@@ -3,7 +3,7 @@
 	"version": "0.0.0",
 	"private": true,
 	"type": "module",
-	"description": "piwpi：pi 扩展 —— 工具上下文插件系统（M0 骨架）",
+	"description": "piwpi：pi 扩展 —— 工具上下文插件系统（阶段一 M0-M6 完成）",
 	"license": "MIT",
 	"engines": {
 		"node": ">=22.19"

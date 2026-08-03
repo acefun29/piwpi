@@ -55,8 +55,10 @@ export interface SourcePluginMeta {
 	segments: Segment[];
 	/** 插件在消息历史中的锚点消息（首次 read 的 toolCallId） */
 	anchorToolCallId: string;
-	/** 自上次哈希变化后是否已通知记忆队列 */
+		/** 自上次哈希变化后是否已通知记忆队列 */
 	updatedAtHashChange: boolean;
+	/** 文件变短被截掉段时的提示行（M4），render 输出在头部；无则缺省 */
+	truncatedNote?: string;
 }
 
 /** 已挂载内容段：1-based，闭区间（计划 §2.2） */

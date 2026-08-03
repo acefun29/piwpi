@@ -38,3 +38,37 @@
 4. **§7.1**：e2e 测试用 `createHarnessWithExtensions({ extensionFactories })`，不是 `createHarness`（#5）。
 5. **路径**：计划文档 `extensions/xxx` 均指 `packages/coding-agent/src/core/extensions/xxx`。
 6. **§3.1 补证**：read 输出上限 2000 行 / 50KB 与 `details.truncation`（`tools/truncate.ts`）待 M2 实现时二次核对（本次未展开，非清单项）。
+
+## 四、阶段一（M1-M6）实现结论
+
+**全部里程碑已实现并通过测试**（2026-08-04）：
+
+| 里程碑 | 产出 | 测试 |
+|---|---|---|
+| M1 | `store.ts`（PluginStore）+ `adapters/registry.ts` 降级映射 | `test/store.test.ts` |
+| M2 | `ranges.ts`（normalize/subtract/clamp，计划 §3.2 矩阵全过）、`hash.ts`、`render.ts`、`adapters/source.ts` | `test/ranges/hash/source-adapter.test.ts` |
+| M3 | `harness.ts` 三 handler：拦截、增量读取（改写 offset/limit 只补缺失段）、锚点固定区域 | `test/harness.test.ts`（22 用例） |
+| M4 | updated 分支：哈希变化重切旧范围 + clamp + truncatedNote，记忆任务投递 | 同上 + e2e 验收 #3 |
+| M5 | `memory/queue.ts`（1500ms 去抖串行队列）、`agent.ts`（LLM 严格 JSON）、`project-map.ts`、`persist.ts`（custom entry + 项目地图文件） | `test/memory.test.ts` + harness 记忆用例 |
+| M6 | e2e：`pi/packages/coding-agent/test/piwpi-e2e.test.ts`（createHarnessWithExtensions + faux provider 完整 agent 循环） | 5 用例，验收 #1/#2/#3/#6 + §7.3 红线 |
+
+**§7.3 token 对比实验结果（红线通过）**：2000 行文件连续 3 次全量重读，on/off 各跑一次——
+- 第二次起请求体量（messages 字符量之和）：on=60,567 vs off=116,874 → **0.518×**
+- 全部请求体量：on=82,522 vs off=138,829 → **0.594×**
+
+**全量验证**：extension 82/82 单测通过、e2e 5/5 通过、`tsgo --noEmit` 全仓 0 错误、biome 对新增文件 0 告警。
+
+**pi 原有测试套件（验收 #7，Windows 环境实测）**：`@earendil-works/pi-coding-agent` 全量 **1749 通过 / 40 失败 / 47 跳过**。40 个失败全部位于**未做任何改动**的 pi 既有测试（`git diff --stat -- packages/` 为空），成因均为本机环境：Windows 路径分隔符（`3302-find-path-glob`，隔离复现）、EACCES 权限/套接字（4 例）、系统 ripgrep 缺失（`tools.test.ts`）、npm/session 文件差异（config/session-file 系）。piwpi 新增测试（`piwpi-e2e.test.ts`）全绿，不构成回归。
+
+### 新增核对结论（M1-M6 期间）
+
+1. **`ModelRegistry.complete` 只在仓库源码存在**：仓库 `core/model-registry.ts:99-107` 有 `complete`（`custom-compaction.ts:90-102` 即用此通道），但**发布的 npm 0.83.0 包中 ModelRegistry 是同步门面（无 complete）**。扩展以结构访问 `asCompleteFn(modelRegistry)`（`harness.ts`）取用——运行时拿不到就静默禁用记忆 Agent，其余功能不受影响（"换宿主只需重写挂接层"的实证）。
+2. **`ReadonlySessionManager` 不含 `appendCustomEntry`**：`ExtensionContext.sessionManager` 类型是 `Pick<SessionManager, 14 个读方法>`，但运行时传入的是完整实例；用 `asCustomEntryWriter()` 安全取用（`memory/persist.ts`）。
+3. **`AgentMessage` 联合类型含 `BashExecutionMessage`**（content 为 string）：onContext 遍历消息必须结构访问（`Array.isArray` 守卫），不能直接 `.filter`。
+4. **pi 的 tsconfig 开 `erasableSyntaxOnly`**：piwpi e2e 文件 import 扩展源码时，扩展代码也受此约束（参数属性会报 TS1294）→ `queue.ts` 已改普通字段赋值，`extension/tsconfig.json` 已同步开启该选项防回归。
+5. **safeCwd 双横线是 pi 原生行为**：`C:\Users\me\proj` → `--C--Users-me-proj--`（冒号与反斜杠各替换一个 `-`），非笔误，`persist.ts` 与 pi 一致。
+
+### 与计划 §2.1 的两处有据偏差（已落地并在源码注释说明）
+
+1. `identify(input, cwd)`：相对路径必须对 cwd resolve（§4.1 本身即 `(path, cwd)` 签名）；基接口保持不变，Source 用特化子接口（`SourceToolContextAdapter`，故意不 extends——参数增多时接口继承被逆变拒绝）。
+2. `ingest(input, output, current, facts)`：segment 文本必须从磁盘字节重切（§3.3 字节哈希原则），经 `facts` 传入磁盘快照与实际返回范围 `got`，`output` 保留为接口兼容参数（避免尾注/截断噪声进 segment）。

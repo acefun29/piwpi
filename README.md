@@ -8,7 +8,7 @@
 
 **piwpi** is a coding-agent extension for [Pi](https://github.com/earendil-works/pi): when the model re-reads a file, already-mounted line ranges are not returned again — only the missing parts are read incrementally, and the plugin content stays pinned at its anchor position in the conversation, byte-identical when unchanged (preserving prompt-cache prefixes). File changes trigger an async memory pass (summary / understanding / relations) that persists with the session.
 
-**Status**: M0 complete — project skeleton, extension API verification ([`extension/VERIFICATION.md`](extension/VERIFICATION.md)), typecheck and smoke tests green. M1–M6 in progress; all piwpi code lives in [`extension/`](extension).
+**Status**: Phase 1 (M0–M6) complete — incremental mounting, pinned anchors, file-change remount, memory pass, persistence, and the token-comparison red line all implemented and tested (82 unit + 5 e2e tests green; extension API verification in [`extension/VERIFICATION.md`](extension/VERIFICATION.md)). All piwpi code lives in [`extension/`](extension); e2e tests live in `packages/coding-agent/test/piwpi-e2e.test.ts`.
 
 **Usage**: load the extension with Pi:
 
