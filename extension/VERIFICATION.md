@@ -60,6 +60,59 @@
 
 **pi 原有测试套件（验收 #7，Windows 环境实测）**：`@earendil-works/pi-coding-agent` 全量 **1749 通过 / 40 失败 / 47 跳过**。40 个失败全部位于**未做任何改动**的 pi 既有测试（`git diff --stat -- packages/` 为空），成因均为本机环境：Windows 路径分隔符（`3302-find-path-glob`，隔离复现）、EACCES 权限/套接字（4 例）、系统 ripgrep 缺失（`tools.test.ts`）、npm/session 文件差异（config/session-file 系）。piwpi 新增测试（`piwpi-e2e.test.ts`）全绿，不构成回归。
 
+## 五、验收 #7 补强验证（Windows 环境修复 + 基线对比 + 真实 pi 进程演示）
+
+### 5.1 环境修复（不动 pi 任何源码）
+
+| 修复 | 手段 | 效果 |
+|---|---|---|
+| 工作区未构建（dist 缺失） | `npm run build`（全包 tsgo 构建，gitignored 产物） | CLI 子进程类测试从失败转绿（session-file-invalid / session-id-readonly / startup-session-name / stdout-cleanliness 等） |
+| 真实用户主目录存在第三方 `.agents/skills`（Codex 符号链接）干扰 trust 扫描 | 测试期间临时挪开（事后已恢复） | trust-manager 2/2 转绿 |
+
+修复后全量：**1763 通过 / 26 失败 / 47 跳过**（对比修复前 1749 / 40）。
+
+### 5.2 基线对比（piwpi 引入前这些失败已存在，零新增回归）
+
+- 方法：`git worktree` 检出 **pristine 提交 `431e66a5`（纯 pi v0.83.0，无 extension/、无 piwpi 测试）**，junction 共享 node_modules、复制 dist 与模型数据，同一 node 22 同一 vitest 命令跑全量套件。
+- 结果：pristine 基线 **1757 通过 / 27 失败**，失败文件清单与当前树**完全一致（11 个文件）**；逐测试 diff（`comm`）：
+  - **in CURRENT but not BASELINE（新增回归）：空**
+  - in BASELINE but not CURRENT：仅 `agent-session-concurrent` 1 例（该文件隔离运行 3/3 通过，属并发时序抖动）
+  - 即当前树 26 失败 ⊆ 基线 27 失败，**piwpi 零新增回归**。
+
+### 5.3 剩余 26 失败的根因分类（全部为 Windows 平台固有，非 piwpi 引入）
+
+| 文件（失败数） | 根因 |
+|---|---|
+| config.test.ts (7) | `getSelfUpdateCommand` 内部 `spawnSync("npm"/"bun"/"pnpm"/"yarn")` 无 shell——Windows 上 .cmd 无法被 CreateProcess 直接拉起 → 检测返回 undefined（pi 源码行为，POSIX 才成立） |
+| trust-selector.test.ts (3) | 组件对 cwd `/project` 做路径解析 → Windows 下变成 `E:\project`，断言字符串不匹配 |
+| tools.test.ts (3) | ① 2 例 EACCES：Windows 只读位（chmod 444）不产生 EACCES，errno 映射不同；② 1 例 rg `\U`：Windows 临时路径含反斜杠，`--pre=C:\Users\...` 中 `\U` 触发 regex 引擎 "invalid hexadecimal digit"（rg 13/14 同错；上游 CI 路径无反斜杠） |
+| 3302-find-path-glob (3) | find 工具返回 Windows 分隔符路径，断言期望 POSIX 分隔符 |
+| sdk-session-manager (2) | 期望路径与系统提示中的 cwd 均为 `/` 分隔，Windows 实际 `\` |
+| package-command-paths (2) | 同 config：spawn npm/pnpm 在 Windows 上的差异 |
+| interactive-mode-suspend (2) | 测试 2/3 走 POSIX 分支（SIGTSTP/suspend），Windows 不支持；win32 分支用例（测试 1）通过 |
+| 7209-model-selector (1) | All 标签页模型顺序依赖 models.dev 实时数据（本机重新生成的数据与上游 CI 快照不同） |
+| 2791-fswatch (1) | 子进程 `import "E:/.../theme.ts"` 裸盘符路径——Node ESM 在 Windows 要求 file:// URL（测试自身假定 POSIX 路径语义） |
+| footer-width (1) | `formatCwdForFooter` 缩写 home 后用平台分隔符 → `~\project` vs `~/project` |
+| agent-session-concurrent (1) | 并发时序抖动（隔离运行 3/3 通过） |
+
+### 5.4 真实 pi 进程演示（`pi -e extension` + 本地 mock LLM）
+
+`extension/scripts/pi-demo/run-demo.mjs`：启动真实 **pi CLI（dist/cli.js）** 加载 `-e extension`，模型指向本地 OpenAI 兼容流式 mock 端点，跑完整 4 轮 agent 循环（read 20-40 → read 30-60 → read 30-60 → done）。实测输出：
+
+```
+PASS  pi 进程退出码 0 — exit=0
+PASS  4 次 LLM 请求（实际 4 次）
+PASS  扩展加载无错误
+PASS  第 2 次请求中锚点消息已刷新为 render 输出 — [piwpi:plugin file:... mounted:L20-40]
+PASS  锚点已合并为 L20-60 — [piwpi:plugin ... mounted:L20-60]
+PASS  第 2 次 read 实际执行 41-60（新增段标记） — [piwpi: ...已挂载 L20-60，本次新增 L41-60]
+PASS  新增段文本覆盖 line41..line60
+PASS  第 3 次 read（已全覆盖）→ noop 短引用 — [piwpi: ...内容无变化（L20-60 已挂载于上文）]
+DEMO PASSED — 真实 pi 进程内 piwpi 拦截行为验证通过
+```
+
+要点：真实进程内验证了拦截→改参→结果替换→锚点刷新→noop 全链路；另确认 openai-completions 请求体中 tool 消息 content 为纯字符串（与 AgentMessage 块数组不同），脚本按两种形态容错。
+
 ### 新增核对结论（M1-M6 期间）
 
 1. **`ModelRegistry.complete` 只在仓库源码存在**：仓库 `core/model-registry.ts:99-107` 有 `complete`（`custom-compaction.ts:90-102` 即用此通道），但**发布的 npm 0.83.0 包中 ModelRegistry 是同步门面（无 complete）**。扩展以结构访问 `asCompleteFn(modelRegistry)`（`harness.ts`）取用——运行时拿不到就静默禁用记忆 Agent，其余功能不受影响（"换宿主只需重写挂接层"的实证）。
