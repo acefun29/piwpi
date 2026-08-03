@@ -1,0 +1,21 @@
+{
+	"name": "piwpi-extension",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "piwpi：pi 扩展 —— 工具上下文插件系统（M0 骨架）",
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@types/node": "22.19.19",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	}
+}

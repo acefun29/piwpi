@@ -1,27 +1,24 @@
+> **piwpi** — a fork of [Pi](https://github.com/earendil-works/pi) by [@mariozechner](https://github.com/mariozechner) ([MIT](LICENSE)), extended with a tool-context plugin system (`extension/`).
+
 <p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
+  <img alt="piwpi logo" src="pwp-logo.png" width="200">
 </p>
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+# piwpi
 
-# Pi Agent Harness
+**piwpi** is a coding-agent extension for [Pi](https://github.com/earendil-works/pi): when the model re-reads a file, already-mounted line ranges are not returned again — only the missing parts are read incrementally, and the plugin content stays pinned at its anchor position in the conversation, byte-identical when unchanged (preserving prompt-cache prefixes). File changes trigger an async memory pass (summary / understanding / relations) that persists with the session.
 
-This is the home of the Pi agent harness project including our self extensible coding agent.
+**Status**: M0 complete — project skeleton, extension API verification ([`extension/VERIFICATION.md`](extension/VERIFICATION.md)), typecheck and smoke tests green. M1–M6 in progress; all piwpi code lives in [`extension/`](extension).
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+**Usage**: load the extension with Pi:
 
-To learn more about Pi:
+```sh
+pi -e extension
+```
 
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
+---
+
+The sections below are Pi's original README, describing the inherited code base (`packages/`).
 
 ## All Packages
 
