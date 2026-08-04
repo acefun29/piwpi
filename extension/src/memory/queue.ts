@@ -42,6 +42,11 @@ export class MemoryQueue {
 			.catch((err) => console.error(`[piwpi] memory job failed for ${pluginId}:`, err));
 	}
 
+	/** 等待去抖窗口的任务数（debug 快照用） */
+	size(): number {
+		return this.pending.size;
+	}
+
 	/** 立即触发所有挂起任务并等待串行链完成；超时则拒绝（调用方 catch 后继续，5s 兜底语义）。 */
 	async flush(timeoutMs = 5000): Promise<void> {
 		for (const pluginId of [...this.pending.keys()]) {

@@ -16,6 +16,14 @@
 pi -e extension
 ```
 
+**Debug API** (optional): set `PIWPI_DEBUG_PORT=8787` to start a read-only HTTP + SSE observability server on `127.0.0.1` (mounted plugins, segments, hashes, anchors, memory, context snapshots, real-time events) for external frontends:
+
+```sh
+PIWPI_DEBUG_PORT=8787 pi -e extension   # then fetch http://127.0.0.1:8787/api/state
+```
+
+Full API reference and frontend integration guide: [`extension/docs/debug-api.md`](extension/docs/debug-api.md).
+
 ---
 
 The sections below are Pi's original README, describing the inherited code base (`packages/`).

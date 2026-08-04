@@ -64,7 +64,7 @@ function readToolCall(id, offset, limit) {
 	);
 }
 
-function startMockServer() {
+function startMockServer(onRequest) {
 	const server = createServer((req, res) => {
 		if (req.method !== "POST" || !req.url.endsWith("/chat/completions")) {
 			res.writeHead(404).end();
@@ -76,6 +76,7 @@ function startMockServer() {
 			const parsed = JSON.parse(body);
 			requests.push({ messages: parsed.messages ?? [] });
 			const callIndex = requests.length - 1;
+			onRequest?.(callIndex);
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
 			const stream = [];
 			if (callIndex === 0) stream.push(readToolCall(1, 20, 21));
@@ -112,7 +113,18 @@ async function main() {
 	const agentDir = join(tmp, "agent");
 	mkdirSync(agentDir, { recursive: true });
 
-	const { server, port } = await startMockServer();
+	// 调试观测服务端口（真实 pi 进程内验证 debug API）
+	const debugPort = 8800 + Math.floor(Math.random() * 100);
+	let debugState = null;
+	const { server, port } = await startMockServer((callIndex) => {
+		// 第 3 次 LLM 请求到达时（两次 read 已挂载），从真实 pi 进程内拉一次 /api/state
+		if (callIndex === 2) {
+			fetch(`http://127.0.0.1:${debugPort}/api/state`)
+				.then((r) => r.json())
+				.then((s) => (debugState = s))
+				.catch((err) => console.error("[demo] debug state fetch failed:", err.message));
+		}
+	});
 	try {
 		writeFileSync(join(tmp, "a.ts"), Array.from({ length: FILE_LINES }, (_, i) => `line${i + 1}`).join("\n"));
 		writeFileSync(
@@ -159,8 +171,8 @@ async function main() {
 			],
 			{
 				cwd: tmp,
-				// agent 目录环境变量：config.ts:495 ENV_AGENT_DIR = PI_CODING_AGENT_DIR
-				env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
+				// agent 目录环境变量：config.ts:495 ENV_AGENT_DIR = PI_CODING_AGENT_DIR；调试服务经 PIWPI_DEBUG_PORT 开启
+				env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PIWPI_DEBUG_PORT: String(debugPort) },
 				stdio: ["ignore", "pipe", "pipe"],
 			},
 		);
@@ -184,6 +196,15 @@ async function main() {
 		assert(exitCode === 0, "pi 进程退出码 0", `exit=${exitCode}`);
 		assert(requests.length === 4, `4 次 LLM 请求（实际 ${requests.length} 次）`);
 		assert(!stderr.includes("Failed to load extension"), "扩展加载无错误");
+		// 真实进程内 debug 服务是否启动：以 /api/state 拉取成功为准（print 模式会屏蔽扩展 stdout 日志）
+		assert(!stderr.includes("debug server failed to start"), "真实进程内 debug 服务启动无错误（PIWPI_DEBUG_PORT）");
+
+		// debug API：真实 pi 进程运行中拉取的 /api/state 快照
+		assert(debugState !== null, "运行中成功拉取 /api/state");
+		assert(debugState?.plugins?.length === 1, "快照含 1 个挂载插件", JSON.stringify(debugState?.plugins?.length));
+		const segs = debugState?.plugins?.[0]?.metadata?.segments ?? [];
+		assert(segs.length >= 1 && segs[0].start === 20 && segs.at(-1).end === 60, "快照 segments 覆盖 L20-60", JSON.stringify(segs.map((s) => `${s.start}-${s.end}`)));
+		assert(debugState?.context?.messageCount > 0, "快照含上下文摘要", `messages=${debugState?.context?.messageCount}`);
 
 		// 第 2 次请求：首条 read 的锚点消息已被 onContext 刷新为确定性渲染（真实进程内锚点刷新）
 		const anchor1 = textOf(toolResults(requests[1]?.messages ?? [])[0] ?? { content: [] });

@@ -38,6 +38,13 @@ import { subtract, clamp, type LineRange } from "./ranges.ts";
 import { render } from "./render.ts";
 import { PluginStore } from "./store.ts";
 import type { Segment, ToolContextPlugin } from "./types.ts";
+import { MAX_CONTEXT_TEXT } from "./debug.ts";
+import type {
+	DebugContextSnapshot,
+	DebugEvent,
+	DebugMessageSummary,
+	DebugSnapshot,
+} from "./debug.ts";
 
 /**
  * Harness：tool_call / tool_result / context / session_start / shutdown（计划 §4，M3+M4+M5）。
@@ -72,6 +79,8 @@ export interface Harness {
 	onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void>;
 	onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void>;
 	shutdown(): Promise<void>;
+	/** 调试/观测快照（debug HTTP 服务用，见 src/debug.ts） */
+	snapshot(): DebugSnapshot;
 }
 
 /** 测试可注入的依赖（默认全部取自事件 ctx） */
@@ -90,6 +99,8 @@ export interface HarnessOptions {
 	entriesProvider?: () => SessionEntry[];
 	/** 记忆队列去抖窗口（默认 1500ms） */
 	debounceMs?: number;
+	/** 调试事件监听（debug 服务用；不设置则事件静默丢弃） */
+	onEvent?: (event: DebugEvent) => void;
 }
 
 /** tool_call 阶段的登记记录（tool_result 按 toolCallId 匹配，计划 §4.2/§4.3） */
@@ -136,6 +147,12 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let currentModel: unknown;
 	let lastUserText = "";
 	let mapLoaded = false;
+	let lastContext: DebugContextSnapshot | null = null;
+
+	/** 调试事件（debug 服务用；无监听者时零开销）。ts 在此填充。 */
+	function emit(event: Omit<DebugEvent, "ts">): void {
+		options.onEvent?.({ ...event, ts: Date.now() } as DebugEvent);
+	}
 
 	function rememberCtx(ctx: ExtensionContext): void {
 		cwd = ctx.cwd;
@@ -192,6 +209,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					// 磁盘已变：段清空、hash 更新；等下一次 read 走 increment 重新挂载（自愈）
 					raw.metadata = { ...sourceMeta, hash, totalLines: diskLines.length, segments: [], updatedAtHashChange: false };
 					memoryQueue.enqueue({ pluginId: raw.id, oldHash: sourceMeta.hash, newHash: hash, localContext: "" });
+					emit({ type: "memory_queued", pluginId: raw.id, oldHash: sourceMeta.hash, newHash: hash });
 				}
 			} catch {
 				// 文件不可读：段清空，等下一次 read 重建
@@ -200,6 +218,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			raw.content = render(raw);
 			store.upsert(raw);
 		}
+		emit({ type: "restore", pluginCount: store.all().length });
 	}
 
 	// 记忆 worker（M5）：串行、失败不阻断主流程
@@ -210,6 +229,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			const deps = memoryDeps();
 			if (!deps?.model) {
 				console.error(`[piwpi] no model available — skip memory job for ${job.pluginId}`);
+				emit({ type: "memory_skipped", pluginId: job.pluginId, reason: "no-model" });
 				return;
 			}
 			const output = await summarize(deps, plugin, job);
@@ -222,6 +242,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			if (output.mapEntry) projectMap.update(plugin.id, output.mapEntry);
 			await writeProjectMapFile(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
 			persistPlugin(plugin);
+			emit({ type: "memory_updated", pluginId: job.pluginId });
 		} catch (err) {
 			console.error("[piwpi] memory worker error:", err);
 		}
@@ -258,6 +279,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					if (missing.length === 0) {
 						// 全覆盖：不改参数，read 照常执行（IO 廉价），tool_result 里替换成短引用
 						pending.set(event.toolCallId, { kind: "noop", pluginId: id });
+						emit({ type: "tool_call", pluginId: id, kind: "noop", want });
 						return;
 					}
 					// 只补第一段缺失：read 只支持单连续区间（read.ts:271-283）
@@ -265,6 +287,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					input.offset = m.start;
 					input.limit = m.end - m.start + 1;
 					pending.set(event.toolCallId, { kind: "increment", pluginId: id, diskLines, hash });
+					emit({ type: "tool_call", pluginId: id, kind: "increment", missing: m });
 				} else if (existing && isSourceMeta(existing)) {
 					// 哈希变了：不改参数，让 read 按用户原始意图执行，重挂载在 tool_result 里做（M4）
 					pending.set(event.toolCallId, {
@@ -274,8 +297,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						hash,
 						oldHash: existing.metadata.hash,
 					});
+					emit({ type: "tool_call", pluginId: id, kind: "updated", oldHash: existing.metadata.hash });
 				} else {
 					pending.set(event.toolCallId, { kind: "new", pluginId: id, absPath, diskLines, hash });
+					emit({ type: "tool_call", pluginId: id, kind: "new" });
 				}
 			} catch (err) {
 				console.error("[piwpi] onToolCall error:", err);
@@ -298,6 +323,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					const plugin = store.get(p.pluginId);
 					if (!plugin) return undefined;
 					const mounted = mountedRanges(plugin).map(formatRange).join(", ");
+					emit({ type: "noop", pluginId: p.pluginId, mounted });
 					return {
 						content: [
 							{
@@ -339,30 +365,32 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 								got,
 								mode: "increment",
 							});
+								store.upsert(plugin);
+								emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
+								const all = mountedRanges(plugin).map(formatRange).join(", ");
+								const body = sliceText(p.diskLines, got);
+								return {
+									content: [
+										{
+											type: "text",
+											text: `[piwpi: ${plugin.source.identity} 已挂载 ${all}，本次新增 ${formatRange(got)}]\n\n${body}`,
+										},
+									],
+								};
+							}
+							// 保留全文：此消息即锚点（anchorToolCallId = 本次 toolCallId）
+							const plugin = sourceAdapter.ingest(input, text, undefined, {
+								absPath: p.absPath,
+								hash: p.hash,
+								diskLines: p.diskLines,
+								anchorToolCallId: event.toolCallId,
+								got,
+								mode: "new",
+							});
 							store.upsert(plugin);
-							const all = mountedRanges(plugin).map(formatRange).join(", ");
-							const body = sliceText(p.diskLines, got);
-							return {
-								content: [
-									{
-										type: "text",
-										text: `[piwpi: ${plugin.source.identity} 已挂载 ${all}，本次新增 ${formatRange(got)}]\n\n${body}`,
-									},
-								],
-							};
+							emit({ type: "mounted", pluginId: plugin.id, kind: "new", hash: p.hash, got });
+							return undefined;
 						}
-						// 保留全文：此消息即锚点（anchorToolCallId = 本次 toolCallId）
-						const plugin = sourceAdapter.ingest(input, text, undefined, {
-							absPath: p.absPath,
-							hash: p.hash,
-							diskLines: p.diskLines,
-							anchorToolCallId: event.toolCallId,
-							got,
-							mode: "new",
-						});
-						store.upsert(plugin);
-						return undefined;
-					}
 					case "increment": {
 						const existing = store.get(p.pluginId);
 						if (!existing || !isSourceMeta(existing)) return undefined;
@@ -375,6 +403,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							mode: "increment",
 						});
 						store.upsert(plugin);
+						emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
 						const all = mountedRanges(plugin).map(formatRange).join(", ");
 						const body = sliceText(p.diskLines, got);
 						return {
@@ -398,12 +427,14 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							mode: "updated",
 						});
 						store.upsert(plugin);
+						emit({ type: "mounted", pluginId: plugin.id, kind: "updated", oldHash: p.oldHash, hash: p.hash, got });
 						memoryQueue.enqueue({
 							pluginId: plugin.id,
 							oldHash: p.oldHash,
 							newHash: p.hash,
 							localContext: lastUserText,
 						});
+						emit({ type: "memory_queued", pluginId: plugin.id, oldHash: p.oldHash, newHash: p.hash });
 						persistPlugin(plugin);
 						const all = mountedRanges(plugin).map(formatRange).join(", ");
 						const body = sliceText(p.diskLines, got);
@@ -462,6 +493,37 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					}
 					if (!refreshed) continue; // 锚点被压缩/裁剪 → 本次跳过（计划 §8 已知限制）
 				}
+				// 上下文摘要（debug 服务用）：每条消息文本截断，防快照膨胀
+				const summaries: DebugMessageSummary[] = event.messages.map((m) => {
+					const mm = m as { role?: string; toolCallId?: unknown; content?: unknown };
+					const content = Array.isArray(mm.content) ? mm.content : [];
+					const text = content
+						.filter(
+							(c): c is { type: string; text?: string } =>
+								typeof c === "object" && c !== null && (c as { type?: string }).type === "text",
+						)
+						.map((c) => c.text ?? "")
+						.join("\n");
+					return {
+						role: mm.role ?? "",
+						toolCallId: typeof mm.toolCallId === "string" ? mm.toolCallId : undefined,
+						hasImage: content.some((c) => (c as { type?: string }).type === "image"),
+						text: text.slice(0, MAX_CONTEXT_TEXT),
+					};
+				});
+				lastContext = {
+					ts: Date.now(),
+					messageCount: event.messages.length,
+					toolResultCount: event.messages.filter(
+						(m) => (m as { role?: string }).role === "toolResult",
+					).length,
+					messages: summaries,
+				};
+				emit({
+					type: "context",
+					messageCount: lastContext.messageCount,
+					toolResultCount: lastContext.toolResultCount,
+				});
 			} catch (err) {
 				console.error("[piwpi] onContext error:", err);
 			}
@@ -480,6 +542,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					}
 				}
 				if (event.reason === "resume") await restorePlugins();
+				emit({ type: "session_start", reason: event.reason });
 			} catch (err) {
 				console.error("[piwpi] onSessionStart error:", err);
 			}
@@ -499,6 +562,29 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			} catch (err) {
 				console.error("[piwpi] shutdown map save error:", err);
 			}
+			emit({ type: "shutdown" });
+		},
+
+		/** 调试/观测快照（debug HTTP 服务用）。 */
+		snapshot(): DebugSnapshot {
+			const plugins: DebugSnapshot["plugins"] = store.all().map((p) => ({
+				id: p.id,
+				category: p.category,
+				source: p.source,
+				metadata: p.metadata as unknown as DebugSnapshot["plugins"][number]["metadata"],
+				content: p.content,
+				memory: p.memory,
+			}));
+			return {
+				cwd,
+				ts: Date.now(),
+				plugins,
+				projectMap: projectMap.toJSON(),
+				pendingCount: pending.size,
+				queuePending: memoryQueue.size(),
+				lastUserText,
+				context: lastContext,
+			};
 		},
 	};
 }
