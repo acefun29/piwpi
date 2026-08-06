@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import type { LineRange } from "../ranges.ts";
 import { clamp } from "../ranges.ts";
 import { render } from "../render.ts";
-import type { PluginCategory, Segment, SourcePluginMeta, ToolContextAdapter, ToolContextPlugin } from "../types.ts";
+import type { PluginCategory, Segment, SourcePluginMeta, ToolContextPlugin } from "../types.ts";
 
 /**
  * Source Adapter：read 工具专用（计划 §3，M2 实现）。
@@ -118,7 +118,9 @@ function buildPlugin(facts: SourceIngestFacts, current: ToolContextPlugin | unde
 				absPath: facts.absPath,
 				hash: facts.hash,
 				totalLines: facts.diskLines.length,
-				segments: valid ? [{ start: facts.got.start, end: facts.got.end, text: sliceText(facts.diskLines, facts.got) }] : [],
+				segments: valid
+					? [{ start: facts.got.start, end: facts.got.end, text: sliceText(facts.diskLines, facts.got) }]
+					: [],
 				anchorToolCallId: facts.anchorToolCallId,
 				updatedAtHashChange: false,
 			};

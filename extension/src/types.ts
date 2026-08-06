@@ -55,10 +55,14 @@ export interface SourcePluginMeta {
 	segments: Segment[];
 	/** 插件在消息历史中的锚点消息（首次 read 的 toolCallId） */
 	anchorToolCallId: string;
-		/** 自上次哈希变化后是否已通知记忆队列 */
+	/** 自上次哈希变化后是否已通知记忆队列 */
 	updatedAtHashChange: boolean;
 	/** 文件变短被截掉段时的提示行（M4），render 输出在头部；无则缺省 */
 	truncatedNote?: string;
+	/** 记忆整理状态：首次挂载未整理 = pending，批量整理完成 = done（缺省视为 done） */
+	memoryState?: "pending" | "done";
+	/** 自上次失效/整理以来累积的变更行数（达阈值触发失效，M5 新模型） */
+	pendingMemoryLines?: number;
 }
 
 /** 已挂载内容段：1-based，闭区间（计划 §2.2） */
@@ -68,13 +72,13 @@ export interface Segment {
 	text: string;
 }
 
-/** 记忆整理任务（计划 §6.1/§6.2 输入） */
+/** 记忆整理任务（M5 新模型：仅在新增批量整理时投递） */
 export interface MemoryJob {
 	pluginId: string;
-	oldHash?: string;
-	newHash?: string;
-	/** 触发整理的局部上下文（当前用户消息等） */
+	/** 当前用户消息（可能为空） */
 	localContext: string;
+	/** 主 Agent 对话尾部摘要（onContext 缓存，与文件挂载内容去重） */
+	dialogueContext?: string;
 }
 
 /** 项目地图条目（计划 §6.2 模型输出 mapEntry / §6.3） */

@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createDebugServer, parseDebugPort, type DebugServer } from "./src/debug.ts";
+import { Type } from "typebox";
+import { createDebugServer, type DebugServer, parseDebugPort } from "./src/debug.ts";
 import { createHarness } from "./src/harness.ts";
 
 /**
@@ -37,5 +38,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_shutdown", async () => {
 		await harness.shutdown();
 		debugServer?.close();
+	});
+
+	// M5 新模型：主 Agent 读取 Project Map 的唯一通道（零持续 token 开销，按需主动调用）。
+	// 协议见 extension/docs/project-map-protocol.md；返回目录分组的 Markdown 缩进树。
+	pi.registerTool({
+		name: "read_project_map",
+		label: "Read project map",
+		description:
+			"读取 piwpi 项目地图（Markdown 目录树）：各文件的身份/职责/关键结构/依赖/被依赖/设计决策。需要理解项目全局结构、查找文件、分析依赖与影响面时调用。",
+		promptSnippet: "piwpi project map（文件身份与依赖树）",
+		promptGuidelines: [
+			"需要项目级理解（找文件、依赖关系、影响面）时调用 read_project_map",
+			"项目地图由 piwpi 记忆 Agent 在新文件挂载累计后批量整理生成",
+		],
+		parameters: Type.Object({}),
+		execute: async () => ({
+			content: [{ type: "text", text: harness.projectMapTree() }],
+			details: {},
+		}),
 	});
 }

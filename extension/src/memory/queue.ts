@@ -32,6 +32,11 @@ export class MemoryQueue {
 		this.pending.set(job.pluginId, { job, timer });
 	}
 
+	/** 通用串行任务（M5 批量整理用）：与 job 共用同一串行链，flush 会等待；异常不会打断链。 */
+	enqueueTask(task: () => Promise<void>): void {
+		this.chain = this.chain.then(task).catch((err) => console.error("[piwpi] memory task failed:", err));
+	}
+
 	private dispatch(pluginId: string): void {
 		const entry = this.pending.get(pluginId);
 		if (!entry) return;

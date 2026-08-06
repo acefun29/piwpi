@@ -18,6 +18,11 @@ export class PluginStore {
 		this.byId.set(plugin.id, plugin);
 	}
 
+	/** 移除插件（M5 新模型：修改达标 → 挂载失效）。 */
+	remove(id: string): void {
+		this.byId.delete(id);
+	}
+
 	all(): ToolContextPlugin[] {
 		return [...this.byId.values()];
 	}

@@ -7,9 +7,9 @@ import {
 	mergeSegments,
 	rangeFromInput,
 	resolveAbsPath,
+	type SourceIngestFacts,
 	sliceText,
 	sourceAdapter,
-	type SourceIngestFacts,
 } from "../src/adapters/source.ts";
 import type { Segment, ToolContextPlugin } from "../src/types.ts";
 
@@ -81,7 +81,12 @@ describe("rangeFromInput（read 参数 → 行范围）", () => {
 describe("ingest：new（计划 §4.3）", () => {
 	it("创建插件：segments 文本与磁盘字节一致，anchor 记录本次 toolCallId", () => {
 		const p = sourceAdapter.ingest({}, diskText, undefined, facts({ mode: "new", anchorToolCallId: "t9" }));
-		const meta = p.metadata as unknown as { segments: Segment[]; anchorToolCallId: string; hash: string; updatedAtHashChange: boolean };
+		const meta = p.metadata as unknown as {
+			segments: Segment[];
+			anchorToolCallId: string;
+			hash: string;
+			updatedAtHashChange: boolean;
+		};
 		expect(meta.segments).toEqual([{ start: 20, end: 40, text: sliceText(diskLines, { start: 20, end: 40 }) }]);
 		expect(meta.anchorToolCallId).toBe("t9");
 		expect(meta.hash).toBe("abc123def456");
@@ -175,11 +180,11 @@ describe("render（计划 §3.4）", () => {
 		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new", got: { start: 20, end: 40 } }));
 		expect(sourceAdapter.render(p)).toBe(sourceAdapter.render(p));
 	});
-	it("含 memory 时输出 memory 段；无 memory 时不输出", () => {
+	it("M5 新模型：render 不输出 memory 段（整理产物只进 Project Map）", () => {
 		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new" }));
 		expect(p.content).not.toContain("[piwpi:memory");
 		p.memory = { summary: "负责认证", relations: ["config.ts"] };
-		expect(sourceAdapter.render(p)).toContain("[piwpi:memory 负责认证；config.ts]");
+		expect(sourceAdapter.render(p)).not.toContain("[piwpi:memory");
 	});
 	it("输出段标记与头部", () => {
 		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new", got: { start: 20, end: 40 } }));

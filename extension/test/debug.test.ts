@@ -1,10 +1,10 @@
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { get as httpGet, type IncomingMessage } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ContextEvent, ExtensionContext, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import { createDebugServer, parseDebugPort, type DebugEvent, type DebugServer } from "../src/debug.ts";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createDebugServer, type DebugEvent, type DebugServer, parseDebugPort } from "../src/debug.ts";
 import { createHarness } from "../src/harness.ts";
 import { MemoryQueue } from "../src/memory/queue.ts";
 
@@ -38,11 +38,7 @@ function readCall(toolCallId: string, input: Record<string, unknown>): ToolCallE
 	return { type: "tool_call", toolName: "read", toolCallId, input } as unknown as ToolCallEvent;
 }
 
-function readResult(
-	toolCallId: string,
-	input: Record<string, unknown>,
-	text: string,
-): ToolResultEvent {
+function readResult(toolCallId: string, input: Record<string, unknown>, text: string): ToolResultEvent {
 	return {
 		type: "tool_result",
 		toolName: "read",
@@ -106,7 +102,11 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		const state = body as {
 			plugins: Array<{
 				id: string;
-				metadata: { segments: Array<{ start: number; end: number; text: string }>; anchorToolCallId: string; hash: string };
+				metadata: {
+					segments: Array<{ start: number; end: number; text: string }>;
+					anchorToolCallId: string;
+					hash: string;
+				};
 			}>;
 			pendingCount: number;
 			queuePending: number;
@@ -116,6 +116,7 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		expect(plugin.id).toBe(fileId(absFile));
 		expect(plugin.metadata.segments).toEqual([{ start: 20, end: 40, text: text20_40 }]);
 		expect(plugin.metadata.anchorToolCallId).toBe("t1");
+		expect((plugin.metadata as { memoryState?: string }).memoryState).toBe("pending"); // M5 新模型
 		expect(state.pendingCount).toBe(0);
 		expect(state.queuePending).toBe(0);
 
@@ -166,15 +167,30 @@ describe("debug 服务（HTTP 快照端点）", () => {
 });
 
 describe("debug 服务（SSE 实时事件）", () => {
-	it("事件按序推送：mounted → memory_queued → memory_updated → shutdown", async () => {
+	it("事件按序推送：mounted(new) → memory_queued → memory_updated → memory_batch_done → mounted(updated) → shutdown", async () => {
 		writeFileSync(absFile, lines(80));
 		const complete = vi.fn(async () => ({
-			content: [{ type: "text", text: JSON.stringify({ summary: "x" }) }],
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						mapEntry: {
+							role: "auth",
+							responsibilities: [],
+							keyStructures: [],
+							dependencies: [],
+							dependents: [],
+							decisions: [],
+						},
+					}),
+				},
+			],
 		}));
 		let server: DebugServer | undefined;
 		const h = createHarness({
 			queue: new MemoryQueue(0),
 			memoryDeps: { complete, model: { provider: "faux" } },
+			memoryBatchFiles: 1, // 注入小阈值：1 个 pending 文件即触发批量整理
 			cwd: tmp,
 			onEvent: (e) => server?.handleEvent(e),
 		});
@@ -203,22 +219,29 @@ describe("debug 服务（SSE 实时事件）", () => {
 		await new Promise((r) => setTimeout(r, 100)); // 等待 SSE 连接建立
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, text20_40), ctx());
-		appendFileSync(absFile, "\nline81"); // 触发 updated → 记忆队列
+		appendFileSync(absFile, "\nline81"); // 尾部追加 1 行 → 变更量 0，重挂载不失效
 		await h.onToolCall(readCall("t2", { path: FILE, offset: 30, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t2", { path: FILE, offset: 30, limit: 21 }, text20_40), ctx());
-		await h.shutdown(); // flush 记忆队列 + shutdown 事件
+		await h.shutdown(); // flush 批量整理链 + shutdown 事件
 
-		await Promise.race([frameArrived, new Promise((_, rej) => setTimeout(() => rej(new Error("SSE timeout")), 5000))]);
+		await Promise.race([
+			frameArrived,
+			new Promise((_, rej) => setTimeout(() => rej(new Error("SSE timeout")), 5000)),
+		]);
 
 		const types = frames.map((f) => f.type);
 		expect(types).toContain("tool_call");
 		expect(types).toContain("mounted");
 		expect(types).toContain("memory_queued");
 		expect(types).toContain("memory_updated");
+		expect(types).toContain("memory_batch_done");
 		expect(types).toContain("shutdown");
 
 		const mountedUpdated = frames.find((f) => f.type === "mounted" && f.kind === "updated");
 		expect(mountedUpdated?.pluginId).toBe(fileId(absFile));
+
+		const queuedNew = frames.find((f) => f.type === "memory_queued" && f.kind === "new");
+		expect(queuedNew?.pluginId).toBe(fileId(absFile));
 
 		await server.close();
 	});

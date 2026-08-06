@@ -7,10 +7,9 @@ import type { SourcePluginMeta, ToolContextPlugin } from "./types.ts";
  *   [piwpi:plugin file:src/auth.ts hash:9f3a2c1e mounted:L20-80]
  *   --- L20-40 ---
  *   <原始文本>
- *   [piwpi:memory 负责 JWT 签发与刷新；依赖 config.ts]
  *
- * 规则：segments 按 start 升序输出；不重排行号、不加行号前缀；memory 段仅当 summary 存在时输出。
- * 说明：memory 行不含日期——日期会随天变化破坏逐字节确定性，需要时由记忆 Agent 写进 summary 内容。
+ * 规则：segments 按 start 升序输出；不重排行号、不加行号前缀。
+ * 说明：M5 新模型下记忆整理产物只进 Project Map（docs/project-map-protocol.md），不再渲染进挂载内容。
  */
 
 function formatRange(start: number, end: number): string {
@@ -30,11 +29,6 @@ export function render(plugin: ToolContextPlugin): string {
 	for (const seg of segments) {
 		lines.push(`--- ${formatRange(seg.start, seg.end)} ---`);
 		lines.push(seg.text);
-	}
-	if (plugin.memory?.summary) {
-		const parts = [plugin.memory.summary];
-		if (plugin.memory.relations?.length) parts.push(plugin.memory.relations.join("；"));
-		lines.push(`[piwpi:memory ${parts.join("；")}]`);
 	}
 	return lines.join("\n");
 }

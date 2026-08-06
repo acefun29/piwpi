@@ -49,14 +49,14 @@
 | M2 | `ranges.ts`（normalize/subtract/clamp，计划 §3.2 矩阵全过）、`hash.ts`、`render.ts`、`adapters/source.ts` | `test/ranges/hash/source-adapter.test.ts` |
 | M3 | `harness.ts` 三 handler：拦截、增量读取（改写 offset/limit 只补缺失段）、锚点固定区域 | `test/harness.test.ts`（22 用例） |
 | M4 | updated 分支：哈希变化重切旧范围 + clamp + truncatedNote，记忆任务投递 | 同上 + e2e 验收 #3 |
-| M5 | `memory/queue.ts`（1500ms 去抖串行队列）、`agent.ts`（LLM 严格 JSON）、`project-map.ts`、`persist.ts`（custom entry + 项目地图文件） | `test/memory.test.ts` + harness 记忆用例 |
+| M5 | **新模型（2026-08-06 重构）**：记忆 Agent 只在新增驱动（pending 计数 5 文件/1000 行 → 批量整理，产物只进 Project Map）；修改累积达 `max(8, 总行数×10%)` → 挂载 + map 双失效（不跑记忆 Agent）；`read_project_map` 工具（目录树）为主 Agent 读取通道。`memory/diff.ts`（LCS 变更量）、`project-map.ts`（delete/renderTree/renderBrief）、`agent.ts`（三段输入 prompt）、`queue.ts`（enqueueTask 串行链） | `test/memory.test.ts`（含 diff/树/批量）、`test/harness.test.ts` 记忆用例（新增失效/累积/批量触发） |
 | M6 | e2e：`pi/packages/coding-agent/test/piwpi-e2e.test.ts`（createHarnessWithExtensions + faux provider 完整 agent 循环） | 5 用例，验收 #1/#2/#3/#6 + §7.3 红线 |
 
 **§7.3 token 对比实验结果（红线通过）**：2000 行文件连续 3 次全量重读，on/off 各跑一次——
 - 第二次起请求体量（messages 字符量之和）：on=60,567 vs off=116,874 → **0.518×**
 - 全部请求体量：on=82,522 vs off=138,829 → **0.594×**
 
-**全量验证**：extension 82/82 单测通过、e2e 5/5 通过、`tsgo --noEmit` 全仓 0 错误、biome 对新增文件 0 告警。
+**全量验证**：extension 107/107 单测通过（含新增 diff/批量整理/失效用例）、e2e 5/5 通过、`tsc --noEmit` 0 错误、biome 对 extension 0 error/warning、real-pi demo 全断言通过。
 
 **pi 原有测试套件（验收 #7，Windows 环境实测）**：`@earendil-works/pi-coding-agent` 全量 **1749 通过 / 40 失败 / 47 跳过**。40 个失败全部位于**未做任何改动**的 pi 既有测试（`git diff --stat -- packages/` 为空），成因均为本机环境：Windows 路径分隔符（`3302-find-path-glob`，隔离复现）、EACCES 权限/套接字（4 例）、系统 ripgrep 缺失（`tools.test.ts`）、npm/session 文件差异（config/session-file 系）。piwpi 新增测试（`piwpi-e2e.test.ts`）全绿，不构成回归。
 

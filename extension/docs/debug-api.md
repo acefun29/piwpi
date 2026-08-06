@@ -32,7 +32,7 @@ $env:PIWPI_DEBUG_PORT="8787"; pi -e extension
 | GET | `/api/plugins` | 插件列表（同上 state.plugins） |
 | GET | `/api/plugins/:id` | 单个插件详情（含 render 输出全文），id 需 URL 编码，如 `/api/plugins/source%3Afile%3Ac%3A%5C...` |
 | GET | `/api/context` | 最近一次 context 事件的消息摘要（每条文本截断 300 字符） |
-| GET | `/api/project-map` | 项目地图 `{ entries }` |
+| GET | `/api/project-map` | 项目地图 `{ entries, tree }`：entries 为按路径索引的 JSON 字典，tree 为目录分组 Markdown 缩进树（read_project_map 工具同款） |
 | GET | `/api/events` | **SSE 实时事件流**（见下） |
 
 所有响应带 `Access-Control-Allow-Origin: *`，任意来源前端可跨域访问。非 GET 返回 405，未知路径返回 404。
@@ -60,15 +60,17 @@ $env:PIWPI_DEBUG_PORT="8787"; pi -e extension
         ],
         "anchorToolCallId": "t1",                      // 上下文中的锚点消息 toolCallId
         "updatedAtHashChange": false,
-        "truncatedNote": undefined                     // 文件变短截段提示（有则显示）
+        "truncatedNote": undefined,                    // 文件变短截段提示（有则显示）
+        "memoryState": "pending",                      // M5 新模型：pending = 待批量整理 / done = 已整理
+        "pendingMemoryLines": 3                        // 修改累积变更行数（达阈值触发失效，可缺省）
       },
-      "content": "[piwpi:plugin ...]\n--- L20-40 ---\n...",  // render 输出（调试用）
-      "memory": { "summary": "负责认证", "relations": ["config.ts"] }  // 记忆整理结果（可缺省）
+      "content": "[piwpi:plugin ...]\n--- L20-40 ---\n...",  // render 输出（调试用，不含记忆段）
+      "memory": undefined                              // 已废弃：M5 新模型下整理产物只进 Project Map
     }
   ],
   "projectMap": { "<pluginId>": { "role": "...", "responsibilities": [...], "decisions": [...] } },
   "pendingCount": 0,        // 等待 tool_result 匹配的登记数
-  "queuePending": 0,        // 等待去抖窗口的记忆任务数
+  "queuePending": 0,        // 等待串行链执行的任务数（批量整理等）
   "lastUserText": "读一下 auth.ts",
   "context": {              // 最近一次 context 事件摘要（初始为 null）
     "ts": 1788000000000,
@@ -97,12 +99,14 @@ $env:PIWPI_DEBUG_PORT="8787"; pi -e extension
 |---|---|---|
 | `session_start` | 会话启动 | `reason`（startup/resume/...） |
 | `tool_call` | read 被拦截并做出决策 | `kind`: `new` / `increment`（含 `missing` 范围）/ `updated`（含 `oldHash`）/ `noop`（含 `want`） |
-| `mounted` | 挂载完成（tool_result 处理后） | `kind`: `new`/`increment`/`updated`（含 `oldHash`）、`hash`、`got` 范围 |
+| `mounted` | 挂载完成（tool_result 处理后） | `kind`: `new`/`increment`/`updated`（含 `oldHash`）、`hash`、`got` 范围；updated 含 `pendingMemoryLines` |
 | `noop` | 全覆盖读取 → 短引用替换 | `mounted`（已挂载范围描述） |
 | `context` | 每次 LLM 请求前 | `messageCount`、`toolResultCount` |
-| `memory_queued` | 记忆任务入队 | `oldHash`、`newHash` |
-| `memory_updated` | 记忆整理完成写回 | — |
-| `memory_skipped` | 记忆任务被跳过 | `reason`（如 no-model） |
+| `memory_queued` | 新文件挂载并标记 pending | `kind`: `new`、`pendingFiles`、`pendingLines`（累计未整理统计） |
+| `memory_updated` | 批量整理中单个文件整理完成写回 Project Map | — |
+| `memory_batch_done` | 批量整理结束 | `files`（成功数）、`total`（本次目标数） |
+| `memory_skipped` | 批量整理无模型跳过 | `reason`（如 no-model）、`pendingFiles` |
+| `invalidated` | 修改累积达阈值 → 挂载 + project map 失效 | `changedLines`（累积变更行数）、`oldHash`、`hash` |
 | `restore` | resume 恢复完成 | `pluginCount` |
 | `shutdown` | 会话关闭 | — |
 
@@ -138,5 +142,6 @@ events.onerror = () => console.warn("debug server disconnected");
 
 - 服务只读，**不提供任何写/控制端点**（重置插件、手动触发记忆等暂不支持，需要再加）。
 - 上下文消息文本截断 300 字符/条，避免快照膨胀；完整内容请以 pi 会话为准。
-- 记忆队列事件在 worker 异步完成后发出（串行执行），`memory_updated` 与 `memory_queued` 之间有真实 LLM 调用的时延。
+- 记忆语义（M5 新模型）：记忆 Agent 只在**新增**驱动——新文件挂载后标记 `pending`，累计达阈值（5 文件 或 1000 行）批量整理，产物只写入 Project Map；**修改**累积达阈值（变更行数 ≥ max(8, 总行数×10%)）直接触发 `invalidated` 失效（挂载移除 + map 删除），不跑记忆 Agent。协议见 `docs/project-map-protocol.md`。
+- 批量整理事件在串行链异步执行后发出，`memory_updated`/`memory_batch_done` 与 `memory_queued` 之间有真实 LLM 调用的时延。
 - 数据仅在**当前 pi 进程内**有效；进程退出即消失（持久化见 custom entries / 项目地图文件）。

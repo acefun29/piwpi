@@ -24,6 +24,8 @@ export type DebugEvent = {
 		| "memory_queued"
 		| "memory_updated"
 		| "memory_skipped"
+		| "memory_batch_done"
+		| "invalidated"
 		| "restore"
 		| "shutdown";
 	ts?: number;
@@ -88,10 +90,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
-export function createDebugServer(
-	harness: { snapshot(): DebugSnapshot },
-	port: number,
-): Promise<DebugServer> {
+export function createDebugServer(harness: { snapshot(): DebugSnapshot }, port: number): Promise<DebugServer> {
 	const clients = new Set<ServerResponse>();
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
 	let closed = false;
