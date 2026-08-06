@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { LiveContent } from "./harness.ts";
 import type { MapEntry, SourcePluginMeta, ToolContextPlugin } from "./types.ts";
 
 /**
@@ -50,13 +51,12 @@ export interface DebugContextSnapshot {
 	messages: DebugMessageSummary[];
 }
 
-/** 插件观测视图（含 segments 文本与 render 输出，本地调试用） */
+/** 插件观测视图（引用式重构后只含元数据，不含内容文本；内容实时查看走 /api/plugins/:id/live） */
 export interface DebugPluginState {
 	id: string;
 	category: string;
 	source: { toolName: string; identity: string };
 	metadata: SourcePluginMeta;
-	content: string;
 	memory?: ToolContextPlugin["memory"];
 }
 
@@ -90,12 +90,15 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
-export function createDebugServer(harness: { snapshot(): DebugSnapshot }, port: number): Promise<DebugServer> {
+export function createDebugServer(
+	harness: { snapshot(): DebugSnapshot; liveContent(id: string): Promise<LiveContent | null> },
+	port: number,
+): Promise<DebugServer> {
 	const clients = new Set<ServerResponse>();
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
 	let closed = false;
 
-	const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+	const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
 		// CORS：前端可在任意来源访问（仅本机绑定的调试服务）
 		res.setHeader("access-control-allow-origin", "*");
 		res.setHeader("access-control-allow-methods", "GET, OPTIONS");
@@ -122,6 +125,7 @@ export function createDebugServer(harness: { snapshot(): DebugSnapshot }, port: 
 					"/api/state",
 					"/api/plugins",
 					"/api/plugins/:id",
+					"/api/plugins/:id/live",
 					"/api/context",
 					"/api/project-map",
 					"/api/events (SSE)",
@@ -144,6 +148,18 @@ export function createDebugServer(harness: { snapshot(): DebugSnapshot }, port: 
 		if (path === "/api/project-map") {
 			const snapshot = harness.snapshot();
 			sendJson(res, 200, { entries: snapshot.projectMap });
+			return;
+		}
+		// 实时读盘查看（引用式：磁盘是事实源，点击时读取挂载范围当前内容）——必须放在 /:id 之前匹配
+		const liveMatch = /^\/api\/plugins\/([^/]+)\/live$/.exec(path);
+		if (liveMatch) {
+			const id = decodeURIComponent(liveMatch[1]!);
+			const live = await harness.liveContent(id);
+			if (!live) {
+				sendJson(res, 404, { error: `plugin not found or file unreadable: ${id}` });
+				return;
+			}
+			sendJson(res, 200, live);
 			return;
 		}
 		const pluginMatch = /^\/api\/plugins\/([^/]+)$/.exec(path);

@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import type {
 	ContextEvent,
 	ExtensionContext,
@@ -21,7 +20,6 @@ import {
 } from "./adapters/source.ts";
 import type { DebugContextSnapshot, DebugEvent, DebugMessageSummary, DebugSnapshot } from "./debug.ts";
 import { MAX_CONTEXT_TEXT } from "./debug.ts";
-import { hashBuffer } from "./hash.ts";
 import { type MemoryAgentDeps, summarize } from "./memory/agent.ts";
 import { countChangedLines } from "./memory/diff.ts";
 import {
@@ -37,6 +35,7 @@ import {
 } from "./memory/persist.ts";
 import { ProjectMap } from "./memory/project-map.ts";
 import { MemoryQueue } from "./memory/queue.ts";
+import { FileContentCache } from "./file-cache.ts";
 import { clamp, type LineRange, subtract } from "./ranges.ts";
 import { render } from "./render.ts";
 import { PluginStore } from "./store.ts";
@@ -77,8 +76,18 @@ export interface Harness {
 	shutdown(): Promise<void>;
 	/** 调试/观测快照（debug HTTP 服务用，见 src/debug.ts） */
 	snapshot(): DebugSnapshot;
+	/** 观测面板"点击实时查看"：从磁盘读取挂载范围当前内容（引用式，磁盘是事实源） */
+	liveContent(id: string): Promise<LiveContent | null>;
 	/** M5 新模型：Project Map 目录树渲染（read_project_map 工具用） */
 	projectMapTree(): string;
+}
+
+/** 观测面板"点击实时查看"的返回（debug /api/plugins/:id/live 用） */
+export interface LiveContent {
+	id: string;
+	hash: string;
+	totalLines: number;
+	segments: { start: number; end: number; text: string }[];
 }
 
 /** 测试可注入的依赖（默认全部取自事件 ctx） */
@@ -105,12 +114,15 @@ export interface HarnessOptions {
 	onEvent?: (event: DebugEvent) => void;
 }
 
-/** tool_call 阶段的登记记录（tool_result 按 toolCallId 匹配，计划 §4.2/§4.3） */
+/**
+ * tool_call 阶段的登记记录（tool_result 按 toolCallId 匹配，计划 §4.2/§4.3）。
+ * 引用式重构后不携带 diskLines（内容按需从 file-cache 取）；updated 保留 oldLines 供 diff。
+ */
 type Pending =
 	| { kind: "noop"; pluginId: string }
-	| { kind: "increment"; pluginId: string; diskLines: string[]; hash: string }
-	| { kind: "updated"; pluginId: string; diskLines: string[]; hash: string; oldHash: string }
-	| { kind: "new"; pluginId: string; absPath: string; diskLines: string[]; hash: string };
+	| { kind: "increment"; pluginId: string; hash: string }
+	| { kind: "updated"; pluginId: string; hash: string; oldHash: string; oldLines?: string[] }
+	| { kind: "new"; pluginId: string; absPath: string; hash: string };
 
 function formatRange(r: LineRange): string {
 	return r.start === r.end ? `L${r.start}` : `L${r.start}-${r.end}`;
@@ -138,10 +150,20 @@ function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
 		fn(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>;
 }
 
+/** 失效通知（onContext 用：把锚点消息替换为失效提示行，消除失效后旧文本残留） */
+interface InvalidatedNotice {
+	anchorToolCallId: string;
+	changedLines: number;
+}
+
 export function createHarness(options: HarnessOptions = {}): Harness {
 	const store = options.store ?? new PluginStore();
 	const memoryQueue = options.queue ?? new MemoryQueue(options.debounceMs);
 	const projectMap = options.projectMap ?? new ProjectMap();
+	/** 引用式内容缓存：唯一读盘入口（磁盘是事实源） */
+	const fileCache = new FileContentCache();
+	/** 引用式：插件状态已变化、需要重新渲染锚点消息的插件（渲染后清除；无变化零 IO 零渲染） */
+	const dirtyPlugins = new Set<string>();
 	const pending = new Map<string, Pending>();
 	const agentDir = options.agentDir ?? defaultAgentDir();
 
@@ -194,66 +216,88 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	/**
-	 * 已挂载段相对新磁盘的变更行数：旧段按新行数 clamp 后重切 vs 旧段文本。
-	 * 本次新读的 got 段不算变更（避免"读新范围"误触发失效）。
+	 * 已挂载段相对新磁盘的变更行数：oldLines 为旧磁盘全文（来自 file-cache 的 old），
+	 * 旧段按新行数 clamp 后与旧段行比较。本次新读的 got 段不算变更（避免"读新范围"误触发失效）。
+	 * 无旧文本（resume 首轮 / 大文件 / 缓存被逐出）→ 返回 null：不判定阈值，只重挂载并更新哈希，
+	 * 判定留给下次变更（下次缓存有旧文本）。
 	 */
-	function changedLinesOf(plugin: ToolContextPlugin, diskLines: string[]): number {
+	function changedLinesOf(
+		plugin: ToolContextPlugin,
+		oldLines: string[] | undefined,
+		newLines: string[],
+	): number | null {
+		if (!oldLines) return null;
 		let changed = 0;
 		for (const seg of (plugin.metadata.segments as Segment[] | undefined) ?? []) {
-			const c = clamp({ start: seg.start, end: seg.end }, diskLines.length);
+			const c = clamp({ start: seg.start, end: seg.end }, newLines.length);
 			if (!c) {
 				changed += seg.end - seg.start + 1; // 段被截掉 → 全部算变更
 				continue;
 			}
-			changed += countChangedLines(seg.text.split("\n"), sliceText(diskLines, c).split("\n"));
+			changed += countChangedLines(oldLines.slice(seg.start - 1, seg.end), newLines.slice(c.start - 1, c.end));
 		}
 		return changed;
 	}
 
+	/** 段范围按新总行数 clamp（旧范围可能超出新行数；超出部分视为截断） */
+	function clampSegments(plugin: ToolContextPlugin, totalLines: number): Segment[] {
+		const out: Segment[] = [];
+		for (const s of (plugin.metadata.segments as Segment[] | undefined) ?? []) {
+			const c = clamp({ start: s.start, end: s.end }, totalLines);
+			if (c) out.push({ start: c.start, end: c.end });
+		}
+		return out;
+	}
+
 	/**
 	 * M5 新模型：主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
-	 * 按与 updated 分支相同的变更量逻辑判定：达阈值 → 挂载失效 + project map 失效；未达 → 主动重挂载并累积
-	 * （本轮的锚点刷新会使用最新 render）。
+	 * 引用式重构：经 file-cache 的 stat 快速通道，文件未变（hash 同）→ 完全跳过，零读盘零渲染；
+	 * 变化后按与 updated 分支相同的变更量逻辑判定：达阈值 → 挂载失效 + project map 失效（返回
+	 * 通知，onContext 把锚点替换为提示行）；未达 → 主动重挂载并累积（本轮的锚点刷新使用最新内容）。
 	 */
-	async function scanDiskChanges(): Promise<void> {
+	async function scanDiskChanges(): Promise<InvalidatedNotice[]> {
+		const invalidated: InvalidatedNotice[] = [];
 		for (const plugin of [...store.all()]) {
 			if (!isSourceMeta(plugin)) continue;
 			const absPath = plugin.metadata.absPath;
 			if (typeof absPath !== "string" || absPath.length === 0) continue;
-			let buf: Buffer;
-			try {
-				buf = await readFile(absPath);
-			} catch {
-				continue; // 文件不可读：跳过
-			}
-			const hash = hashBuffer(buf);
-			if (hash === plugin.metadata.hash) continue;
-			const diskLines = buf.toString("utf8").split("\n");
-			const changed = changedLinesOf(plugin, diskLines);
-			const accumulated = ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
+			fileCache.pin(absPath);
+			const r = await fileCache.get(absPath);
+			if (!r) continue; // 文件不可读：跳过
+			const { entry, old } = r;
+			if (entry.hash === plugin.metadata.hash) continue; // 无变化：零读盘
+			const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
+			const changed = changedLinesOf(plugin, old?.lines, diskLines);
+			const accumulated =
+				changed === null
+					? 0 // 无旧文本：不判定阈值，累积归零（判定留给下次变更）
+					: ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
 			const oldHash = plugin.metadata.hash;
-			if (accumulated >= changeThreshold(diskLines.length)) {
+			if (changed !== null && accumulated >= changeThreshold(diskLines.length)) {
 				// 达阈值 → 挂载失效 + project map 失效（与 updated 分支同语义）
+				invalidated.push({ anchorToolCallId: plugin.metadata.anchorToolCallId, changedLines: accumulated });
+				fileCache.unpin(absPath);
 				store.remove(plugin.id);
 				projectMap.delete(plugin.id);
-				emit({ type: "invalidated", pluginId: plugin.id, changedLines: accumulated, oldHash, hash });
+				emit({
+					type: "invalidated",
+					pluginId: plugin.id,
+					changedLines: accumulated,
+					oldHash,
+					hash: entry.hash,
+				});
 				continue;
 			}
-			// 未达阈值：按旧段 clamp 重切重挂载 + 累积（不引入 read 的 got 段）
-			const segments: Segment[] = [];
-			for (const s of (plugin.metadata.segments as Segment[] | undefined) ?? []) {
-				const c = clamp({ start: s.start, end: s.end }, diskLines.length);
-				if (c) segments.push({ start: c.start, end: c.end, text: sliceText(diskLines, c) });
-			}
+			// 未达阈值（或无旧文本不判定）：按旧段 clamp 重切重挂载 + 累积（不引入 read 的 got 段）
 			plugin.metadata = {
 				...plugin.metadata,
-				hash,
+				hash: entry.hash,
 				totalLines: diskLines.length,
-				segments,
+				segments: clampSegments(plugin, diskLines.length),
 				pendingMemoryLines: accumulated,
 				updatedAtHashChange: false,
 			};
-			plugin.content = render(plugin);
+			dirtyPlugins.add(plugin.id); // 重挂载：锚点需用最新磁盘内容重新渲染
 			store.upsert(plugin);
 			persistPlugin(plugin);
 			emit({
@@ -261,11 +305,12 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				pluginId: plugin.id,
 				kind: "updated",
 				oldHash,
-				hash,
-				changedLines: changed,
+				hash: entry.hash,
+				changedLines: changed ?? 0,
 				pendingMemoryLines: accumulated,
 			});
 		}
+		return invalidated;
 	}
 
 	/** 未整理（pending）插件统计：文件数与行数（M5 新模型批量触发判定） */
@@ -286,7 +331,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	 * 经 memoryQueue 串行链调度，不阻塞主流程；失败仅记日志，pending 保留下轮再试。
 	 */
 	async function runMemoryBatch(dialogueContext: string): Promise<void> {
-		const targets = store.all().filter((p) => isSourceMeta(p) && p.metadata.memoryState === "pending");
+		const targets = store
+			.all()
+			.filter(isSourceMeta)
+			.filter((p) => p.metadata.memoryState === "pending");
 		if (targets.length === 0) return;
 		const deps = memoryDeps();
 		if (!deps?.model) {
@@ -297,17 +345,19 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		const mapBrief = projectMap.renderBrief(cwd);
 		let done = 0;
 		for (const plugin of targets) {
+			// 引用式：渲染时点统一为任务开始时取到的磁盘内容（LLM 往返期间的变化下轮 scan 自愈）
+			const r = await fileCache.get(plugin.metadata.absPath);
+			if (!r) continue;
+			const lines = r.entry.lines ?? (await fileCache.readLines(plugin.metadata.absPath));
 			const job: MemoryJob = {
 				pluginId: plugin.id,
 				localContext: lastUserText,
 				dialogueContext,
 			};
-			const output = await summarize(deps, plugin, job, mapBrief);
+			const output = await summarize(deps, plugin, job, mapBrief, lines);
 			if (!output?.mapEntry) continue; // 失败：保留 pending，下轮再试
 			projectMap.update(plugin.id, output.mapEntry);
-			const meta = plugin.metadata as { memoryState?: "pending" | "done" };
-			plugin.metadata = { ...meta, memoryState: "done" };
-			plugin.content = render(plugin);
+			plugin.metadata = { ...plugin.metadata, memoryState: "done" };
 			store.upsert(plugin);
 			await writeProjectMapFile(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
 			persistPlugin(plugin);
@@ -317,7 +367,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		emit({ type: "memory_batch_done", files: done, total: targets.length });
 	}
 
-	/** 计划 §6.4：resume 时回放 custom entries 重建 store；segments 按记录范围+哈希从磁盘重切。 */
+	/**
+	 * 计划 §6.4：resume 时回放 custom entries 重建 store。
+	 * 引用式重构：只恢复元数据（路径/范围/哈希），不读盘重切——磁盘未变时锚点消息历史文本
+	 * 即正确（不需要渲染）；磁盘已变时由 scan/read 按哈希变化自愈。
+	 */
 	async function restorePlugins(): Promise<void> {
 		if (!entriesProvider) return;
 		let entries: SessionEntry[];
@@ -331,34 +385,12 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			const raw = data.plugin;
 			const sourceMeta = raw.metadata as { absPath?: string; hash?: string; segments?: Segment[] } | undefined;
 			if (!sourceMeta?.absPath) continue;
-			try {
-				const buf = await readFile(sourceMeta.absPath);
-				const hash = hashBuffer(buf);
-				const diskLines = buf.toString("utf8").split("\n");
-				if (hash === sourceMeta.hash) {
-					// 哈希一致：按记录范围从磁盘重切文本
-					const segments: Segment[] = [];
-					for (const s of sourceMeta.segments ?? []) {
-						const c = clamp({ start: s.start, end: s.end }, diskLines.length);
-						if (c) segments.push({ start: c.start, end: c.end, text: sliceText(diskLines, c) });
-					}
-					raw.metadata = { ...sourceMeta, totalLines: diskLines.length, segments };
-				} else {
-					// 磁盘已变：段清空、hash 更新；不触发记忆/失效（旧文本不可得无法量化），
-					// 等下一次 read 走 updated 按新内容累积判定（自愈，M5 新模型）
-					raw.metadata = {
-						...sourceMeta,
-						hash,
-						totalLines: diskLines.length,
-						segments: [],
-						updatedAtHashChange: false,
-					};
-				}
-			} catch {
-				// 文件不可读：段清空，等下一次 read 重建
-				raw.metadata = { ...sourceMeta, segments: [] };
-			}
-			raw.content = render(raw);
+			// 历史条目可能带 text 冗余字段：归一为纯范围（多余字段无害）
+			raw.metadata = {
+				...sourceMeta,
+				segments: (sourceMeta.segments ?? []).map((s) => ({ start: s.start, end: s.end })),
+			};
+			fileCache.pin(sourceMeta.absPath);
 			store.upsert(raw);
 		}
 		emit({ type: "restore", pluginCount: store.all().length });
@@ -378,22 +410,19 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				const input = event.input as ReadInputLike;
 				if (typeof input.path !== "string" || input.path.length === 0) return;
 				const absPath = resolveAbsPath(input.path, ctx.cwd);
-				let disk: Buffer;
-				try {
-					disk = await readFile(absPath);
-				} catch {
-					return; // 读不到 → 完全走原生（read 自身报错）
-				}
-				const hash = hashBuffer(disk);
-				const diskLines = disk.toString("utf8").split("\n");
+				// 引用式：经 file-cache（stat 快速通道）取哈希与总行数；文件未变时零读盘
+				const r = await fileCache.get(absPath);
+				if (!r) return; // 读不到 → 完全走原生（read 自身报错）
+				const { entry, old } = r;
+				const hash = entry.hash;
 				const identity = sourceAdapter.identify(input, ctx.cwd);
 				if (!identity) return;
 				const id = `source:${identity}`;
 				const existing = store.get(id);
 
 				if (existing && isSourceMeta(existing) && existing.metadata.hash === hash) {
-					const want = rangeFromInput(input, diskLines.length);
-					if (want.start > diskLines.length) return; // 越界：让 read 原生报错
+					const want = rangeFromInput(input, entry.totalLines);
+					if (want.start > entry.totalLines) return; // 越界：让 read 原生报错
 					const missing = subtract(mountedRanges(existing), want);
 					if (missing.length === 0) {
 						// 全覆盖：不改参数，read 照常执行（IO 廉价），tool_result 里替换成短引用
@@ -405,20 +434,21 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					const m = missing[0]!;
 					input.offset = m.start;
 					input.limit = m.end - m.start + 1;
-					pending.set(event.toolCallId, { kind: "increment", pluginId: id, diskLines, hash });
+					pending.set(event.toolCallId, { kind: "increment", pluginId: id, hash });
 					emit({ type: "tool_call", pluginId: id, kind: "increment", missing: m });
 				} else if (existing && isSourceMeta(existing)) {
 					// 哈希变了：不改参数，让 read 按用户原始意图执行，重挂载在 tool_result 里做（M4）
 					pending.set(event.toolCallId, {
 						kind: "updated",
 						pluginId: id,
-						diskLines,
 						hash,
 						oldHash: existing.metadata.hash,
+						// 旧文本来自本 get 替换前的缓存（diff 用；大文件/缓存被逐出时为 undefined → 不判定阈值）
+						oldLines: old?.lines,
 					});
 					emit({ type: "tool_call", pluginId: id, kind: "updated", oldHash: existing.metadata.hash });
 				} else {
-					pending.set(event.toolCallId, { kind: "new", pluginId: id, absPath, diskLines, hash });
+					pending.set(event.toolCallId, { kind: "new", pluginId: id, absPath, hash });
 					emit({ type: "tool_call", pluginId: id, kind: "new" });
 				}
 			} catch (err) {
@@ -456,38 +486,57 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 
 				const startLine = Math.max(1, typeof input.offset === "number" ? input.offset : 1);
 				const truncation = (event.details as { truncation?: TruncationResult } | undefined)?.truncation;
-				let gotEnd: number;
 				if (truncation?.firstLineExceedsLimit) {
 					return undefined; // 输出是 bash 提示而非文件文本 → 不挂载（原生透传）
 				}
+				// 引用式：总行数从 file-cache 取（tool_call 后文件被改的 TOCTOU 由各分支 hash 比对兜底）
+				const existing0 = p.kind === "new" ? undefined : store.get(p.pluginId);
+				const absPath0 =
+					p.kind === "new" ? p.absPath : existing0 && isSourceMeta(existing0) ? existing0.metadata.absPath : undefined;
+				if (!absPath0) return undefined;
+				const r0 = await fileCache.get(absPath0);
+				if (!r0) return undefined;
+				const totalLines = r0.entry.totalLines;
+				let gotEnd: number;
 				if (truncation) {
 					gotEnd = startLine + truncation.outputLines - 1; // 精确：truncation 按完整行计
 				} else if (typeof input.limit === "number") {
 					const limit = Math.max(0, input.limit);
-					gotEnd = startLine + Math.min(limit, p.diskLines.length - startLine + 1) - 1;
+					gotEnd = startLine + Math.min(limit, totalLines - startLine + 1) - 1;
 				} else {
-					gotEnd = p.diskLines.length;
+					gotEnd = totalLines;
 				}
 				if (gotEnd < startLine) return undefined;
 				const got: LineRange = { start: startLine, end: gotEnd };
+
+				/** 引用式：取当前磁盘行（缓存命中零读盘），并对 tool_call 后的变化（TOCTOU）透传 */
+				async function currentLines(absPath: string, expectHash: string): Promise<string[] | undefined> {
+					const r = await fileCache.get(absPath);
+					if (!r || r.entry.hash !== expectHash) return undefined; // 不可读/文件已变 → 原生透传，下轮 scan 自愈
+					return r.entry.lines ?? (await fileCache.readLines(absPath));
+				}
 
 				switch (p.kind) {
 					case "new": {
 						const existing = store.get(p.pluginId);
 						if (existing && isSourceMeta(existing)) {
 							// 并行竞态（计划 §4.3）：第一个 new 已落地 → 转 increment，anchor 先到先得
+							const lines = await currentLines(existing.metadata.absPath, p.hash);
+							if (!lines) return undefined;
 							const plugin = sourceAdapter.ingest(input, text, existing, {
 								absPath: existing.metadata.absPath,
 								hash: p.hash,
-								diskLines: p.diskLines,
+								totalLines: lines.length,
 								anchorToolCallId: existing.metadata.anchorToolCallId,
 								got,
 								mode: "increment",
 							});
+							fileCache.pin(existing.metadata.absPath);
+							dirtyPlugins.add(plugin.id);
 							store.upsert(plugin);
 							emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
 							const all = mountedRanges(plugin).map(formatRange).join(", ");
-							const body = sliceText(p.diskLines, got);
+							const body = sliceText(lines, got);
 							return {
 								content: [
 									{
@@ -501,7 +550,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						const plugin = sourceAdapter.ingest(input, text, undefined, {
 							absPath: p.absPath,
 							hash: p.hash,
-							diskLines: p.diskLines,
+							totalLines: r0.entry.totalLines,
 							anchorToolCallId: event.toolCallId,
 							got,
 							mode: "new",
@@ -509,7 +558,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						// M5 新模型：新文件首次挂载 → 标记 pending（记忆只在新增驱动，修改走失效）
 						const newMeta = plugin.metadata as { memoryState?: "pending" | "done" };
 						plugin.metadata = { ...newMeta, memoryState: "pending" };
-						plugin.content = render(plugin);
+						fileCache.pin(p.absPath);
+						dirtyPlugins.add(plugin.id);
 						store.upsert(plugin);
 						persistPlugin(plugin);
 						emit({ type: "mounted", pluginId: plugin.id, kind: "new", hash: p.hash, got });
@@ -530,18 +580,22 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					case "increment": {
 						const existing = store.get(p.pluginId);
 						if (!existing || !isSourceMeta(existing)) return undefined;
+						const lines = await currentLines(existing.metadata.absPath, p.hash);
+						if (!lines) return undefined;
 						const plugin = sourceAdapter.ingest(input, text, existing, {
 							absPath: existing.metadata.absPath,
 							hash: p.hash,
-							diskLines: p.diskLines,
+							totalLines: lines.length,
 							anchorToolCallId: existing.metadata.anchorToolCallId,
 							got,
 							mode: "increment",
 						});
+						fileCache.pin(existing.metadata.absPath);
+						dirtyPlugins.add(plugin.id);
 						store.upsert(plugin);
 						emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
 						const all = mountedRanges(plugin).map(formatRange).join(", ");
-						const body = sliceText(p.diskLines, got);
+						const body = sliceText(lines, got);
 						return {
 							content: [
 								{
@@ -554,21 +608,26 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					case "updated": {
 						const existing = store.get(p.pluginId);
 						if (!existing || !isSourceMeta(existing)) return undefined;
+						const lines = await currentLines(existing.metadata.absPath, p.hash);
+						if (!lines) return undefined;
 						// M5 新模型：变更量只算"已挂载段"的内容变化（本次 read 的 got 段是新挂载，不算变更）
-						const changed = changedLinesOf(existing, p.diskLines);
-						const accumulated = ((existing.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
+						const changed = changedLinesOf(existing, p.oldLines, lines);
+						const accumulated =
+							changed === null
+								? 0 // 无旧文本：不判定阈值，累积归零（判定留给下次变更）
+								: ((existing.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
 						const plugin = sourceAdapter.ingest(input, text, existing, {
 							absPath: existing.metadata.absPath,
 							hash: p.hash,
-							diskLines: p.diskLines,
+							totalLines: lines.length,
 							anchorToolCallId: existing.metadata.anchorToolCallId,
 							got,
 							mode: "updated",
 						});
-						if (accumulated >= changeThreshold(p.diskLines.length)) {
+						if (changed !== null && accumulated >= changeThreshold(lines.length)) {
 							// 修改累计到阈值 → 直接挂载失效 + project map 失效（不跑记忆 Agent）；
-							// 本次原生透传，下次 read 走新增流程重建（自愈闭环）。旧 custom entry 无法删除，
-							// resume 时哈希不一致 → 段清空，无害。
+							// 本次改写为失效提示（旧 custom entry 无法删除，resume 时哈希不一致 → 段清空，无害）
+							fileCache.unpin(existing.metadata.absPath);
 							store.remove(plugin.id);
 							projectMap.delete(plugin.id);
 							emit({
@@ -578,12 +637,20 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 								oldHash: p.oldHash,
 								hash: p.hash,
 							});
-							return undefined;
+							return {
+								content: [
+									{
+										type: "text",
+										text: `[piwpi: ${plugin.source.identity} 文件大改（${accumulated} 行），挂载已失效，请重新 read]`,
+									},
+								],
+							};
 						}
 						// 未达阈值：累积变更行数，正常重挂载
 						const meta = plugin.metadata as { pendingMemoryLines?: number };
 						plugin.metadata = { ...meta, pendingMemoryLines: accumulated };
-						plugin.content = render(plugin);
+						fileCache.pin(existing.metadata.absPath);
+						dirtyPlugins.add(plugin.id);
 						store.upsert(plugin);
 						persistPlugin(plugin);
 						emit({
@@ -596,7 +663,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							pendingMemoryLines: accumulated,
 						});
 						const all = mountedRanges(plugin).map(formatRange).join(", ");
-						const body = sliceText(p.diskLines, got);
+						const body = sliceText(lines, got);
 						return {
 							content: [
 								{
@@ -618,8 +685,23 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		async onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
-				// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载
-				await scanDiskChanges();
+				// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载；
+				// 引用式：stat 快速通道，文件未变零读盘；返回失效列表 → 锚点替换为提示行
+				const invalidated = await scanDiskChanges();
+				// 失效提示：把锚点旧文本替换为一行提示（消除"失效后对话保留旧内容"的不一致）
+				for (const inv of invalidated) {
+					for (const m of event.messages) {
+						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
+						if (msg.role !== "toolResult" || msg.toolCallId !== inv.anchorToolCallId) continue;
+						msg.content = [
+							{
+								type: "text",
+								text: `[piwpi: 文件大改（${inv.changedLines} 行），挂载已失效，请重新 read]`,
+							},
+						];
+						break;
+					}
+				}
 				// 记录最近一条 user 消息（M5 记忆任务的 localContext 来源）。
 				// AgentMessage 联合类型含 BashExecutionMessage（content 为 string），用结构访问防御。
 				for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -663,12 +745,17 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				recentDialogue = dialogueParts.join("\n").slice(0, 4000);
 				for (const plugin of store.all()) {
 					if (!isSourceMeta(plugin)) continue;
+					if (!dirtyPlugins.has(plugin.id)) continue; // 引用式：状态未变 → 锚点文本已最新，零 IO 零渲染
 					let refreshed = false;
 					for (const m of event.messages) {
 						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
 						if (msg.role !== "toolResult" || msg.toolCallId !== plugin.metadata.anchorToolCallId) continue;
-						// 锚点找到：原地替换 content（引用同一对象，runner 返回的 clone 即被修改）
-						const fresh = render(plugin);
+						// 锚点找到：引用式渲染（内容从 file-cache 按需读磁盘），原地替换 content
+						// （引用同一对象，runner 返回的 clone 即被修改）
+						const r = await fileCache.get(plugin.metadata.absPath);
+						if (!r) break;
+						const lines = r.entry.lines ?? (await fileCache.readLines(plugin.metadata.absPath));
+						const fresh = render(plugin, lines);
 						const cur = msg.content?.[0] as { type?: string; text?: string } | undefined;
 						if (cur?.type === "text" && cur.text !== fresh) {
 							msg.content = [{ type: "text", text: fresh }];
@@ -676,6 +763,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						}
 						break;
 					}
+					dirtyPlugins.delete(plugin.id);
 					if (!refreshed) continue; // 锚点被压缩/裁剪 → 本次跳过（计划 §8 已知限制）
 				}
 				// 上下文摘要（debug 服务用）：每条消息文本截断，防快照膨胀
@@ -748,14 +836,13 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			emit({ type: "shutdown" });
 		},
 
-		/** 调试/观测快照（debug HTTP 服务用）。 */
+		/** 调试/观测快照（debug HTTP 服务用）。引用式：快照只含元数据，不含内容文本。 */
 		snapshot(): DebugSnapshot {
 			const plugins: DebugSnapshot["plugins"] = store.all().map((p) => ({
 				id: p.id,
 				category: p.category,
 				source: p.source,
 				metadata: p.metadata as unknown as DebugSnapshot["plugins"][number]["metadata"],
-				content: p.content,
 				memory: p.memory,
 			}));
 			return {
@@ -768,6 +855,19 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				lastUserText,
 				context: lastContext,
 			};
+		},
+
+		/** 观测面板"点击实时查看"：从磁盘读取挂载范围当前内容（引用式，磁盘是事实源）。 */
+		async liveContent(id: string): Promise<LiveContent | null> {
+			const plugin = store.get(id);
+			if (!plugin || !isSourceMeta(plugin)) return null;
+			const r = await fileCache.get(plugin.metadata.absPath);
+			if (!r) return null;
+			const lines = r.entry.lines ?? (await fileCache.readLines(plugin.metadata.absPath));
+			const segments = ((plugin.metadata.segments as Segment[] | undefined) ?? [])
+				.filter((s) => s.start <= s.end)
+				.map((s) => ({ start: s.start, end: s.end, text: sliceText(lines, s) }));
+			return { id, hash: r.entry.hash, totalLines: lines.length, segments };
 		},
 
 		/** M5 新模型：Project Map 目录树渲染（read_project_map 工具用）。 */

@@ -60,24 +60,30 @@ Rules:
 /**
  * 组装 LLM 输入（纯函数，可单测）。M5 新模型：输入域严格限定为三段——
  * ① 该文件挂载内容 ② 主 Agent 对话尾部（去重）③ Project Map 精简列表。
+ * 引用式：挂载内容由调用方传入磁盘行（lines）渲染，渲染时点与调用方一致。
  */
-export function buildMemoryPrompt(plugin: ToolContextPlugin, job: MemoryJob, mapBrief: string): string {
-	const lines: string[] = [];
-	lines.push("# piwpi 记忆整理任务（首次身份定义）");
-	lines.push(`文件：${plugin.source.identity}`);
-	lines.push(`当前用户消息：${job.localContext || "（无）"}`);
-	lines.push("");
-	lines.push("## 输入一：该文件挂载内容（确定性渲染）");
-	lines.push(render(plugin));
-	lines.push("");
-	lines.push("## 输入二：主 Agent 最近对话（已去重：工具结果仅保留标记行，与挂载内容不重叠）");
-	lines.push(job.dialogueContext || "（无）");
-	lines.push("");
-	lines.push("## 输入三：Project Map 已有条目（精简，用于推断依赖/被依赖、避免重复定义）");
-	lines.push(mapBrief || "（无）");
-	lines.push("");
-	lines.push("输出该文件的 Project Map 条目（mapEntry JSON），只输出一个 JSON 对象，不要输出任何其他内容。");
-	return lines.join("\n");
+export function buildMemoryPrompt(
+	plugin: ToolContextPlugin,
+	job: MemoryJob,
+	mapBrief: string,
+	lines: string[],
+): string {
+	const out: string[] = [];
+	out.push("# piwpi 记忆整理任务（首次身份定义）");
+	out.push(`文件：${plugin.source.identity}`);
+	out.push(`当前用户消息：${job.localContext || "（无）"}`);
+	out.push("");
+	out.push("## 输入一：该文件挂载内容（确定性渲染）");
+	out.push(render(plugin, lines));
+	out.push("");
+	out.push("## 输入二：主 Agent 最近对话（已去重：工具结果仅保留标记行，与挂载内容不重叠）");
+	out.push(job.dialogueContext || "（无）");
+	out.push("");
+	out.push("## 输入三：Project Map 已有条目（精简，用于推断依赖/被依赖、避免重复定义）");
+	out.push(mapBrief || "（无）");
+	out.push("");
+	out.push("输出该文件的 Project Map 条目（mapEntry JSON），只输出一个 JSON 对象，不要输出任何其他内容。");
+	return out.join("\n");
 }
 
 /** 解析模型输出为 MemoryOutput；任何不合法输入 → null（调用方保留现状，绝不影响主流程） */
@@ -124,9 +130,10 @@ export async function summarize(
 	plugin: ToolContextPlugin,
 	job: MemoryJob,
 	mapBrief: string,
+	lines: string[],
 ): Promise<MemoryOutput | null> {
 	if (!deps.model) return null;
-	const prompt = buildMemoryPrompt(plugin, job, mapBrief);
+	const prompt = buildMemoryPrompt(plugin, job, mapBrief, lines);
 	try {
 		const response = await deps.complete(deps.model, {
 			systemPrompt: MEMORY_SYSTEM_PROMPT,

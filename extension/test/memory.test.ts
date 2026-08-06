@@ -26,18 +26,20 @@ function plugin(over?: Partial<ToolContextPlugin>): ToolContextPlugin {
 		id: "source:file:a",
 		category: "source",
 		source: { toolName: "read", identity: "file:a" },
-		content: "",
 		metadata: {
 			absPath: "C:\\x\\a.ts",
 			hash: "h",
 			totalLines: 10,
-			segments: [{ start: 1, end: 2, text: "a\nb" }],
+			segments: [{ start: 1, end: 2 }],
 			anchorToolCallId: "t1",
 			updatedAtHashChange: false,
 		},
 		...over,
 	};
 }
+
+/** 引用式：渲染输入的行数组（与 plugin 的 segments 范围 1-2 对应） */
+const LINES = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
 
 const JOB: MemoryJob = { pluginId: "source:file:a", localContext: "改一下认证", dialogueContext: "[user] 看看认证" };
 
@@ -151,7 +153,7 @@ describe("countChangedLines（M5 变更量 diff）", () => {
 describe("记忆 Agent（M5 新模型）", () => {
 	it("buildMemoryPrompt 三段输入：挂载内容 / 对话尾部（去重说明）/ map 精简列表", () => {
 		const p = plugin();
-		const prompt = buildMemoryPrompt(p, JOB, "src/b.ts — auth; 依赖: config.ts");
+		const prompt = buildMemoryPrompt(p, JOB, "src/b.ts — auth; 依赖: config.ts", LINES);
 		expect(prompt).toContain("改一下认证");
 		expect(prompt).toContain("[piwpi:plugin");
 		expect(prompt).toContain("[user] 看看认证");
@@ -211,21 +213,23 @@ describe("记忆 Agent（M5 新模型）", () => {
 				},
 			],
 		}));
-		const out = await summarize({ complete, model: { provider: "faux" } }, plugin(), JOB, "");
+		const out = await summarize({ complete, model: { provider: "faux" } }, plugin(), JOB, "", LINES);
 		expect(out?.mapEntry?.role).toBe("新角色");
 
 		const bad = vi.fn(async () => ({ content: [{ type: "text", text: "oops" }] }));
-		expect(await summarize({ complete: bad, model: { provider: "faux" } }, plugin(), JOB, "")).toBeNull();
+		expect(await summarize({ complete: bad, model: { provider: "faux" } }, plugin(), JOB, "", LINES)).toBeNull();
 
 		const throwing = vi.fn(async () => {
 			throw new Error("LLM down");
 		});
-		expect(await summarize({ complete: throwing, model: { provider: "faux" } }, plugin(), JOB, "")).toBeNull();
+		expect(
+			await summarize({ complete: throwing, model: { provider: "faux" } }, plugin(), JOB, "", LINES),
+		).toBeNull();
 	});
 
 	it("无模型 → 直接返回 null（不调 LLM）", async () => {
 		const complete = vi.fn();
-		expect(await summarize({ complete, model: undefined }, plugin(), JOB, "")).toBeNull();
+		expect(await summarize({ complete, model: undefined }, plugin(), JOB, "", LINES)).toBeNull();
 		expect(complete).not.toHaveBeenCalled();
 	});
 
@@ -371,10 +375,10 @@ describe("persist（计划 §6.4）", () => {
 		expect(data).toEqual({ p1: { role: "auth" } });
 	});
 
-	it("serializePlugin 剥离 segment 大段文本（恢复时从磁盘重切）", () => {
+	it("serializePlugin 原样序列化（引用式：插件本身不携带文本）", () => {
 		const data = serializePlugin(plugin());
-		const meta = data.plugin.metadata as unknown as { segments: { text: string }[] };
-		expect(meta.segments).toEqual([{ start: 1, end: 2, text: "" }]);
+		const meta = data.plugin.metadata as unknown as { segments: Array<{ start: number; end: number }> };
+		expect(meta.segments).toEqual([{ start: 1, end: 2 }]);
 	});
 
 	it("restoreFromEntries 只收 piwpi custom entries", () => {

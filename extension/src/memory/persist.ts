@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { SourcePluginMeta, ToolContextPlugin } from "../types.ts";
+import type { ToolContextPlugin } from "../types.ts";
 
 /**
  * 双通道持久化（计划 §6.4）。
@@ -20,7 +20,7 @@ import type { SourcePluginMeta, ToolContextPlugin } from "../types.ts";
 /** custom entry 类型名（SessionManager.appendCustomEntry 的 customType） */
 export const CUSTOM_ENTRY_TYPE = "piwpi:plugin";
 
-/** 持久化载荷：版本 + 插件状态（segments 不含 text，恢复时按范围+哈希从磁盘重切） */
+/** 持久化载荷：版本 + 插件状态（引用式：只存路径/范围/哈希，内容按需从磁盘读取） */
 export interface PersistedPluginData {
 	version: 1;
 	plugin: ToolContextPlugin;
@@ -51,19 +51,12 @@ export function defaultAgentDir(): string {
 	return join(homedir(), ".pi", "agent");
 }
 
-/** 序列化插件状态：segments 只保留范围（计划 §6.4"不含大段文本"） */
+/**
+ * 序列化插件状态（引用式重构后插件本身不携带文本；历史条目可能带 text/content 冗余字段，
+ * 恢复时多余字段无害，不 version bump）。
+ */
 export function serializePlugin(plugin: ToolContextPlugin): PersistedPluginData {
-	const meta = plugin.metadata as unknown as SourcePluginMeta;
-	return {
-		version: 1,
-		plugin: {
-			...plugin,
-			metadata: {
-				...meta,
-				segments: meta.segments.map((s) => ({ start: s.start, end: s.end, text: "" })),
-			},
-		},
-	};
+	return { version: 1, plugin };
 }
 
 /** 从 session entries 中收集 piwpi custom entries（恢复用）。 */

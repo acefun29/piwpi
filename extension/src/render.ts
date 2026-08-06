@@ -9,26 +9,27 @@ import type { SourcePluginMeta, ToolContextPlugin } from "./types.ts";
  *   <原始文本>
  *
  * 规则：segments 按 start 升序输出；不重排行号、不加行号前缀。
- * 说明：M5 新模型下记忆整理产物只进 Project Map（docs/project-map-protocol.md），不再渲染进挂载内容。
+ * 说明：挂载引用式重构后段文本不驻留插件，由调用方从 file-cache 取磁盘行传入；
+ * 段范围按新行数 clamp（越界 slice 自动截断，调用方已保证 clamp）。
  */
 
 function formatRange(start: number, end: number): string {
 	return start === end ? `L${start}` : `L${start}-${end}`;
 }
 
-export function render(plugin: ToolContextPlugin): string {
+export function render(plugin: ToolContextPlugin, lines: string[]): string {
 	const meta = plugin.metadata as Partial<SourcePluginMeta> | undefined;
 	if (!meta) return "";
 
 	const segments = [...(meta.segments ?? [])].sort((a, b) => a.start - b.start || a.end - b.end);
-	const lines: string[] = [];
+	const out: string[] = [];
 	const mounted = segments.map((s) => formatRange(s.start, s.end)).join(", ");
 	const hash = meta.hash ? meta.hash.slice(0, 8) : "";
-	lines.push(`[piwpi:plugin ${plugin.source.identity} hash:${hash} mounted:${mounted}]`);
-	if (meta.truncatedNote) lines.push(meta.truncatedNote);
+	out.push(`[piwpi:plugin ${plugin.source.identity} hash:${hash} mounted:${mounted}]`);
+	if (meta.truncatedNote) out.push(meta.truncatedNote);
 	for (const seg of segments) {
-		lines.push(`--- ${formatRange(seg.start, seg.end)} ---`);
-		lines.push(seg.text);
+		out.push(`--- ${formatRange(seg.start, seg.end)} ---`);
+		out.push(lines.slice(seg.start - 1, seg.end).join("\n"));
 	}
-	return lines.join("\n");
+	return out.join("\n");
 }

@@ -94,7 +94,7 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		expect(state.cwd).toBe(tmp);
 	});
 
-	it("read 流程后：快照含插件（segments/锚点），插件详情含 render 输出", async () => {
+	it("read 流程后：快照含插件元数据（引用式无文本），live 端点实时读盘返回段文本", async () => {
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, text20_40), ctx());
 
@@ -103,7 +103,7 @@ describe("debug 服务（HTTP 快照端点）", () => {
 			plugins: Array<{
 				id: string;
 				metadata: {
-					segments: Array<{ start: number; end: number; text: string }>;
+					segments: Array<{ start: number; end: number }>;
 					anchorToolCallId: string;
 					hash: string;
 				};
@@ -114,7 +114,7 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		expect(state.plugins).toHaveLength(1);
 		const plugin = state.plugins[0]!;
 		expect(plugin.id).toBe(fileId(absFile));
-		expect(plugin.metadata.segments).toEqual([{ start: 20, end: 40, text: text20_40 }]);
+		expect(plugin.metadata.segments).toEqual([{ start: 20, end: 40 }]);
 		expect(plugin.metadata.anchorToolCallId).toBe("t1");
 		expect((plugin.metadata as { memoryState?: string }).memoryState).toBe("pending"); // M5 新模型
 		expect(state.pendingCount).toBe(0);
@@ -123,14 +123,18 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		const list = (await fetchJson(`http://127.0.0.1:${server.port}/api/plugins`)).body as unknown[];
 		expect(list).toHaveLength(1);
 
-		const detail = await fetchJson(
-			`http://127.0.0.1:${server.port}/api/plugins/${encodeURIComponent(fileId(absFile))}`,
+		// 实时读盘（引用式：磁盘是事实源）→ 挂载范围当前文本
+		const live = await fetchJson(
+			`http://127.0.0.1:${server.port}/api/plugins/${encodeURIComponent(fileId(absFile))}/live`,
 		);
-		expect(detail.status).toBe(200);
-		expect((detail.body as { content: string }).content).toContain("--- L20-40 ---");
+		expect(live.status).toBe(200);
+		const liveBody = live.body as { segments: Array<{ start: number; end: number; text: string }> };
+		expect(liveBody.segments).toEqual([{ start: 20, end: 40, text: text20_40 }]);
 
 		const missing = await fetchJson(`http://127.0.0.1:${server.port}/api/plugins/nope`);
 		expect(missing.status).toBe(404);
+		const missingLive = await fetchJson(`http://127.0.0.1:${server.port}/api/plugins/nope/live`);
+		expect(missingLive.status).toBe(404);
 	});
 
 	it("onContext 后：/api/context 返回截断摘要", async () => {

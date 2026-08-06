@@ -8,7 +8,6 @@ function plugin(id: string, anchor: string, extra?: Partial<ToolContextPlugin>):
 		id,
 		category: "source",
 		source: { toolName: "read", identity: id },
-		content: "",
 		metadata: {
 			absPath: `C:\\x\\${id}`,
 			hash: "h",

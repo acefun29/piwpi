@@ -103,7 +103,7 @@ describe("M3 §4.2/§4.3：拦截与增量读取", () => {
 
 		const p = store.get(fileId(absFile));
 		expect(p).toBeDefined();
-		expect(sourceMeta(p!).segments).toEqual([{ start: 20, end: 40, text: text20_40 }]);
+		expect(sourceMeta(p!).segments).toEqual([{ start: 20, end: 40 }]);
 		expect(sourceMeta(p!).anchorToolCallId).toBe("t1");
 		expect(sourceMeta(p!).memoryState).toBe("pending"); // M5 新模型：新挂载标记 pending
 	});
@@ -128,7 +128,7 @@ describe("M3 §4.2/§4.3：拦截与增量读取", () => {
 		expect(res?.content?.[0]?.text).toContain(text41_60);
 
 		const p = store.get(fileId(absFile))!;
-		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 60, text: text20_60 }]);
+		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 60 }]);
 		expect(sourceMeta(p).anchorToolCallId).toBe("t1"); // anchor 不变
 	});
 
@@ -176,7 +176,7 @@ describe("M3 §4.2/§4.3：拦截与增量读取", () => {
 		);
 		expect(res).toBeUndefined();
 		const p = store.get(fileId(absFile))!;
-		expect(sourceMeta(p).segments).toEqual([{ start: 1, end: 2000, text: sliceOf(5000, 1, 2000) }]);
+		expect(sourceMeta(p).segments).toEqual([{ start: 1, end: 2000 }]);
 	});
 
 	it("firstLineExceedsLimit → 不挂载（原生透传）", async () => {
@@ -210,8 +210,10 @@ describe("M3 §4.2/§4.3：拦截与增量读取", () => {
 		expect(r2?.content?.[0]?.text).toContain("本次新增 L50-59");
 		const p = store.get(fileId(absFile))!;
 		expect(sourceMeta(p).anchorToolCallId).toBe("p1");
-		expect(sourceMeta(p).segments.map((s) => s.text)).toContain(sliceTextOf(1, 10));
-		expect(sourceMeta(p).segments.map((s) => s.text)).toContain(sliceTextOf(50, 59));
+		expect(sourceMeta(p).segments).toEqual([
+			{ start: 1, end: 10 },
+			{ start: 50, end: 59 },
+		]);
 	});
 });
 
@@ -223,7 +225,7 @@ describe("M3 §4.4：固定上下文区域（锚点刷新）", () => {
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
 		const p = store.get(fileId(absFile))!;
-		const fresh = render(p);
+		const fresh = render(p, readFileSync(absFile, "utf8").split("\n"));
 
 		// 第一次：锚点是原生全文 → 被替换为渲染
 		const messages = [
@@ -291,17 +293,9 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		const meta = sourceMeta(p);
 		expect(meta.hash).toBe(hashBuffer(readFileSync(absFile)));
 		expect(meta.hash).not.toBe(oldHash);
-		// 旧范围 20-40 按新磁盘重切 + 本次 30-50 → 合并 20-50
+		// 旧范围 20-40 clamp 到新磁盘 + 本次 30-50 → 合并 20-50
 		const merged = meta.segments.map((s) => `${s.start}-${s.end}`).join(",");
 		expect(merged).toBe("20-50");
-		for (const s of meta.segments) {
-			expect(s.text).toBe(
-				readFileSync(absFile, "utf8")
-					.split("\n")
-					.slice(s.start - 1, s.end)
-					.join("\n"),
-			);
-		}
 		expect(meta.updatedAtHashChange).toBe(true);
 		// 尾部追加不影响已挂载段 → 变更量 0，不触发记忆（pendingMemoryLines 保持 0）
 		expect(complete).not.toHaveBeenCalled();
@@ -335,7 +329,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 			readResult("t2", { path: FILE, offset: 20, limit: 41 }, { text: big.split("\n").slice(19, 60).join("\n") }),
 			ctx(),
 		);
-		expect(res).toBeUndefined(); // 原生透传（不挂载）
+		expect(res?.content?.[0]?.text).toContain("挂载已失效"); // 失效提示行（替换原生透传）
 		expect(store.get(fileId(absFile))).toBeUndefined(); // 挂载失效
 		expect(projectMap.get(fileId(absFile))).toBeUndefined(); // project map 失效
 		expect(events).toContain("invalidated");
@@ -369,8 +363,8 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 			);
 			const plugin = store.get(fileId(absFile));
 			if (!plugin) {
-				// 达阈值 → 已失效：原生透传 + map 删除
-				expect(res).toBeUndefined();
+				// 达阈值 → 已失效：失效提示行 + map 删除
+				expect(res?.content?.[0]?.text).toContain("挂载已失效");
 				expect(projectMap.get(fileId(absFile))).toBeUndefined();
 				continue;
 			}
@@ -406,7 +400,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		for (const s of meta.segments) {
 			expect(s.end).toBeLessThanOrEqual(75);
 		}
-		expect(render(p)).toContain(meta.truncatedNote!);
+		expect(render(p, readFileSync(absFile, "utf8").split("\n"))).toContain(meta.truncatedNote!);
 		expect(store.get(fileId(absFile))).toBeDefined(); // 小缩短不失效
 	});
 
@@ -467,7 +461,6 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		const meta = sourceMeta(p);
 		expect(meta.hash).toBe(hashBuffer(readFileSync(absFile))); // 已更新为磁盘值
 		expect(meta.pendingMemoryLines).toBe(4); // 累积
-		expect(meta.segments[0]!.text).toContain("x"); // 已按磁盘重切
 
 		// 后续 read：hash 一致 → 走 increment（只补缺失段 41-50）
 		const call = readCall("t2", { path: FILE, offset: 30, limit: 21 });
@@ -531,9 +524,9 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 
 		expect(written.length).toBeGreaterThan(0);
 		const persisted = written[written.length - 1]![1] as { plugin: ToolContextPlugin };
-		// 持久化不含大段文本
+		// 引用式：持久化只含范围，不含文本字段
 		const segs = persisted.plugin.metadata as unknown as { segments: Segment[] };
-		expect(segs.segments.every((s) => s.text === "")).toBe(true);
+		expect(segs.segments.every((s) => !("text" in s))).toBe(true);
 
 		const mapFile = projectMapFilePath(agentDir, tmp);
 		expect(existsSync(mapFile)).toBe(true);
@@ -584,12 +577,11 @@ describe("M5 §6.4：session_start 恢复", () => {
 			id: fileId(absFile),
 			category: "source",
 			source: { toolName: "read", identity: fileId(absFile).replace("source:", "") },
-			content: "",
 			metadata: {
 				absPath: absFile,
 				hash: "PLACEHOLDER",
 				totalLines: 80,
-				segments: [{ start: 20, end: 40, text: "" }],
+				segments: [{ start: 20, end: 40 }],
 				anchorToolCallId: "t1",
 				updatedAtHashChange: false,
 			},
@@ -603,7 +595,7 @@ describe("M5 §6.4：session_start 恢复", () => {
 		return [{ type: "custom", customType: CUSTOM_ENTRY_TYPE, data, id: "e1" }] as unknown as SessionEntry[];
 	}
 
-	it("resume：从 custom entries 恢复，segments 按哈希从磁盘重切", async () => {
+	it("resume：从 custom entries 恢复元数据（引用式不重切文本，磁盘未变时锚点历史文本即正确）", async () => {
 		write80Lines();
 		const store = new PluginStore();
 		const data = persistedData();
@@ -613,11 +605,11 @@ describe("M5 §6.4：session_start 恢复", () => {
 		await h.onSessionStart({ type: "session_start", reason: "resume" } as never, ctx());
 		const p = store.get(fileId(absFile))!;
 		expect(p.memory?.summary).toBe("旧记忆");
-		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 40, text: text20_40 }]); // 文本重切
+		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 40 }]); // 只恢复范围
 		expect(sourceMeta(p).anchorToolCallId).toBe("t1");
 	});
 
-	it("resume 但磁盘已变：段清空、hash 更新为磁盘值、不投递记忆（等下次 read 判定）", async () => {
+	it("resume 但磁盘已变：保留原元数据，不投递记忆（等 scan/read 按哈希变化自愈）", async () => {
 		write80Lines();
 		const store = new PluginStore();
 		const data = persistedData(); // hash=PLACEHOLDER ≠ 磁盘
@@ -634,15 +626,15 @@ describe("M5 §6.4：session_start 恢复", () => {
 		});
 		await h.onSessionStart({ type: "session_start", reason: "resume" } as never, ctx());
 		const p = store.get(fileId(absFile))!;
-		expect(sourceMeta(p).segments).toEqual([]);
-		expect(sourceMeta(p).hash).toBe(hashBuffer(readFileSync(absFile)));
+		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 40 }]); // 引用式：不做磁盘判定
+		expect(sourceMeta(p).hash).toBe("PLACEHOLDER");
 		expect(complete).not.toHaveBeenCalled(); // M5 新模型：resume 不投递记忆，等 read 判定
-		// 下一次 read：hash 已更新为磁盘值 → 走 increment 补段重新挂载
+		// 下一次 read：hash 与磁盘不一致 → 走 updated 重挂载（无旧文本 → 不判定阈值）
 		const call = readCall("t9", { path: FILE, offset: 20, limit: 21 });
 		await h.onToolCall(call, ctx());
-		expect((call.input as { offset?: number }).offset).toBe(20); // 段为空 → 视为缺失，但走 increment 分支改写为缺失段本身
+		expect((call.input as { offset?: number }).offset).toBe(20); // updated 不改参数
 		await h.onToolResult(readResult("t9", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
-		expect(sourceMeta(store.get(fileId(absFile))!).segments).toEqual([{ start: 20, end: 40, text: text20_40 }]);
+		expect(sourceMeta(store.get(fileId(absFile))!).segments).toEqual([{ start: 20, end: 40 }]);
 	});
 
 	it("startup（非 resume）：不恢复", async () => {

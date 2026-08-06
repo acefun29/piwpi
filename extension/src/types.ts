@@ -12,9 +12,7 @@ export interface ToolContextPlugin {
 	id: string;
 	category: PluginCategory;
 	source: { toolName: string; identity: string };
-	/** 保留：render 的冗余缓存或调试用 */
-	content: string;
-	/** Source 插件内部结构见 SourcePluginMeta */
+	/** Source 插件内部结构见 SourcePluginMeta（挂载引用式重构：内容不驻留，见 file-cache.ts） */
 	metadata: Record<string, unknown>;
 	memory?: {
 		summary?: string;
@@ -65,11 +63,10 @@ export interface SourcePluginMeta {
 	pendingMemoryLines?: number;
 }
 
-/** 已挂载内容段：1-based，闭区间（计划 §2.2） */
+/** 已挂载内容段：1-based，闭区间（计划 §2.2）。引用式重构后不再携带文本，内容按需从磁盘读取。 */
 export interface Segment {
 	start: number;
 	end: number;
-	text: string;
 }
 
 /** 记忆整理任务（M5 新模型：仅在新增批量整理时投递） */
