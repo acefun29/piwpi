@@ -235,7 +235,9 @@ function hideRunning() {
 
 function setStreaming(on) {
 	streaming = on;
-	$("#btnAbort").hidden = !on;
+	const btn = $("#btnAction");
+	btn.classList.toggle("streaming", on);
+	btn.title = on ? "中断" : "发送";
 	if (!on) hideRunning();
 }
 
@@ -600,8 +602,10 @@ function setupInput() {
 			sendMessage();
 		}
 	});
-	$("#btnSend").addEventListener("click", sendMessage);
-	$("#btnAbort").addEventListener("click", () => rpcRaw({ type: "abort" }).catch(() => {}));
+	$("#btnAction").addEventListener("click", () => {
+		if (streaming) rpcRaw({ type: "abort" }).catch(() => {});
+		else sendMessage();
+	});
 	$("#btnNewChat").addEventListener("click", async () => {
 		try {
 			const res = await rpc({ type: "new_session" });
@@ -629,27 +633,47 @@ let debugEvents = null;
 let refreshTimer = null;
 
 function setupDrawer() {
-	$("#btnContext").addEventListener("click", () => {
-		drawer.hidden = !drawer.hidden;
-		if (!drawer.hidden) refreshDebugState();
+	const ctxBtn = $("#btnContext");
+	ctxBtn.addEventListener("click", () => {
+		const opening = drawer.hidden;
+		if (opening) {
+			drawer.hidden = false;
+			requestAnimationFrame(() => drawer.classList.add("open"));
+			ctxBtn.classList.add("open");
+			refreshDebugState();
+		} else {
+			drawer.classList.remove("open");
+			ctxBtn.classList.remove("open");
+			setTimeout(() => (drawer.hidden = true), 220);
+		}
 	});
-	$("#btnCloseDrawer").addEventListener("click", () => (drawer.hidden = true));
 	connectDebugEvents();
 	refreshDebugState(); // 页面加载即拉一次，更新徽标
 }
 
+let debugReconnectTimer = null;
+
 function connectDebugEvents() {
+	if (debugEvents) { try { debugEvents.close(); } catch {} debugEvents = null; }
+	clearTimeout(debugReconnectTimer);
+
 	debugEvents = new EventSource("/debug/events");
 	debugEvents.addEventListener("piwpi", (e) => {
 		let evt;
 		try { evt = JSON.parse(e.data); } catch { return; }
 		logDebugEvent(evt);
-		// 去抖刷新快照
+		// 去抖刷新快照（抽屉打开时立即刷新，关闭时仅更新徽标）
 		clearTimeout(refreshTimer);
 		refreshTimer = setTimeout(refreshDebugState, 400);
 	});
+	debugEvents.onopen = () => {
+		if (drawer.hidden) refreshDebugState();
+	};
 	debugEvents.onerror = () => {
-		$("#ctxMeta").textContent = "debug 服务未连接（扩展未启动？）";
+		try { debugEvents.close(); } catch {}
+		debugEvents = null;
+		if (!drawer.hidden) $("#ctxMeta").textContent = "debug 服务未连接（扩展未启动？），正在重连…";
+		debugReconnectTimer = setTimeout(connectDebugEvents, 3000);
 	};
 }
 

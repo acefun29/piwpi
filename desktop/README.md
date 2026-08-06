@@ -38,6 +38,12 @@ npm run dev:web    # node server/bridge.mjs
 # 浏览器打开 http://127.0.0.1:8901
 ```
 
+> **node 版本要求**：pi 要求 node >= 22.19，bridge 用 `process.execPath` spawn pi 子进程，所以 dev:web 必须用 node 22 运行（`npm start` 不受影响——Electron 自带 Node 22）。系统 node 为 20.x 时显式指定：
+>
+> ```bash
+> C:\path\to\node22\node.exe server\bridge.mjs
+> ```
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |

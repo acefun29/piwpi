@@ -79,18 +79,34 @@ button { font-family: inherit; }
 }
 .crumb { font-size: 14px; font-weight: 500; }
 .ctx-btn {
-  height: 32px; border-radius: 16px; border: none;
+  height: 32px; border-radius: 16px; border: 1px solid transparent;
   background: var(--selected);
-  display: flex; align-items: center; gap: 8px;
-  padding: 0 8px 0 14px; cursor: pointer;
-}
-.ctx-btn span { font-size: 13px; font-weight: 500; color: var(--brand); }
-.ctx-badge {
-  min-width: 20px; height: 20px; border-radius: 10px;
-  background: var(--brand); color: #fff;
-  font-size: 11px; font-weight: 500;
   display: flex; align-items: center; justify-content: center;
-  padding: 0 5px;
+  gap: 8px;
+  padding: 0 10px 0 14px; cursor: pointer;
+  width: auto; min-width: 32px; max-width: 120px;
+  transition: max-width .28s cubic-bezier(.4,0,.2,1), padding .28s cubic-bezier(.4,0,.2,1), gap .28s cubic-bezier(.4,0,.2,1), background .15s, border-color .15s;
+  overflow: hidden;
+}
+.ctx-btn .ctx-label {
+  font-size: 13px; font-weight: 500; color: var(--brand);
+  white-space: nowrap;
+  max-width: 80px; line-height: 20px;
+  transition: opacity .18s ease, max-width .28s cubic-bezier(.4,0,.2,1), color .15s;
+}
+.ctx-btn:hover { background: var(--brand); }
+.ctx-btn:hover .ctx-label { color: #fff; }
+.ctx-btn:hover .ctx-badge { color: #fff; }
+.ctx-btn.open {
+  width: 32px; max-width: 32px; padding: 0; gap: 0;
+  background: var(--brand); border-color: var(--brand);
+}
+.ctx-btn.open .ctx-label { opacity: 0; max-width: 0; }
+.ctx-btn.open .ctx-badge { color: #fff; padding: 0; min-width: auto; }
+.ctx-badge {
+  font-size: 13px; font-weight: 600; color: var(--brand);
+  line-height: 20px;
+  display: flex; align-items: center; justify-content: center;
 }
 
 /* ===== 对话流 ===== */
@@ -196,26 +212,44 @@ button { font-family: inherit; }
   font-size: 12px; color: var(--text-2); font-family: inherit;
   cursor: pointer; max-width: 90px;
 }
-.send-btn, .abort-btn {
+.action-btn {
   width: 36px; height: 36px; border-radius: 8px; border: none;
   background: var(--brand); cursor: pointer;
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  position: relative;
 }
-.send-btn:hover { background: var(--brand-hover); }
-.send-btn:disabled { background: var(--text-3); cursor: default; }
-.abort-btn { background: #5A5B60; }
-.abort-btn:hover { background: #44454A; }
+.action-btn:hover { background: var(--brand-hover); }
+.action-btn:disabled { background: var(--text-3); cursor: default; }
+.action-btn.streaming { background: #5A5B60; }
+.action-btn.streaming:hover { background: #44454A; }
+.action-btn svg { position: absolute; transition: opacity .15s; }
+.action-btn .icon-abort { opacity: 0; }
+.action-btn.streaming .icon-send { opacity: 0; }
+.action-btn.streaming .icon-abort { opacity: 1; }
 
 /* ===== Context 抽屉 ===== */
 .drawer {
-  width: 360px; flex-shrink: 0; height: 100%;
-  background: var(--card); border-left: 1px solid var(--border);
+  width: 0; flex-shrink: 0; height: 100%; overflow: hidden;
+  background: var(--card); border-left: 1px solid transparent;
   display: flex; flex-direction: column;
-  padding: 20px 0 20px 20px; gap: 12px;
+  padding: 20px 0; gap: 12px;
+  transition: width .22s ease, border-color .22s ease, padding .22s ease;
+}
+.drawer[hidden] { display: none; }
+.drawer.open {
+  width: 360px;
+  border-left-color: var(--border);
+  padding: 20px 0 20px 20px;
 }
 .drawer-head { height: 32px; display: flex; align-items: center; justify-content: space-between; padding-right: 20px; }
 .drawer-title { font-size: 15px; font-weight: 600; }
-.icon-btn { background: none; border: none; cursor: pointer; padding: 0; display: flex; }
+.icon-btn {
+  width: 28px; height: 28px; border-radius: 6px;
+  background: none; border: none; cursor: pointer; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { background: var(--bg-app); }
+.icon-btn:hover svg path { stroke: var(--text); }
 .drawer-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 20px; }
 .drawer-label { font-size: 11px; font-weight: 500; color: var(--text-3); display: flex; align-items: center; gap: 6px; margin-top: 6px; }
 .drawer-count {
