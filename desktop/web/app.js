@@ -742,11 +742,12 @@ function renderPlugins(plugins) {
 
 async function showPluginDetail(id) {
 	try {
-		const res = await fetch(`/debug/plugins/${encodeURIComponent(id)}`);
+		// 实时读盘查看：live 端点返回挂载范围在磁盘上的当前内容（引用式，磁盘是事实源）
+		const res = await fetch(`/debug/plugins/${encodeURIComponent(id)}/live`);
 		if (!res.ok) return;
 		const p = await res.json();
-		const segs = (p.metadata?.segments ?? []).map((s) => `--- L${s.start}-${s.end} ---\n${s.text}`).join("\n\n");
-		const text = segs || p.content || "（无内容）";
+		const segs = (p.segments ?? []).map((s) => `--- L${s.start}-${s.end} ---\n${s.text}`).join("\n\n");
+		const text = segs || "（无内容）";
 		// 简单弹层展示已挂载文本
 		const overlay = el("div");
 		overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:80;display:flex;align-items:center;justify-content:center;";
