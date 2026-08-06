@@ -193,6 +193,81 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		return Math.max(8, Math.round(totalLines * 0.1));
 	}
 
+	/**
+	 * 已挂载段相对新磁盘的变更行数：旧段按新行数 clamp 后重切 vs 旧段文本。
+	 * 本次新读的 got 段不算变更（避免"读新范围"误触发失效）。
+	 */
+	function changedLinesOf(plugin: ToolContextPlugin, diskLines: string[]): number {
+		let changed = 0;
+		for (const seg of (plugin.metadata.segments as Segment[] | undefined) ?? []) {
+			const c = clamp({ start: seg.start, end: seg.end }, diskLines.length);
+			if (!c) {
+				changed += seg.end - seg.start + 1; // 段被截掉 → 全部算变更
+				continue;
+			}
+			changed += countChangedLines(seg.text.split("\n"), sliceText(diskLines, c).split("\n"));
+		}
+		return changed;
+	}
+
+	/**
+	 * M5 新模型：主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
+	 * 按与 updated 分支相同的变更量逻辑判定：达阈值 → 挂载失效 + project map 失效；未达 → 主动重挂载并累积
+	 * （本轮的锚点刷新会使用最新 render）。
+	 */
+	async function scanDiskChanges(): Promise<void> {
+		for (const plugin of [...store.all()]) {
+			if (!isSourceMeta(plugin)) continue;
+			const absPath = plugin.metadata.absPath;
+			if (typeof absPath !== "string" || absPath.length === 0) continue;
+			let buf: Buffer;
+			try {
+				buf = await readFile(absPath);
+			} catch {
+				continue; // 文件不可读：跳过
+			}
+			const hash = hashBuffer(buf);
+			if (hash === plugin.metadata.hash) continue;
+			const diskLines = buf.toString("utf8").split("\n");
+			const changed = changedLinesOf(plugin, diskLines);
+			const accumulated = ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
+			const oldHash = plugin.metadata.hash;
+			if (accumulated >= changeThreshold(diskLines.length)) {
+				// 达阈值 → 挂载失效 + project map 失效（与 updated 分支同语义）
+				store.remove(plugin.id);
+				projectMap.delete(plugin.id);
+				emit({ type: "invalidated", pluginId: plugin.id, changedLines: accumulated, oldHash, hash });
+				continue;
+			}
+			// 未达阈值：按旧段 clamp 重切重挂载 + 累积（不引入 read 的 got 段）
+			const segments: Segment[] = [];
+			for (const s of (plugin.metadata.segments as Segment[] | undefined) ?? []) {
+				const c = clamp({ start: s.start, end: s.end }, diskLines.length);
+				if (c) segments.push({ start: c.start, end: c.end, text: sliceText(diskLines, c) });
+			}
+			plugin.metadata = {
+				...plugin.metadata,
+				hash,
+				totalLines: diskLines.length,
+				segments,
+				pendingMemoryLines: accumulated,
+				updatedAtHashChange: false,
+			};
+			plugin.content = render(plugin);
+			store.upsert(plugin);
+			persistPlugin(plugin);
+			emit({
+				type: "mounted",
+				pluginId: plugin.id,
+				kind: "updated",
+				oldHash,
+				hash,
+				changedLines: changed,
+				pendingMemoryLines: accumulated,
+			});
+		}
+	}
+
 	/** 未整理（pending）插件统计：文件数与行数（M5 新模型批量触发判定） */
 	function pendingStats(): { files: number; lines: number } {
 		let files = 0;
@@ -479,17 +554,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					case "updated": {
 						const existing = store.get(p.pluginId);
 						if (!existing || !isSourceMeta(existing)) return undefined;
-						// M5 新模型：变更量只算"已挂载段"的内容变化——旧段按新行数 clamp 后重切 vs 旧段文本
-						// （本次 read 的 got 段是新挂载，不算变更，避免"读新范围"误触发失效）
-						let changed = 0;
-						for (const seg of (existing.metadata.segments as Segment[] | undefined) ?? []) {
-							const c = clamp({ start: seg.start, end: seg.end }, p.diskLines.length);
-							if (!c) {
-								changed += seg.end - seg.start + 1; // 段被截掉 → 全部算变更
-								continue;
-							}
-							changed += countChangedLines(seg.text.split("\n"), sliceText(p.diskLines, c).split("\n"));
-						}
+						// M5 新模型：变更量只算"已挂载段"的内容变化（本次 read 的 got 段是新挂载，不算变更）
+						const changed = changedLinesOf(existing, p.diskLines);
 						const accumulated = ((existing.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
 						const plugin = sourceAdapter.ingest(input, text, existing, {
 							absPath: existing.metadata.absPath,
@@ -552,6 +618,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		async onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
+				// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载
+				await scanDiskChanges();
 				// 记录最近一条 user 消息（M5 记忆任务的 localContext 来源）。
 				// AgentMessage 联合类型含 BashExecutionMessage（content 为 string），用结构访问防御。
 				for (let i = event.messages.length - 1; i >= 0; i--) {

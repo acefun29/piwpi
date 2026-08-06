@@ -142,6 +142,6 @@ events.onerror = () => console.warn("debug server disconnected");
 
 - 服务只读，**不提供任何写/控制端点**（重置插件、手动触发记忆等暂不支持，需要再加）。
 - 上下文消息文本截断 300 字符/条，避免快照膨胀；完整内容请以 pi 会话为准。
-- 记忆语义（M5 新模型）：记忆 Agent 只在**新增**驱动——新文件挂载后标记 `pending`，累计达阈值（5 文件 或 1000 行）批量整理，产物只写入 Project Map；**修改**累积达阈值（变更行数 ≥ max(8, 总行数×10%)）直接触发 `invalidated` 失效（挂载移除 + map 删除），不跑记忆 Agent。协议见 `docs/project-map-protocol.md`。
+- 记忆语义（M5 新模型）：记忆 Agent 只在**新增**驱动——新文件挂载后标记 `pending`，累计达阈值（5 文件 或 1000 行）批量整理，产物只写入 Project Map；**修改**累积达阈值（变更行数 ≥ max(8, 总行数×10%)）直接触发 `invalidated` 失效（挂载移除 + map 删除），不跑记忆 Agent。失效检测是**主动的**：每轮 LLM 请求前（context 事件）扫描已挂载文件磁盘哈希，外部修改不依赖下一次 read 即可触发；read 拦截的 updated 分支为第二重检测。协议见 `docs/project-map-protocol.md`。
 - 批量整理事件在串行链异步执行后发出，`memory_updated`/`memory_batch_done` 与 `memory_queued` 之间有真实 LLM 调用的时延。
 - 数据仅在**当前 pi 进程内**有效；进程退出即消失（持久化见 custom entries / 项目地图文件）。

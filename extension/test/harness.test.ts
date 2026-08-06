@@ -409,6 +409,71 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		expect(render(p)).toContain(meta.truncatedNote!);
 		expect(store.get(fileId(absFile))).toBeDefined(); // 小缩短不失效
 	});
+
+	it("onContext 主动扫描：外部大改（超阈值）→ 失效（无需下一次 read）", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const projectMap = new ProjectMap();
+		projectMap.update(fileId(absFile), {
+			role: "旧角色",
+			responsibilities: [],
+			keyStructures: [],
+			dependencies: [],
+			dependents: [],
+			decisions: [],
+		});
+		const events: string[] = [];
+		const h = createHarness({ store, projectMap, onEvent: (e) => events.push(e.type) });
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 41 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 41 }, { text: text20_60 }), ctx());
+		expect(store.get(fileId(absFile))).toBeDefined();
+
+		// 外部大改：重写整个文件（已挂载段全变）
+		const big = Array.from({ length: 80 }, (_, i) => `new${i + 1}`).join("\n");
+		writeFileSync(absFile, big);
+
+		// 只触发 onContext（不 read）
+		const messages = [
+			{ role: "user", content: [{ type: "text", text: "继续" }] },
+		] as unknown as ContextEvent["messages"];
+		await h.onContext({ type: "context", messages } as unknown as ContextEvent, ctx());
+		expect(store.get(fileId(absFile))).toBeUndefined();
+		expect(projectMap.get(fileId(absFile))).toBeUndefined();
+		expect(events).toContain("invalidated");
+	});
+
+	it("onContext 主动扫描：小改 → 主动重挂载 + 累积，hash 更新，后续 read 走 increment", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const h = createHarness({ store });
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+
+		// 外部改已挂载段内 2 行（替换 2 行 = changed 4 < 阈值 8）
+		const disk = readFileSync(absFile, "utf8").split("\n");
+		disk[24] = "x";
+		disk[29] = "y";
+		writeFileSync(absFile, disk.join("\n"));
+
+		await h.onContext(
+			{
+				type: "context",
+				messages: [{ role: "user", content: [{ type: "text", text: "继续" }] }],
+			} as unknown as ContextEvent,
+			ctx(),
+		);
+
+		const p = store.get(fileId(absFile))!;
+		const meta = sourceMeta(p);
+		expect(meta.hash).toBe(hashBuffer(readFileSync(absFile))); // 已更新为磁盘值
+		expect(meta.pendingMemoryLines).toBe(4); // 累积
+		expect(meta.segments[0]!.text).toContain("x"); // 已按磁盘重切
+
+		// 后续 read：hash 一致 → 走 increment（只补缺失段 41-50）
+		const call = readCall("t2", { path: FILE, offset: 30, limit: 21 });
+		await h.onToolCall(call, ctx());
+		expect((call.input as { offset?: number }).offset).toBe(41);
+	});
 });
 
 describe("M5 新模型：记忆批量整理与持久化", () => {
