@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { ToolContextPlugin } from "../types.ts";
+import type { MapEntry, ToolContextPlugin } from "../types.ts";
 
 /**
  * 双通道持久化（计划 §6.4）。
@@ -83,4 +83,24 @@ export async function readProjectMapFile(filePath: string): Promise<unknown | un
 export async function writeProjectMapFile(filePath: string, data: unknown): Promise<void> {
 	await mkdir(dirname(filePath), { recursive: true });
 	await writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
+}
+
+/**
+ * 写前合并（多会话并发写防护）：以磁盘最新为基准 merge（本内存条目覆盖/新增），再写回。
+ * 窗口内另一会话写入的条目不会丢失（丢失窗口 ≈ 一次读+写，代价 = 一次重新整理，不做锁）。
+ * 项目地图是项目级共享资产，任何会话写都不得覆盖他人沉淀。
+ */
+export async function writeProjectMapFileMerged(
+	filePath: string,
+	data: Record<string, MapEntry>,
+): Promise<void> {
+	const disk = await readProjectMapFile(filePath);
+	const merged: Record<string, MapEntry> = {};
+	if (disk && typeof disk === "object" && !Array.isArray(disk)) {
+		for (const [k, v] of Object.entries(disk as Record<string, unknown>)) {
+			if (v && typeof v === "object") merged[k] = v as MapEntry;
+		}
+	}
+	for (const [k, v] of Object.entries(data)) merged[k] = v;
+	await writeProjectMapFile(filePath, merged);
 }

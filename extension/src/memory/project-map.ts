@@ -17,7 +17,9 @@ export class ProjectMap {
 		return this.entries.get(pluginId);
 	}
 
-	/** 增量更新：已有条目在旧值上取并集（PRD §5"在原有理解上继续更新"）。 */
+	/** 增量更新：已有条目在旧值上取并集（PRD §5"在原有理解上继续更新"）。
+	 *  磁盘驱动字段：hash/chunks 取新值（`?? old`，旧调用方兼容）；pendingLines 归零、stale 清
+	 *  （整理即恢复有效，基准 = 本次整理时刻）。 */
 	update(pluginId: string, entry: MapEntry): void {
 		const old = this.entries.get(pluginId);
 		if (!old) {
@@ -32,7 +34,21 @@ export class ProjectMap {
 			dependencies: merge(old.dependencies, entry.dependencies),
 			dependents: merge(old.dependents, entry.dependents),
 			decisions: merge(old.decisions, entry.decisions),
+			hash: entry.hash ?? old.hash,
+			chunks: entry.chunks ?? old.chunks,
+			pendingLines: 0,
+			stale: false,
 		});
+	}
+
+	/** 全部条目 id（扫描队列构建用） */
+	keys(): string[] {
+		return [...this.entries.keys()];
+	}
+
+	/** 从 `source:file:<abs>` 条目 id 提取绝对路径；非 source:file 前缀返回 undefined */
+	pathOf(pluginId: string): string | undefined {
+		return absPathOf(pluginId);
 	}
 
 	/** 失效语义：删除条目（无 tombstone，协议见 project-map-protocol.md）。 */
@@ -67,6 +83,7 @@ export class ProjectMap {
 		const root: TreeNode = { name: "", files: [], dirs: new Map() };
 		const base = process.platform === "win32" ? cwd.toLowerCase() : cwd;
 		for (const [pluginId, entry] of this.entries) {
+			if (entry.stale) continue; // 软删除：磁盘事实自证过期，渲染过滤
 			const abs = absPathOf(pluginId);
 			if (!abs) {
 				root.files.push({ name: pluginId, entry });
@@ -95,6 +112,7 @@ export class ProjectMap {
 		const base = process.platform === "win32" ? cwd.toLowerCase() : cwd;
 		const lines: string[] = [];
 		for (const [pluginId, e] of [...this.entries.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+			if (e.stale) continue; // 软删除：渲染过滤
 			const abs = absPathOf(pluginId);
 			const label = abs ? relative(base, abs).replace(/\\/g, "/") : pluginId;
 			const role = e.role || e.responsibilities[0] || "";

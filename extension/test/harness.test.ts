@@ -302,7 +302,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		expect((meta.pendingMemoryLines as number | undefined) ?? 0).toBe(0);
 	});
 
-	it("修改累计达阈值（max(8, 总行数×10%)）→ 挂载失效 + project map 失效 + 原生透传", async () => {
+	it("修改累计达阈值（max(8, 总行数×10%)）→ 挂载失效 + 原生透传（map 条目保留，由磁盘驱动校验软删）", async () => {
 		write80Lines();
 		const store = new PluginStore();
 		const projectMap = new ProjectMap();
@@ -331,7 +331,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		);
 		expect(res?.content?.[0]?.text).toContain("挂载已失效"); // 失效提示行（替换原生透传）
 		expect(store.get(fileId(absFile))).toBeUndefined(); // 挂载失效
-		expect(projectMap.get(fileId(absFile))).toBeUndefined(); // project map 失效
+		expect(projectMap.get(fileId(absFile))).toBeDefined(); // map 条目保留：失效不归会话管理，由磁盘驱动校验软删
 		expect(events).toContain("invalidated");
 	});
 
@@ -432,7 +432,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		] as unknown as ContextEvent["messages"];
 		await h.onContext({ type: "context", messages } as unknown as ContextEvent, ctx());
 		expect(store.get(fileId(absFile))).toBeUndefined();
-		expect(projectMap.get(fileId(absFile))).toBeUndefined();
+		expect(projectMap.get(fileId(absFile))).toBeDefined(); // map 条目保留：失效不归会话管理，由磁盘驱动校验软删
 		expect(events).toContain("invalidated");
 	});
 

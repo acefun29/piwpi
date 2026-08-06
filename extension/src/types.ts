@@ -61,6 +61,9 @@ export interface SourcePluginMeta {
 	memoryState?: "pending" | "done";
 	/** 自上次失效/整理以来累积的变更行数（达阈值触发失效，M5 新模型） */
 	pendingMemoryLines?: number;
+	/** 跨会话行级指纹（fingerprint.ts lineFingerprint 的 base64）：自上次 hash 追平时点的磁盘状态快照。
+	 *  进程内无旧文本（resume/跨会话）时用它量化变化量；每次追平时刷新。 */
+	lineHashes?: string;
 }
 
 /** 已挂载内容段：1-based，闭区间（计划 §2.2）。引用式重构后不再携带文本，内容按需从磁盘读取。 */
@@ -86,4 +89,12 @@ export interface MapEntry {
 	dependencies: string[];
 	dependents: string[];
 	decisions: string[];
+	/** 整理时文件的 sha256(hex)——磁盘驱动基准（基准 = 整理时刻，不属于任何会话） */
+	hash?: string;
+	/** 自整理以来累计变更行数（块指纹量化；达阈值 → stale）。跨会话沿用（随 project-map.json 落盘） */
+	pendingLines?: number;
+	/** 软删除标记：渲染过滤，等任何会话重新整理覆盖。旧字段全可选，向后兼容 */
+	stale?: boolean;
+	/** 整理时文件的块指纹（fingerprint.ts chunkFingerprint 的 base64，16 行/块） */
+	chunks?: string;
 }

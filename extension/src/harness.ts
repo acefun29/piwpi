@@ -31,11 +31,18 @@ import {
 	readProjectMapFile,
 	restoreFromEntries,
 	serializePlugin,
-	writeProjectMapFile,
+	writeProjectMapFileMerged,
 } from "./memory/persist.ts";
 import { ProjectMap } from "./memory/project-map.ts";
 import { MemoryQueue } from "./memory/queue.ts";
 import { FileContentCache } from "./file-cache.ts";
+import {
+	chunkFingerprint,
+	countDelta,
+	decodeFingerprint,
+	encodeFingerprint,
+	lineFingerprint,
+} from "./fingerprint.ts";
 import { clamp, type LineRange, subtract } from "./ranges.ts";
 import { render } from "./render.ts";
 import { PluginStore } from "./store.ts";
@@ -150,10 +157,16 @@ function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
 		fn(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>;
 }
 
-/** 失效通知（onContext 用：把锚点消息替换为失效提示行，消除失效后旧文本残留） */
-interface InvalidatedNotice {
+/**
+ * 锚点提示通知（onContext 用：把锚点消息替换/追加提示行）。
+ * invalidated/deleted → 整体替换为提示；caught-up → 提示行前缀 + 最新渲染（下一轮无 notice 自动干净）。
+ */
+interface AnchorNotice {
+	kind: "invalidated" | "deleted" | "caught-up";
 	anchorToolCallId: string;
-	changedLines: number;
+	changedLines?: number;
+	/** 提示行完整文本 */
+	text: string;
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
@@ -179,6 +192,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let lastContext: DebugContextSnapshot | null = null;
 	const memoryBatchFiles = options.memoryBatchFiles ?? 5;
 	const memoryBatchLines = options.memoryBatchLines ?? 1000;
+	/** 渐进式扫描：清单 ≤ SCAN_FULL_LIMIT → 每轮全量；否则每轮 SCAN_BATCH 个 FIFO 循环（单轮成本固定） */
+	const SCAN_FULL_LIMIT = 64;
+	const SCAN_BATCH = 32;
+	let scanQueue: string[] = [];
+	let scanCursor = 0;
 
 	/** 调试事件（debug 服务用；无监听者时零开销）。ts 在此填充。 */
 	function emit(event: Omit<DebugEvent, "ts">): void {
@@ -249,68 +267,170 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		return out;
 	}
 
+	/** 插件 id 构造（与 source.ts identifyPath 一致：`source:file:` + win32 小写路径） */
+	function pluginIdOf(absPath: string): string {
+		return `source:file:${process.platform === "win32" ? absPath.toLowerCase() : absPath}`;
+	}
+
+	/** 扫描清单 = 挂载文件 + 非 stale map 条目文件（Set 去重；只存 absPath，双重校验运行时推导） */
+	function buildScanQueue(): string[] {
+		const set = new Set<string>();
+		for (const p of store.all()) {
+			if (!isSourceMeta(p)) continue;
+			const abs = p.metadata.absPath;
+			if (typeof abs === "string" && abs.length > 0) set.add(abs);
+		}
+		for (const id of projectMap.keys()) {
+			const e = projectMap.get(id);
+			if (e?.stale) continue;
+			const abs = projectMap.pathOf(id);
+			if (abs) set.add(abs);
+		}
+		return [...set];
+	}
+
+	/** 渐进式分批：≤64 全量（cursor 归零）；>64 取 32 个 FIFO 循环 */
+	function pickScanBatch(): string[] {
+		scanQueue = buildScanQueue();
+		if (scanQueue.length === 0) return [];
+		if (scanQueue.length <= SCAN_FULL_LIMIT) {
+			scanCursor = 0;
+			return scanQueue;
+		}
+		const batch: string[] = [];
+		for (let i = 0; i < SCAN_BATCH; i++) {
+			batch.push(scanQueue[scanCursor]!);
+			scanCursor = (scanCursor + 1) % scanQueue.length;
+		}
+		return batch;
+	}
+
 	/**
-	 * M5 新模型：主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
-	 * 引用式重构：经 file-cache 的 stat 快速通道，文件未变（hash 同）→ 完全跳过，零读盘零渲染；
-	 * 变化后按与 updated 分支相同的变更量逻辑判定：达阈值 → 挂载失效 + project map 失效（返回
-	 * 通知，onContext 把锚点替换为提示行）；未达 → 主动重挂载并累积（本轮的锚点刷新使用最新内容）。
+	 * 主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
+	 * 引用式：经 file-cache 的 stat 快速通道，文件未变（hash 同）→ 完全跳过，零读盘零渲染。
+	 * 按渐进式队列迭代（挂载文件 + map 条目文件，一次 get 双重校验）：
+	 * 挂载插件：变化量判定（会话内 LCS / 跨会话行指纹）→ 达阈值挂载失效 / 未达主动重挂载并累积；
+	 * map 条目：磁盘驱动校验（hash/chunks 自证过期）→ 累计 → 达阈值软删除（stale），写回合并落盘。
+	 * 返回锚点提示列表（invalidated/deleted/caught-up），onContext 在刷新循环后处理。
 	 */
-	async function scanDiskChanges(): Promise<InvalidatedNotice[]> {
-		const invalidated: InvalidatedNotice[] = [];
-		for (const plugin of [...store.all()]) {
-			if (!isSourceMeta(plugin)) continue;
-			const absPath = plugin.metadata.absPath;
-			if (typeof absPath !== "string" || absPath.length === 0) continue;
-			fileCache.pin(absPath);
+	async function scanDiskChanges(): Promise<AnchorNotice[]> {
+		const notices: AnchorNotice[] = [];
+		let mapDirty = false;
+		for (const absPath of pickScanBatch()) {
+			const id = pluginIdOf(absPath);
+			const plugin = store.get(id); // 可能 undefined（纯 map 条目文件）
+			const mapEntry = projectMap.get(id); // 可能 undefined（纯挂载文件）
+			if (!plugin && (!mapEntry || mapEntry.stale)) continue;
+			if (plugin) fileCache.pin(absPath);
 			const r = await fileCache.get(absPath);
-			if (!r) continue; // 文件不可读：跳过
-			const { entry, old } = r;
-			if (entry.hash === plugin.metadata.hash) continue; // 无变化：零读盘
-			const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
-			const changed = changedLinesOf(plugin, old?.lines, diskLines);
-			const accumulated =
-				changed === null
-					? 0 // 无旧文本：不判定阈值，累积归零（判定留给下次变更）
-					: ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed;
-			const oldHash = plugin.metadata.hash;
-			if (changed !== null && accumulated >= changeThreshold(diskLines.length)) {
-				// 达阈值 → 挂载失效 + project map 失效（与 updated 分支同语义）
-				invalidated.push({ anchorToolCallId: plugin.metadata.anchorToolCallId, changedLines: accumulated });
-				fileCache.unpin(absPath);
-				store.remove(plugin.id);
-				projectMap.delete(plugin.id);
-				emit({
-					type: "invalidated",
-					pluginId: plugin.id,
-					changedLines: accumulated,
-					oldHash,
-					hash: entry.hash,
-				});
+			if (!r) {
+				// ④ 文件删除/不可读：挂载失效 + map 条目软删除（磁盘事实自证过期）
+				if (plugin && isSourceMeta(plugin)) {
+					fileCache.unpin(absPath);
+					store.remove(plugin.id);
+					notices.push({
+						kind: "deleted",
+						anchorToolCallId: plugin.metadata.anchorToolCallId,
+						text: "[piwpi: 文件已删除，挂载已失效]",
+					});
+				}
+				if (mapEntry && !mapEntry.stale) {
+					mapEntry.stale = true;
+					mapDirty = true;
+				}
 				continue;
 			}
-			// 未达阈值（或无旧文本不判定）：按旧段 clamp 重切重挂载 + 累积（不引入 read 的 got 段）
-			plugin.metadata = {
-				...plugin.metadata,
-				hash: entry.hash,
-				totalLines: diskLines.length,
-				segments: clampSegments(plugin, diskLines.length),
-				pendingMemoryLines: accumulated,
-				updatedAtHashChange: false,
-			};
-			dirtyPlugins.add(plugin.id); // 重挂载：锚点需用最新磁盘内容重新渲染
-			store.upsert(plugin);
-			persistPlugin(plugin);
-			emit({
-				type: "mounted",
-				pluginId: plugin.id,
-				kind: "updated",
-				oldHash,
-				hash: entry.hash,
-				changedLines: changed ?? 0,
-				pendingMemoryLines: accumulated,
-			});
+			const { entry, old } = r;
+			// —— 挂载插件校验（一次 get 双重校验的一半）——
+			if (plugin && isSourceMeta(plugin) && entry.hash !== plugin.metadata.hash) {
+				const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
+				const changed = changedLinesOf(plugin, old?.lines, diskLines);
+				// 跨会话量化：进程内无旧文本（resume 首轮/大文件/缓存被逐出）但有持久化行指纹
+				let crossDelta: number | undefined;
+				if (changed === null) {
+					const base = decodeFingerprint(plugin.metadata.lineHashes ?? "");
+					if (base !== undefined) crossDelta = countDelta(base, lineFingerprint(diskLines));
+				}
+				const accumulated =
+					changed !== null
+						? ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + changed
+						: crossDelta !== undefined
+							? ((plugin.metadata.pendingMemoryLines as number | undefined) ?? 0) + crossDelta
+							: 0; // 无旧文本且无指纹：归零，判定留给下次变更（现状语义）
+				const oldHash = plugin.metadata.hash;
+				if (accumulated >= changeThreshold(diskLines.length)) {
+					// 达阈值（会话内 LCS 累计 或 跨会话一次性判定）→ 挂载失效（与 updated 分支同语义）
+					// 磁盘驱动：不再 projectMap.delete（map 由条目校验自证过期，不归会话管理）
+					notices.push({
+						kind: "invalidated",
+						anchorToolCallId: plugin.metadata.anchorToolCallId,
+						changedLines: accumulated,
+						text: `[piwpi: 文件大改（${accumulated} 行），挂载已失效，请重新 read]`,
+					});
+					fileCache.unpin(absPath);
+					store.remove(plugin.id);
+					emit({
+						type: "invalidated",
+						pluginId: plugin.id,
+						changedLines: accumulated,
+						oldHash,
+						hash: entry.hash,
+					});
+					continue;
+				}
+				// 未达阈值（含跨会话小改追平）：按旧段 clamp 重切重挂载 + 累积 + 行指纹基准追平
+				plugin.metadata = {
+					...plugin.metadata,
+					hash: entry.hash,
+					totalLines: diskLines.length,
+					segments: clampSegments(plugin, diskLines.length),
+					pendingMemoryLines: accumulated,
+					lineHashes: encodeFingerprint(lineFingerprint(diskLines)),
+					updatedAtHashChange: false,
+				};
+				dirtyPlugins.add(plugin.id); // 重挂载：锚点需用最新磁盘内容重新渲染
+				store.upsert(plugin);
+				persistPlugin(plugin);
+				if (crossDelta !== undefined) {
+					notices.push({
+						kind: "caught-up",
+						anchorToolCallId: plugin.metadata.anchorToolCallId,
+						changedLines: crossDelta,
+						text: `[piwpi: 该文件自上次会话以来已变化（${crossDelta} 行），挂载已更新为最新内容]`,
+					});
+				}
+				emit({
+					type: "mounted",
+					pluginId: plugin.id,
+					kind: "updated",
+					oldHash,
+					hash: entry.hash,
+					changedLines: changed ?? crossDelta ?? 0,
+					pendingMemoryLines: accumulated,
+				});
+			}
+			// —— map 条目校验（磁盘驱动：hash/chunks 自证过期；旧条目无 hash → 跳过）——
+			if (mapEntry && !mapEntry.stale && typeof mapEntry.hash === "string") {
+				if (entry.hash !== mapEntry.hash) {
+					const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
+					const base = decodeFingerprint(mapEntry.chunks ?? "");
+					const delta =
+						base === undefined ? diskLines.length : countDelta(base, chunkFingerprint(diskLines));
+					const pending = (mapEntry.pendingLines ?? 0) + delta;
+					if (pending >= changeThreshold(diskLines.length)) {
+						mapEntry.stale = true;
+						emit({ type: "map_stale", pluginId: id, changedLines: pending });
+					} else {
+						mapEntry.pendingLines = pending;
+					}
+					mapDirty = true;
+				}
+			}
 		}
-		return invalidated;
+		if (mapDirty) {
+			await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+		}
+		return notices;
 	}
 
 	/** 未整理（pending）插件统计：文件数与行数（M5 新模型批量触发判定） */
@@ -356,10 +476,15 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			};
 			const output = await summarize(deps, plugin, job, mapBrief, lines);
 			if (!output?.mapEntry) continue; // 失败：保留 pending，下轮再试
-			projectMap.update(plugin.id, output.mapEntry);
+			// 磁盘驱动：整理即记录基准（hash/chunks = 本时点磁盘状态；pendingLines 归零/stale 清除由 update 内部强制）
+			projectMap.update(plugin.id, {
+				...output.mapEntry,
+				hash: r.entry.hash,
+				chunks: encodeFingerprint(chunkFingerprint(lines)),
+			});
 			plugin.metadata = { ...plugin.metadata, memoryState: "done" };
 			store.upsert(plugin);
-			await writeProjectMapFile(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+			await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
 			persistPlugin(plugin);
 			emit({ type: "memory_updated", pluginId: plugin.id });
 			done++;
@@ -557,7 +682,13 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						});
 						// M5 新模型：新文件首次挂载 → 标记 pending（记忆只在新增驱动，修改走失效）
 						const newMeta = plugin.metadata as { memoryState?: "pending" | "done" };
-						plugin.metadata = { ...newMeta, memoryState: "pending" };
+						// 首次挂载即建立跨会话行指纹基准（r0 刚读盘，≤3000 行缓存命中；大文件 readLines 一次）
+						const newLines = r0.entry.lines ?? (await fileCache.readLines(p.absPath));
+						plugin.metadata = {
+							...newMeta,
+							memoryState: "pending",
+							lineHashes: encodeFingerprint(lineFingerprint(newLines)),
+						};
 						fileCache.pin(p.absPath);
 						dirtyPlugins.add(plugin.id);
 						store.upsert(plugin);
@@ -625,11 +756,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							mode: "updated",
 						});
 						if (changed !== null && accumulated >= changeThreshold(lines.length)) {
-							// 修改累计到阈值 → 直接挂载失效 + project map 失效（不跑记忆 Agent）；
-							// 本次改写为失效提示（旧 custom entry 无法删除，resume 时哈希不一致 → 段清空，无害）
+							// 修改累计到阈值 → 直接挂载失效（不跑记忆 Agent）；本次改写为失效提示
+							// （旧 custom entry 无法删除，resume 时哈希不一致 → 段清空，无害）。
+							// 磁盘驱动：不再 projectMap.delete（map 由条目校验自证过期，不归会话管理）
 							fileCache.unpin(existing.metadata.absPath);
 							store.remove(plugin.id);
-							projectMap.delete(plugin.id);
 							emit({
 								type: "invalidated",
 								pluginId: plugin.id,
@@ -646,9 +777,13 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 								],
 							};
 						}
-						// 未达阈值：累积变更行数，正常重挂载
+						// 未达阈值：累积变更行数，正常重挂载 + 行指纹基准追平
 						const meta = plugin.metadata as { pendingMemoryLines?: number };
-						plugin.metadata = { ...meta, pendingMemoryLines: accumulated };
+						plugin.metadata = {
+							...meta,
+							pendingMemoryLines: accumulated,
+							lineHashes: encodeFingerprint(lineFingerprint(lines)),
+						};
 						fileCache.pin(existing.metadata.absPath);
 						dirtyPlugins.add(plugin.id);
 						store.upsert(plugin);
@@ -686,22 +821,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			try {
 				rememberCtx(ctx);
 				// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载；
-				// 引用式：stat 快速通道，文件未变零读盘；返回失效列表 → 锚点替换为提示行
-				const invalidated = await scanDiskChanges();
-				// 失效提示：把锚点旧文本替换为一行提示（消除"失效后对话保留旧内容"的不一致）
-				for (const inv of invalidated) {
-					for (const m of event.messages) {
-						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
-						if (msg.role !== "toolResult" || msg.toolCallId !== inv.anchorToolCallId) continue;
-						msg.content = [
-							{
-								type: "text",
-								text: `[piwpi: 文件大改（${inv.changedLines} 行），挂载已失效，请重新 read]`,
-							},
-						];
-						break;
-					}
-				}
+				// 引用式：stat 快速通道，文件未变零读盘；返回提示列表 → 刷新循环后处理（见下）
+				const notices = await scanDiskChanges();
 				// 记录最近一条 user 消息（M5 记忆任务的 localContext 来源）。
 				// AgentMessage 联合类型含 BashExecutionMessage（content 为 string），用结构访问防御。
 				for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -766,6 +887,21 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					dirtyPlugins.delete(plugin.id);
 					if (!refreshed) continue; // 锚点被压缩/裁剪 → 本次跳过（计划 §8 已知限制）
 				}
+				// 锚点提示（必须在刷新循环之后：caught-up 需要锚点已被渲染为最新内容，提示只注入本轮，
+				// 下一轮无 notice 自动干净；invalidated/deleted 插件已移除，直接替换为提示行）
+				for (const n of notices) {
+					for (const m of event.messages) {
+						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
+						if (msg.role !== "toolResult" || msg.toolCallId !== n.anchorToolCallId) continue;
+						const cur = msg.content?.[0] as { type?: string; text?: string } | undefined;
+						const text =
+							n.kind === "caught-up"
+								? `${n.text}\n\n${cur?.text ?? ""}`
+								: n.text;
+						msg.content = [{ type: "text", text }];
+						break;
+					}
+				}
 				// 上下文摘要（debug 服务用）：每条消息文本截断，防快照膨胀
 				const summaries: DebugMessageSummary[] = event.messages.map((m) => {
 					const mm = m as { role?: string; toolCallId?: unknown; content?: unknown };
@@ -828,7 +964,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 			try {
 				if (projectMap.size() > 0) {
-					await writeProjectMapFile(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+					// 写前合并：不覆盖其他会话并发写入的条目
+					await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
 				}
 			} catch (err) {
 				console.error("[piwpi] shutdown map save error:", err);

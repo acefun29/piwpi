@@ -27,6 +27,7 @@ export type DebugEvent = {
 		| "memory_skipped"
 		| "memory_batch_done"
 		| "invalidated"
+		| "map_stale"
 		| "restore"
 		| "shutdown";
 	ts?: number;
