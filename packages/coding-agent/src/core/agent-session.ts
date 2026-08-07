@@ -24,7 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { type Context, type ContextBreakdown, contentText, estimateContextBreakdown } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -95,6 +95,7 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -3209,6 +3210,30 @@ export class AgentSession {
 			contextWindow,
 			percent,
 		};
+	}
+
+	/**
+	 * Per-category context token breakdown (system prompt / tools / user / assistant /
+	 * thinking / tool calls / tool results / images), estimated the same way the plain
+	 * estimation path counts characters. `percent` is `total / contextWindow`.
+	 */
+	getContextBreakdown(): { breakdown: ContextBreakdown; contextWindow: number; percent: number } | undefined {
+		const model = this.model;
+		if (!model) return undefined;
+
+		const contextWindow = model.contextWindow ?? 0;
+		if (contextWindow <= 0) return undefined;
+
+		const context: Context = {
+			systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+			// Mirror the harness: normalize custom roles (bashExecution/custom/branch
+			// summary/compaction summary) into plain user messages before counting.
+			messages: convertToLlm(this.messages),
+			tools: this.agent.state.tools.map((tool) => createToolDefinitionFromAgentTool(tool)),
+		};
+		const breakdown = estimateContextBreakdown(context);
+
+		return { breakdown, contextWindow, percent: (breakdown.total / contextWindow) * 100 };
 	}
 
 	/**

@@ -277,6 +277,7 @@ button { font-family: inherit; }
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
   display: flex; align-items: flex-end; gap: 8px;
   padding: 10px 8px 10px 16px;
+  position: relative; /* 上下文分布弹窗的锚点 */
 }
 .input-card:focus-within { border-color: var(--brand); }
 .input-card textarea {
@@ -311,6 +312,68 @@ button { font-family: inherit; }
 .action-btn .icon-abort { opacity: 0; }
 .action-btn.streaming .icon-send { opacity: 0; }
 .action-btn.streaming .icon-abort { opacity: 1; }
+
+/* ===== 上下文分布圆环 ===== */
+.ctx-ring-btn {
+  width: 32px; height: 32px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+.ctx-ring-btn:hover { background: var(--bg-app); }
+.ctx-ring-btn svg { display: block; }
+.ring-track { fill: none; stroke: var(--border); stroke-width: 2.4; }
+.ring-progress {
+  fill: none; stroke: var(--brand); stroke-width: 2.4;
+  stroke-linecap: round;
+  transition: stroke-dashoffset .4s ease, stroke .2s ease;
+}
+.ring-progress.warn { stroke: #C98A2D; }
+.ring-progress.high { stroke: var(--err); }
+.ring-progress.none { stroke: var(--text-3); stroke-dasharray: 1 42.98; stroke-dashoffset: 0; opacity: .45; }
+
+.ctx-popover {
+  position: absolute; bottom: calc(100% + 10px); right: 8px;
+  width: 300px; max-height: 70vh;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.14); z-index: 100;
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 12px;
+  overflow-y: auto;
+}
+/* [hidden] 显式覆盖：UA 样式表会被上面的 display:flex 规则盖掉（同 L377 教训） */
+.ctx-popover[hidden] { display: none; }
+.ctx-pop-head { display: flex; align-items: center; gap: 8px; }
+.ctx-pop-title { font-size: 13px; font-weight: 600; flex: 1; }
+.est-tag {
+  background: var(--selected); color: var(--brand);
+  font-size: 10px; border-radius: 8px; padding: 1px 6px; flex-shrink: 0;
+}
+#ctxDonut svg { width: 150px; height: 150px; display: block; margin: 0 auto; }
+.donut-seg { fill: none; stroke-width: 16; cursor: pointer; transition: opacity .15s; }
+.donut-seg.dim { opacity: .22; }
+.donut-pct { font-size: 22px; font-weight: 600; fill: var(--text); }
+.donut-cap { font-size: 10px; fill: var(--text-3); }
+.ctx-empty { font-size: 12px; color: var(--text-3); text-align: center; padding: 8px 0; line-height: 20px; }
+.ctx-legend { display: flex; flex-direction: column; gap: 2px; }
+.ctx-lg-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-2); height: 26px;
+  cursor: default; border-radius: 6px; padding: 0 4px;
+}
+.ctx-lg-row:hover { background: var(--bg-app); }
+.ctx-lg-row.dim { opacity: .35; }
+.lg-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.lg-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lg-tokens { color: var(--text); font-variant-numeric: tabular-nums; }
+.lg-pct { color: var(--text-3); width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+.ctx-pop-foot {
+  font-size: 11px; color: var(--text-3);
+  border-top: 1px solid var(--border); padding-top: 10px;
+  line-height: 18px;
+}
+.ctx-pop-foot b { color: var(--text); font-weight: 600; }
 
 /* ===== Context 抽屉 ===== */
 .drawer {

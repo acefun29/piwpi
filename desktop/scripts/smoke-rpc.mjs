@@ -53,6 +53,21 @@ try {
 	const tlLine = await waitFor((l) => l.includes('"s2"'), 10000, "thinking levels");
 	console.log("thinking levels:", JSON.parse(tlLine).data?.levels);
 
+	// 上下文分布：空会话时 system+tools > 0，其余分类为 0，percent 有值
+	send({ id: "s3", type: "get_context_breakdown" });
+	const bdLine = await waitFor((l) => l.includes('"s3"'), 10000, "context breakdown");
+	const bd = JSON.parse(bdLine).data;
+	if (!bd || typeof bd.percent !== "number") throw new Error("context breakdown missing data");
+	const b = bd.breakdown;
+	if (b.system <= 0 || b.tools <= 0 || b.total <= 0) throw new Error(`unexpected breakdown: ${JSON.stringify(b)}`);
+	if (b.user + b.assistant + b.thinking + b.toolCalls + b.toolResults + b.images !== 0) {
+		throw new Error(`empty session should have no message categories: ${JSON.stringify(b)}`);
+	}
+	if (b.total !== b.system + b.tools + b.user + b.assistant + b.thinking + b.toolCalls + b.toolResults + b.images) {
+		throw new Error(`total mismatch: ${JSON.stringify(b)}`);
+	}
+	console.log("context breakdown:", JSON.stringify(bd));
+
 	// 等扩展把 debug server 拉起来
 	let ok = false;
 	for (let i = 0; i < 40; i++) {

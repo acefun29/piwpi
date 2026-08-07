@@ -325,6 +325,7 @@ function dispatch(evt) {
 			setStreaming(false);
 			if (currentAssistant) finalizeMd(currentAssistant); // 兜底：没收齐 message_end 时仍完成收尾
 			currentAssistant = null;
+			scheduleCtxRingRefresh(); // 一轮结束，上下文定稿
 			return;
 		case "agent_end":
 			if (!evt.willRetry) { /* 等 agent_settled 收尾 */ }
@@ -348,6 +349,7 @@ function dispatch(evt) {
 					currentAssistant.root.appendChild(el("div", "run-text", "已中断"));
 				}
 			}
+			scheduleCtxRingRefresh(); // assistant 消息提交
 			return;
 		case "tool_execution_start": {
 			hideRunning();
@@ -381,6 +383,7 @@ function dispatch(evt) {
 				fillToolDetail(refs, refs.args, toolResultText(evt.result), evt.isError);
 			}
 			if (streaming) showRunning("执行完成，继续处理…");
+			scheduleCtxRingRefresh(); // toolResult 已入上下文
 			return;
 		}
 		case "auto_retry_start":
@@ -394,6 +397,7 @@ function dispatch(evt) {
 			return;
 		case "compaction_end":
 			if (evt.result) toast(`上下文已压缩：${evt.result.tokensBefore} → 约 ${evt.result.estimatedTokensAfter} tokens`);
+			scheduleCtxRingRefresh(); // 压缩后上下文骤变
 			return;
 		case "extension_ui_request":
 			handleExtensionUI(evt);
@@ -421,6 +425,7 @@ function dispatch(evt) {
 				})
 				.catch(() => {});
 			refreshSessions();
+			scheduleCtxRingRefresh(); // 新会话/切换会话，重置圆环
 			return;
 		default:
 			return;
@@ -888,6 +893,183 @@ async function showPluginDetail(id) {
 		overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
 		document.body.appendChild(overlay);
 	} catch { /* ignore */ }
+}
+
+/* ================= 上下文分布圆环 ================= */
+// 分类顺序即圆环与图例的渲染顺序（与 pi 侧 estimateContextBreakdown 的 key 对应）
+const CTX_CATS = [
+  { key: "system", label: "系统提示词", color: "#7167E8" },
+  { key: "tools", label: "工具定义", color: "#A78BFA" },
+  { key: "user", label: "用户消息", color: "#3F9E63" },
+  { key: "assistant", label: "助手回复", color: "#38A3A5" },
+  { key: "thinking", label: "思考过程", color: "#E0A82E" },
+  { key: "toolCalls", label: "工具调用参数", color: "#5B8DEF" },
+  { key: "toolResults", label: "工具输出", color: "#D96C6C" },
+  { key: "images", label: "图片", color: "#D96CA8" },
+];
+let ctxBreakdown = null; // { breakdown, contextWindow, percent } | null，最新一次成功快照
+let ctxPopoverOpen = false;
+let ctxRingTimer = 0; // 去抖定时器
+let ctxFetchSeq = 0; // 递增序号：丢弃过期响应
+
+/** k/M 缩写（对齐 pi footer 的 formatTokens 语义） */
+function formatTokens(n) {
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1) + "k";
+  if (n < 1e6) return Math.round(n / 1000) + "k";
+  if (n < 1e7) return (n / 1e6).toFixed(1) + "M";
+  return Math.round(n / 1e6) + "M";
+}
+
+/** 百分比显示：≥10 取整，<10 一位小数，>0 且 <0.1 显示 <0.1% */
+function fmtPct(p) {
+  if (!Number.isFinite(p) || p <= 0) return "0%";
+  if (p < 0.1) return "<0.1%";
+  if (p < 10) return p.toFixed(1) + "%";
+  return Math.round(p) + "%";
+}
+
+/** 输入框旁的迷你单段进度环（r=7，C≈43.98） */
+function renderMiniRing(pct) {
+  const progress = document.querySelector("#btnCtxRing .ring-progress");
+  const C = 2 * Math.PI * 7;
+  if (pct === null || pct === undefined || Number.isNaN(pct)) {
+    progress.classList.add("none");
+    progress.classList.remove("warn", "high");
+    return;
+  }
+  progress.classList.remove("none", "warn", "high");
+  if (pct >= 85) progress.classList.add("high");
+  else if (pct >= 60) progress.classList.add("warn");
+  const clamped = Math.min(Math.max(pct, 0), 100);
+  progress.style.strokeDasharray = `${C.toFixed(2)} ${C.toFixed(2)}`;
+  progress.style.strokeDashoffset = (C * (1 - clamped / 100)).toFixed(2);
+}
+
+/** 多段圆环 SVG（viewBox 120，R=48，C≈301.59，段间 gap=3，12 点起顺时针） */
+function donutHtml(segs, total, pct) {
+  const C = 2 * Math.PI * 48;
+  const GAP = 3;
+  const center =
+    `<text x="60" y="57" text-anchor="middle" dominant-baseline="middle" class="donut-pct">${fmtPct(pct)}</text>` +
+    `<text x="60" y="74" text-anchor="middle" class="donut-cap">已用</text>`;
+  if (total <= 0 || segs.length === 0) {
+    return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">` +
+      `<circle cx="60" cy="60" r="48" fill="none" stroke="var(--border)" stroke-width="16"/>${center}</svg>`;
+  }
+  let start = 0;
+  let circles = "";
+  for (const s of segs) {
+    const len = Math.max((s.tokens / total) * C - GAP, 0.75);
+    circles +=
+      `<circle class="donut-seg" data-key="${s.key}" cx="60" cy="60" r="48" stroke="${s.color}"` +
+      ` stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}"` +
+      ` stroke-dashoffset="${(-start).toFixed(2)}" transform="rotate(-90 60 60)"/>`;
+    start += (s.tokens / total) * C;
+  }
+  return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">${circles}${center}</svg>`;
+}
+
+function legendHtml(segs, total) {
+  return segs.map((s) => {
+    const pct = (s.tokens / total) * 100;
+    return `<div class="ctx-lg-row" data-key="${s.key}">` +
+      `<span class="lg-swatch" style="background:${s.color}"></span>` +
+      `<span class="lg-name">${s.label}</span>` +
+      `<span class="lg-tokens">${formatTokens(s.tokens)}</span>` +
+      `<span class="lg-pct">${fmtPct(pct)}</span></div>`;
+  }).join("");
+}
+
+function renderCtxPopover(data) {
+  const donut = $("#ctxDonut");
+  const legend = $("#ctxLegend");
+  const foot = $("#ctxFoot");
+  if (!data) {
+    donut.innerHTML = `<div class="ctx-empty">暂无上下文数据（模型未就绪）</div>`;
+    legend.innerHTML = "";
+    foot.innerHTML = "";
+    return;
+  }
+  const bd = data.breakdown;
+  const total = bd.total || 0;
+  const segs = CTX_CATS.map((c) => ({ ...c, tokens: bd[c.key] || 0 })).filter((s) => s.tokens > 0);
+  donut.innerHTML = total > 0
+    ? donutHtml(segs, total, data.percent ?? 0)
+    : `<div class="ctx-empty">暂无上下文内容<br>系统提示词与工具定义也会计入</div>`;
+  legend.innerHTML = legendHtml(segs, total);
+  foot.innerHTML = total > 0
+    ? `共 <b>${formatTokens(total)}</b> tokens · 上下文窗口 <b>${formatTokens(data.contextWindow)}</b> · 已用 <b>${fmtPct(data.percent)}</b>`
+    : `上下文窗口 <b>${formatTokens(data.contextWindow)}</b>`;
+}
+
+/** 拉取最新上下文分布；用 ctxFetchSeq 丢弃过期响应，失败时保留上次状态 */
+async function refreshCtxRing() {
+  try { await esOpened; } catch { return; } // 等 SSE 就绪再发 rpc（同 initSession）
+  const seq = ++ctxFetchSeq;
+  try {
+    const res = await rpc({ type: "get_context_breakdown" }, 8000);
+    if (seq !== ctxFetchSeq || !res.success) return;
+    ctxBreakdown = res.data ?? null;
+    renderMiniRing(ctxBreakdown ? ctxBreakdown.percent : null);
+    if (ctxPopoverOpen) renderCtxPopover(ctxBreakdown);
+  } catch {
+    // 静默：保留上次成功状态
+  }
+}
+
+/** 事件驱动的去抖刷新（每轮最多收敛到一次请求） */
+function scheduleCtxRingRefresh() {
+  clearTimeout(ctxRingTimer);
+  ctxRingTimer = setTimeout(refreshCtxRing, 500);
+}
+
+function openCtxPopover() {
+  ctxPopoverOpen = true;
+  $("#ctxPopover").hidden = false;
+  $("#btnCtxRing").setAttribute("aria-expanded", "true");
+  refreshCtxRing(); // 打开即强拉最新数据
+}
+function closeCtxPopover() {
+  ctxPopoverOpen = false;
+  $("#ctxPopover").hidden = true;
+  $("#btnCtxRing").setAttribute("aria-expanded", "false");
+}
+
+/** 图例行 ↔ 圆环段 hover 联动（事件委托，dim 非目标） */
+function bindCtxPopoverHover() {
+  const pop = $("#ctxPopover");
+  pop.addEventListener("mouseover", (e) => {
+    const row = e.target.closest(".ctx-lg-row");
+    const seg = e.target.closest(".donut-seg");
+    const key = row?.dataset.key ?? seg?.dataset.key;
+    if (!key) return;
+    document.querySelectorAll(".donut-seg").forEach((s) => s.classList.toggle("dim", s.dataset.key !== key));
+    document.querySelectorAll(".ctx-lg-row").forEach((r) => r.classList.toggle("dim", r.dataset.key !== key));
+  });
+  pop.addEventListener("mouseout", () => {
+    document.querySelectorAll(".donut-seg, .ctx-lg-row").forEach((n) => n.classList.remove("dim"));
+  });
+}
+
+function setupCtxRing() {
+  const btn = $("#btnCtxRing");
+  const pop = $("#ctxPopover");
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation(); // 避免触发 document 关闭
+    if (ctxPopoverOpen) closeCtxPopover();
+    else openCtxPopover();
+  });
+  $("#btnCtxClose").addEventListener("click", closeCtxPopover);
+  document.addEventListener("click", (e) => {
+    if (ctxPopoverOpen && !pop.contains(e.target) && !btn.contains(e.target)) closeCtxPopover();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && ctxPopoverOpen) closeCtxPopover();
+  });
+  bindCtxPopoverHover();
+  renderMiniRing(null); // 初始空态：仅 track + 顶部小点
+  scheduleCtxRingRefresh(); // 页面加载即拉一次
 }
 
 function renderContext(ctx) {
@@ -1375,6 +1557,7 @@ chatFlow.addEventListener("click", (e) => {
 connectEvents();
 setupInput();
 setupDrawer();
+setupCtxRing();
 setupMap();
 setupProject();
 initSession();

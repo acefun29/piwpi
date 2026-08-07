@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import type { ContextBreakdown, ImageContent, Model } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -70,6 +70,7 @@ export type RpcCommand =
 
 	// Messages
 	| { id?: string; type: "get_messages" }
+	| { id?: string; type: "get_context_breakdown" }
 
 	// Commands (available for invocation via prompt)
 	| { id?: string; type: "get_commands" };
@@ -185,7 +186,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }
 	| { id?: string; type: "response"; command: "export_html"; success: true; data: { path: string } }
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
-	| { id?: string; type: "response"; command: "switch_project"; success: true; data: { cancelled: boolean; cwd: string } }
+	| {
+			id?: string;
+			type: "response";
+			command: "switch_project";
+			success: true;
+			data: { cancelled: boolean; cwd: string };
+	  }
 	| { id?: string; type: "response"; command: "fork"; success: true; data: { text: string; cancelled: boolean } }
 	| { id?: string; type: "response"; command: "clone"; success: true; data: { cancelled: boolean } }
 	| {
@@ -220,6 +227,13 @@ export type RpcResponse =
 
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_context_breakdown";
+			success: true;
+			data: { breakdown: ContextBreakdown; contextWindow: number; percent: number } | null;
+	  }
 
 	// Commands
 	| {

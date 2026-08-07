@@ -680,6 +680,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "get_messages", { messages: session.messages });
 			}
 
+			case "get_context_breakdown": {
+				return success(id, "get_context_breakdown", session.getContextBreakdown() ?? null);
+			}
+
 			// =================================================================
 			// Commands (available for invocation via prompt)
 			// =================================================================

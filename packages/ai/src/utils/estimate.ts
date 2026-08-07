@@ -141,3 +141,93 @@ export function estimateContextTokens(context: Context | readonly Message[]): Co
 		lastUsageIndex: estimate.lastUsageIndex,
 	};
 }
+
+// ============================================================================
+// Per-category context breakdown (for context distribution charts)
+// ============================================================================
+
+/** Fixed order of breakdown categories, matching the display/ring order. */
+export type ContextBreakdownKey =
+	| "system"
+	| "tools"
+	| "user"
+	| "assistant"
+	| "thinking"
+	| "toolCalls"
+	| "toolResults"
+	| "images";
+
+/** Estimated tokens per context category. `total` is the plain sum of all categories. */
+export interface ContextBreakdown {
+	system: number;
+	tools: number;
+	user: number;
+	assistant: number;
+	thinking: number;
+	toolCalls: number;
+	toolResults: number;
+	images: number;
+	total: number;
+}
+
+const IMAGE_TOKENS = Math.ceil(ESTIMATED_IMAGE_CHARS / CHARS_PER_TOKEN);
+
+/**
+ * Estimate token count per context category. Char counting mirrors
+ * `estimateMessageTokens`, so `total` stays consistent with the plain
+ * estimation path (no usage anchoring).
+ */
+export function estimateContextBreakdown(context: Context): ContextBreakdown {
+	const breakdown: ContextBreakdown = {
+		system: context.systemPrompt ? estimateTextTokens(context.systemPrompt) : 0,
+		tools: estimateToolsTokens(context.tools),
+		user: 0,
+		assistant: 0,
+		thinking: 0,
+		toolCalls: 0,
+		toolResults: 0,
+		images: 0,
+		total: 0,
+	};
+
+	for (const message of context.messages) {
+		if (message.role === "user" || message.role === "toolResult") {
+			// User prompts and tool results both carry text (and optionally image) content.
+			const target = message.role === "user" ? "user" : "toolResults";
+			if (typeof message.content === "string") {
+				breakdown[target] += estimateTextTokens(message.content);
+				continue;
+			}
+			for (const block of message.content) {
+				if (block.type === "text") {
+					breakdown[target] += estimateTextTokens(block.text);
+				} else {
+					breakdown.images += IMAGE_TOKENS;
+				}
+			}
+		} else if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type === "text") {
+					breakdown.assistant += estimateTextTokens(block.text);
+				} else if (block.type === "thinking") {
+					breakdown.thinking += estimateTextTokens(block.thinking);
+				} else {
+					breakdown.toolCalls += Math.ceil(
+						(block.name.length + safeJsonStringify(block.arguments).length) / CHARS_PER_TOKEN,
+					);
+				}
+			}
+		}
+	}
+
+	breakdown.total =
+		breakdown.system +
+		breakdown.tools +
+		breakdown.user +
+		breakdown.assistant +
+		breakdown.thinking +
+		breakdown.toolCalls +
+		breakdown.toolResults +
+		breakdown.images;
+	return breakdown;
+}
