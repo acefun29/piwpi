@@ -665,9 +665,16 @@ function connectDebugEvents() {
 		// 去抖刷新快照（抽屉打开时立即刷新，关闭时仅更新徽标）
 		clearTimeout(refreshTimer);
 		refreshTimer = setTimeout(refreshDebugState, 400);
+		// Project Map 页可见时同步刷新（memory_updated / memory_batch_done / map_stale 等事件）
+		if (mapVisible) {
+			clearTimeout(mapRefreshTimer);
+			mapRefreshTimer = setTimeout(refreshMap, 400);
+		}
 	});
 	debugEvents.onopen = () => {
 		if (drawer.hidden) refreshDebugState();
+		// debug 服务晚启动：重连成功后补刷新 map 页（此前可能停在"未连接"错误态）
+		if (mapVisible) refreshMap();
 	};
 	debugEvents.onerror = () => {
 		try { debugEvents.close(); } catch {}
@@ -700,6 +707,7 @@ async function refreshDebugState() {
 		const res = await fetch("/debug/state");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const state = await res.json();
+		if (state.cwd) debugCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
 		renderPlugins(state.plugins ?? []);
 		renderContext(state.context);
 	} catch {
@@ -789,8 +797,198 @@ function renderContext(ctx) {
 	}
 }
 
+/* ================= Project Map 页面（debug API） ================= */
+const mapTree = $("#mapTree");
+const mapDetail = $("#mapDetail");
+let mapVisible = false;
+let debugCwd = "";            // 会话内稳定，从 /debug/state 缓存
+let mapEntries = {};          // 最近一次 entries（重选文件时重渲染用）
+let mapFileList = [];         // [{ id, name, rel, entry }]，构建时收集、按 rel 排序
+let selectedMapId = null;
+const mapCollapsed = new Set(); // 折叠的目录路径（跨刷新保留）
+let mapRefreshTimer = null;
+
+/** 视图切换：chat ↔ map。map 视图隐藏 topbar/chat-flow/input-area，显示 mapPage */
+function setView(view) {
+	const mapView = view === "map";
+	mapVisible = mapView;
+	document.querySelector(".topbar").hidden = mapView;
+	$("#chatFlow").hidden = mapView;
+	document.querySelector(".input-area").hidden = mapView;
+	$("#mapPage").hidden = !mapView;
+	$("#navConv").classList.toggle("selected", !mapView);
+	$("#navMap").classList.toggle("selected", mapView);
+	if (mapView) refreshMap();
+}
+
+/** 相对路径（无 node:path 的浏览器实现，语义对齐 project-map.ts renderTree 的 relative） */
+function relPath(cwd, abs, win) {
+	const norm = (p) => p.replace(/\\/g, "/");
+	const from = norm(cwd).split("/").filter(Boolean);
+	const to = norm(abs).split("/").filter(Boolean);
+	const cmp = win ? (s) => s.toLowerCase() : (s) => s;
+	let i = 0;
+	while (i < from.length && i < to.length && cmp(from[i]) === cmp(to[i])) i++;
+	const up = from.length - i;
+	const rest = to.slice(i).join("/");
+	if (!rest) return ".";
+	return up ? "../".repeat(up) + rest : rest;
+}
+
+/** 目录分组构建（语义对齐 renderTree：过滤 stale 与非 source:file，目录在前文件在后排序） */
+function buildMapTree(entries) {
+	// win32 检测须在剥掉 source:file: 前缀后的 abs 上做（前缀会挡住 ^[a-zA-Z]: 锚点）
+	const win = Object.keys(entries).some((id) =>
+		id.startsWith("source:file:") && /^[a-zA-Z]:[\\/]/.test(id.slice("source:file:".length)),
+	);
+	const root = { name: "", dirs: new Map(), files: [] };
+	mapFileList = [];
+	for (const [id, e] of Object.entries(entries)) {
+		if (!e || e.stale) continue; // 软删除：快照 toJSON 不过滤，前端自建必须过滤（renderTree 同款语义）
+		if (!id.startsWith("source:file:")) continue; // 协议：仅 source:file 类别写入
+		const abs = id.slice("source:file:".length);
+		if (!abs) continue;
+		const rel = relPath(debugCwd, abs, win);
+		const parts = rel.split("/").filter(Boolean);
+		let node = root;
+		for (const part of parts.slice(0, -1)) {
+			let next = node.dirs.get(part);
+			if (!next) { next = { name: part, dirs: new Map(), files: [] }; node.dirs.set(part, next); }
+			node = next;
+		}
+		const file = { name: parts.at(-1) ?? abs, rel, id, entry: e };
+		node.files.push(file);
+		mapFileList.push(file);
+	}
+	mapFileList.sort((a, b) => a.rel.localeCompare(b.rel));
+	return root;
+}
+
+function renderTreeDom(root) {
+	mapTree.innerHTML = "";
+	const rootName = (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目";
+	const rootRow = el("div", "tree-root", rootName);
+	rootRow.title = debugCwd || "";
+	mapTree.appendChild(rootRow);
+	emitMapNode(root, mapTree, "");
+}
+
+function emitMapNode(node, parent, dirPath) {
+	const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+	for (const [name, dir] of dirs) {
+		const path = dirPath ? `${dirPath}/${name}` : name;
+		const row = el("div", "tree-dir");
+		const chev = el("span", "dir-chev");
+		chev.innerHTML = SVG.chev;
+		row.append(chev, `${name}/`);
+		const children = el("div", "tree-children");
+		emitMapNode(dir, children, path);
+		parent.append(row, children);
+		if (mapCollapsed.has(path)) row.classList.add("collapsed");
+		row.addEventListener("click", () => {
+			row.classList.toggle("collapsed");
+			if (row.classList.contains("collapsed")) mapCollapsed.add(path);
+			else mapCollapsed.delete(path);
+		});
+	}
+	const files = [...node.files].sort((a, b) => a.name.localeCompare(b.name));
+	for (const f of files) {
+		const row = el("div", "tree-node");
+		row.innerHTML = SVG.file;
+		row.appendChild(el("span", null, f.name));
+		row.title = f.rel;
+		if (f.id === selectedMapId) row.classList.add("selected");
+		row.addEventListener("click", () => {
+			selectedMapId = f.id;
+			renderMapPage(mapEntries);
+		});
+		parent.appendChild(row);
+	}
+}
+
+/** 详情卡：纯 Map 数据（作用/职责/结构/依赖/决策），空字段省略行 */
+function renderMapDetail(entry, rel) {
+	mapDetail.innerHTML = "";
+	const head = el("div", "detail-head");
+	const title = el("span", "detail-title", rel);
+	title.title = rel;
+	head.append(title, el("span", "chip", "Source"));
+	mapDetail.appendChild(head);
+	const add = (label, value) => {
+		mapDetail.appendChild(el("div", "f-label", label));
+		mapDetail.appendChild(el("div", "f-value", value));
+	};
+	const join = (arr) => (arr ?? []).filter(Boolean).join("；");
+	if (entry.role) add("文件作用", entry.role);
+	if ((entry.responsibilities ?? []).length) add("主要职责", join(entry.responsibilities));
+	if ((entry.keyStructures ?? []).length) add("关键结构", join(entry.keyStructures));
+	const deps = (entry.dependencies ?? []).filter(Boolean);
+	const dependents = (entry.dependents ?? []).filter(Boolean);
+	if (deps.length || dependents.length) {
+		const parts = [];
+		if (deps.length) parts.push(`依赖 ${deps.join("、")}`);
+		if (dependents.length) parts.push(`被 ${dependents.join("、")} 依赖`);
+		add("依赖关系", parts.join("；"));
+	}
+	if ((entry.decisions ?? []).length) {
+		mapDetail.appendChild(el("div", "divider"));
+		mapDetail.appendChild(el("div", "f-label", "相关开发结论"));
+		mapDetail.appendChild(el("div", "f-value", join(entry.decisions)));
+	}
+	if (!mapDetail.querySelector(".f-label")) {
+		mapDetail.appendChild(el("div", "tree-empty", "（记忆 Agent 尚未整理出该文件的内容）"));
+	}
+}
+
+function renderMapPage(entries) {
+	mapEntries = entries;
+	const root = buildMapTree(entries);
+	if (mapFileList.length === 0) {
+		mapTree.innerHTML = "";
+		mapTree.appendChild(el("div", "tree-root", (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目"));
+		mapTree.appendChild(el("div", "tree-empty", "（暂无条目）对话中 agent 读取文件后，记忆 Agent 会累计整理生成项目地图。"));
+		mapDetail.innerHTML = "";
+		mapDetail.appendChild(el("div", "tree-empty", "从左侧选择一个文件查看详情"));
+		return;
+	}
+	// 选中态保持：条目失效/消失时回退到第一个文件
+	if (!selectedMapId || !mapFileList.some((f) => f.id === selectedMapId)) {
+		selectedMapId = mapFileList[0].id;
+	}
+	renderTreeDom(root);
+	const sel = mapFileList.find((f) => f.id === selectedMapId);
+	renderMapDetail(sel.entry, sel.rel);
+}
+
+async function refreshMap() {
+	if (!mapVisible) return;
+	try {
+		// 树构建依赖 cwd 做相对路径；页面加载时 debug 服务可能尚未就绪导致缓存为空，先补拉一次
+		if (!debugCwd) {
+			const r = await fetch("/debug/state");
+			if (!r.ok) throw new Error(`HTTP ${r.status}`); // 502（服务未就绪）不静默落空 cwd
+			const s = await r.json();
+			debugCwd = s.cwd ?? "";
+		}
+		const res = await fetch("/debug/project-map");
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const data = await res.json();
+		renderMapPage(data.entries ?? {});
+	} catch {
+		mapTree.innerHTML = "";
+		mapTree.appendChild(el("div", "tree-empty", "debug 服务未连接（扩展未启动？），正在重连…"));
+		mapDetail.innerHTML = "";
+	}
+}
+
+function setupMap() {
+	$("#navMap").addEventListener("click", () => setView("map"));
+	$("#navConv").addEventListener("click", () => setView("chat"));
+}
+
 /* ================= 启动 ================= */
 connectEvents();
 setupInput();
 setupDrawer();
+setupMap();
 initSession();

@@ -94,6 +94,16 @@ describe("debug 服务（HTTP 快照端点）", () => {
 		expect(state.cwd).toBe(tmp);
 	});
 
+	it("GET /api/project-map：返回 { entries, tree }（文档承诺形状，空 map 时 tree 含占位）", async () => {
+		const { status, body } = await fetchJson(`http://127.0.0.1:${server.port}/api/project-map`);
+		expect(status).toBe(200);
+		const map = body as { entries: Record<string, unknown>; tree: string };
+		expect(typeof map.entries).toBe("object");
+		expect(typeof map.tree).toBe("string");
+		expect(map.tree.startsWith("# 项目地图")).toBe(true);
+		expect(map.tree).toContain("（暂无条目）");
+	});
+
 	it("read 流程后：快照含插件元数据（引用式无文本），live 端点实时读盘返回段文本", async () => {
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, text20_40), ctx());

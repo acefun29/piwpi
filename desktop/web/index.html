@@ -18,9 +18,9 @@
     </button>
     <div class="side-spacer"></div>
     <div class="section-label">Workspace</div>
-    <button class="nav-row selected"><span>Conversations</span></button>
+    <button class="nav-row selected" id="navConv"><span>Conversations</span></button>
     <button class="nav-row disabled" title="即将推出"><span>Memory</span><span class="soon">即将推出</span></button>
-    <button class="nav-row disabled" title="即将推出"><span>Project Map</span><span class="soon">即将推出</span></button>
+    <button class="nav-row" id="navMap"><span>Project Map</span></button>
     <div class="side-fill"></div>
     <div class="side-status">
       <div class="status-row"><span class="status-dot" id="piDot"></span><span id="piStatus">连接中…</span></div>
@@ -58,6 +58,18 @@
             <svg class="icon-send" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <svg class="icon-abort" width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="2" y="2" width="8" height="8" rx="1.5" fill="#FFFFFF"/></svg>
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Project Map 页面（数据源：/debug/project-map + /debug/state.cwd） ===== -->
+    <div class="page page-map" id="mapPage" hidden>
+      <div class="page-pad-sm">
+        <div class="page-title">Project Map</div>
+        <div class="page-sub">记忆 Agent 逐步建立的项目理解</div>
+        <div class="body-row">
+          <div class="tree-card" id="mapTree"></div>
+          <div class="detail-card map-detail" id="mapDetail"></div>
         </div>
       </div>
     </div>

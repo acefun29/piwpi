@@ -285,6 +285,63 @@ button { font-family: inherit; }
 .event-item { font-size: 11px; color: var(--text-3); line-height: 18px; word-break: break-all; }
 .event-item .ev-type { color: var(--brand); }
 
+/* ===== Project Map 页面 ===== */
+.page { flex: 1; min-width: 0; }
+.page[hidden] { display: none; }
+/* [hidden] 显式覆盖：UA 样式表会被作者 display:flex 规则盖掉 */
+.topbar[hidden], .chat-flow[hidden], .input-area[hidden] { display: none; }
+.page-pad-sm { height: 100%; padding: 32px; display: flex; flex-direction: column; gap: 20px; overflow: hidden; }
+.page-title { font-size: 22px; font-weight: 600; }
+.page-sub { font-size: 13px; color: var(--text-3); margin-top: 4px; }
+.body-row { flex: 1; display: flex; gap: 16px; align-items: flex-start; min-height: 0; }
+
+.tree-card {
+  width: 440px; flex-shrink: 0; height: 100%;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.tree-root { height: 32px; display: flex; align-items: center; padding-left: 8px; font-size: 14px; font-weight: 600; flex-shrink: 0; }
+.tree-children { display: flex; flex-direction: column; gap: 2px; padding-left: 16px; }
+.tree-dir {
+  height: 30px; border-radius: 6px;
+  display: flex; align-items: center; gap: 6px; padding-left: 8px;
+  font-size: 13px; font-weight: 500; color: var(--text-2);
+  cursor: pointer; user-select: none;
+}
+.tree-dir:hover { background: var(--bg-app); }
+.tree-dir .dir-chev { transition: transform .15s; display: inline-flex; color: var(--brand); }
+.tree-dir.collapsed .dir-chev { transform: rotate(-90deg); }
+.tree-dir.collapsed + .tree-children { display: none; }
+.tree-node {
+  height: 30px; border-radius: 6px;
+  display: flex; align-items: center; gap: 8px; padding-left: 24px;
+  font-size: 13px; cursor: pointer; user-select: none;
+}
+.tree-node:hover { background: var(--bg-app); }
+.tree-node.selected { background: var(--selected); color: var(--brand); font-weight: 500; }
+.tree-node.selected:hover { background: var(--selected); }
+.tree-desc { font-size: 12px; color: var(--text-3); padding-left: 40px; line-height: 18px; }
+.tree-empty { font-size: 12px; color: var(--text-3); padding: 8px 4px; line-height: 20px; }
+
+.detail-card {
+  width: 380px; flex-shrink: 0;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px; display: flex; flex-direction: column; gap: 12px;
+}
+.detail-card.map-detail { flex: 1; width: auto; }
+.detail-head { height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.detail-title { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip {
+  height: 22px; border-radius: 11px; background: var(--selected);
+  color: var(--brand); font-size: 11px; font-weight: 500;
+  display: flex; align-items: center; padding: 0 10px; flex-shrink: 0;
+}
+.f-label { font-size: 12px; color: var(--text-3); }
+.f-value { font-size: 13px; line-height: 20px; }
+.f-value.brand { color: var(--brand); cursor: pointer; }
+.divider { height: 1px; background: var(--border); }
+
 /* ===== 全局提示 ===== */
 .banner {
   position: fixed; top: 0; left: 0; right: 0; z-index: 50;

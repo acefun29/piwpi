@@ -92,7 +92,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 export function createDebugServer(
-	harness: { snapshot(): DebugSnapshot; liveContent(id: string): Promise<LiveContent | null> },
+	harness: {
+		snapshot(): DebugSnapshot;
+		liveContent(id: string): Promise<LiveContent | null>;
+		projectMapTree(): string;
+	},
 	port: number,
 ): Promise<DebugServer> {
 	const clients = new Set<ServerResponse>();
@@ -148,7 +152,7 @@ export function createDebugServer(
 		}
 		if (path === "/api/project-map") {
 			const snapshot = harness.snapshot();
-			sendJson(res, 200, { entries: snapshot.projectMap });
+			sendJson(res, 200, { entries: snapshot.projectMap, tree: harness.projectMapTree() });
 			return;
 		}
 		// 实时读盘查看（引用式：磁盘是事实源，点击时读取挂载范围当前内容）——必须放在 /:id 之前匹配
