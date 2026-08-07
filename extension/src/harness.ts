@@ -26,7 +26,8 @@ import {
 	asCustomEntryWriter,
 	CUSTOM_ENTRY_TYPE,
 	type CustomEntryWriter,
-	defaultAgentDir,
+	dataDirFor,
+	migrateLegacyProjectMap,
 	projectMapFilePath,
 	readProjectMapFile,
 	restoreFromEntries,
@@ -102,8 +103,8 @@ export interface HarnessOptions {
 	store?: PluginStore;
 	queue?: MemoryQueue;
 	projectMap?: ProjectMap;
-	/** 项目地图文件目录（默认 ~/.pi/agent） */
-	agentDir?: string;
+	/** piwpi 数据目录（project map 落盘处；默认 <cwd>/.piwpi，$PIWPI_DATA_DIR 可覆盖） */
+	dataDir?: string;
 	cwd?: string;
 	/** 记忆 LLM 依赖（默认从 ctx.modelRegistry/ctx.model 提取） */
 	memoryDeps?: MemoryAgentDeps;
@@ -206,9 +207,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	/** 引用式：插件状态已变化、需要重新渲染锚点消息的插件（渲染后清除；无变化零 IO 零渲染） */
 	const dirtyPlugins = new Set<string>();
 	const pending = new Map<string, Pending>();
-	const agentDir = options.agentDir ?? defaultAgentDir();
 
 	let cwd = options.cwd ?? process.cwd();
+	/** piwpi 数据目录（惰性取：cwd 随会话变化，数据目录必须跟随当前项目） */
+	const dataDir = () => options.dataDir ?? dataDirFor(cwd);
 	let customEntryWriter: CustomEntryWriter | undefined = options.customEntryWriter;
 	let entriesProvider: (() => SessionEntry[]) | undefined = options.entriesProvider;
 	let modelRegistry: ModelRegistry | undefined;
@@ -236,8 +238,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		modelRegistry ??= ctx.modelRegistry;
 		// 只在有值时更新：后续事件（onToolCall/onContext）的 ctx 可能缺 model，无条件覆盖会冲掉已提取的模型
 		if (ctx.model) currentModel = ctx.model;
-		customEntryWriter ??= asCustomEntryWriter(ctx.sessionManager);
-		entriesProvider ??= () => (ctx.sessionManager.getEntries() ?? []) as SessionEntry[];
+		// 会话 writer/entries 必须跟随当前会话：会话切换（switch_session/switch_project）会重建
+		// sessionManager，??= 会保留旧会话的 writer（挂载写进旧会话 JSONL）；options 注入优先（测试隔离）
+		customEntryWriter = options.customEntryWriter ?? asCustomEntryWriter(ctx.sessionManager);
+		entriesProvider = options.entriesProvider ?? (() => (ctx.sessionManager.getEntries() ?? []) as SessionEntry[]);
 	}
 
 	/** 记忆 Agent LLM 通道自检（session_start 输出一次，杜绝"功能未生效但无日志"） */
@@ -481,7 +485,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 		}
 		if (mapDirty) {
-			await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+			await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
 		}
 		return notices;
 	}
@@ -537,7 +541,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			});
 			plugin.metadata = { ...plugin.metadata, memoryState: "done" };
 			store.upsert(plugin);
-			await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+			await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
 			persistPlugin(plugin);
 			emit({ type: "memory_updated", pluginId: plugin.id });
 			done++;
@@ -997,7 +1001,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				if (!mapLoaded) {
 					mapLoaded = true;
 					try {
-						projectMap.load(await readProjectMapFile(projectMapFilePath(agentDir, cwd)));
+						// 旧位置（~/.pi/agent/piwpi/<safeCwd>/）→ 项目内 .piwpi/ 一次性迁移（新位置已有则跳过）
+						await migrateLegacyProjectMap(cwd, dataDir());
+						projectMap.load(await readProjectMapFile(projectMapFilePath(dataDir())));
 					} catch (err) {
 						console.error("[piwpi] project map load error:", err);
 					}
@@ -1019,7 +1025,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			try {
 				if (projectMap.size() > 0) {
 					// 写前合并：不覆盖其他会话并发写入的条目
-					await writeProjectMapFileMerged(projectMapFilePath(agentDir, cwd), projectMap.toJSON());
+					await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
 				}
 			} catch (err) {
 				console.error("[piwpi] shutdown map save error:", err);

@@ -7,6 +7,8 @@ import { countChangedLines } from "../src/memory/diff.ts";
 import {
 	asCustomEntryWriter,
 	CUSTOM_ENTRY_TYPE,
+	dataDirFor,
+	migrateLegacyProjectMap,
 	projectMapFilePath,
 	readProjectMapFile,
 	restoreFromEntries,
@@ -362,17 +364,48 @@ describe("persist（计划 §6.4）", () => {
 		}
 	});
 
-	it("projectMapFilePath 落在 agentDir/piwpi/safeCwd/ 下", async () => {
-		const file = projectMapFilePath(tmp, "C:\\proj");
-		expect(file).toContain(join("piwpi"));
-		expect(file).toContain("project-map.json");
+	it("dataDirFor：默认 <cwd>/.piwpi，PIWPI_DATA_DIR 可覆盖", () => {
+		expect(dataDirFor("C:\\proj")).toBe(join("C:\\proj", ".piwpi"));
+		process.env.PIWPI_DATA_DIR = join(tmp, "custom-data");
+		try {
+			expect(dataDirFor("C:\\proj")).toBe(join(tmp, "custom-data"));
+		} finally {
+			delete process.env.PIWPI_DATA_DIR;
+		}
+	});
+
+	it("projectMapFilePath 落在数据目录内单文件（M6 新模型）", async () => {
+		expect(projectMapFilePath(join(tmp, "data"))).toBe(join(tmp, "data", "project-map.json"));
 	});
 
 	it("项目地图文件写读往返", async () => {
-		const file = projectMapFilePath(tmp, "C:\\proj");
+		const file = projectMapFilePath(tmp);
 		await writeProjectMapFile(file, { p1: { role: "auth" } });
 		const data = await readProjectMapFile(file);
 		expect(data).toEqual({ p1: { role: "auth" } });
+	});
+
+	it("migrateLegacyProjectMap：旧位置无数据 → false；有数据且新位置空 → 复制并返回 true；新位置已有 → 不覆盖", async () => {
+		const cwd = join(tmp, "proj");
+		const dataDir = join(tmp, "proj", ".piwpi");
+		// 旧位置 = defaultAgentDir()/piwpi/<safeCwd>/project-map.json（临时隔离：注入 PI_CODING_AGENT_DIR）
+		const legacyAgent = join(tmp, "legacy-agent");
+		process.env.PI_CODING_AGENT_DIR = legacyAgent;
+		try {
+			// 旧位置无数据
+			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(false);
+			// 旧位置有数据 → 迁移
+			const legacy = join(legacyAgent, "piwpi", safeCwd(cwd), "project-map.json");
+			await writeProjectMapFile(legacy, { p1: { role: "legacy" } });
+			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(true);
+			expect(await readProjectMapFile(projectMapFilePath(dataDir))).toEqual({ p1: { role: "legacy" } });
+			// 新位置已有数据 → 不覆盖
+			await writeProjectMapFile(projectMapFilePath(dataDir), { p2: { role: "new" } });
+			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(false);
+			expect(await readProjectMapFile(projectMapFilePath(dataDir))).toEqual({ p2: { role: "new" } });
+		} finally {
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
 	});
 
 	it("serializePlugin 原样序列化（引用式：插件本身不携带文本）", () => {

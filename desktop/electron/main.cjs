@@ -10,7 +10,8 @@
  * - spawn pi 子进程由 bridge 负责（Electron 下自动注入 ELECTRON_RUN_AS_NODE=1）
  * - 关窗即杀 pi、关 bridge
  */
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const path = require("node:path");
 
 let bridge = null;
 let win = null;
@@ -42,7 +43,15 @@ async function createWindow() {
 			contextIsolation: true,
 			nodeIntegration: false,
 			sandbox: true,
+			preload: path.join(__dirname, "preload.cjs"),
 		},
+	});
+	// 渲染进程外链（markdown 渲染出的 http(s) 链接）→ 主进程校验协议后走系统浏览器
+	ipcMain.on("open-external", (e, url) => {
+		try {
+			const u = new URL(String(url));
+			if (u.protocol === "https:" || u.protocol === "http:") shell.openExternal(u.href);
+		} catch { /* 非法 URL 忽略 */ }
 	});
 	// 安全基线：禁止新窗口、禁止导航到白名单之外的 URL
 	win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));

@@ -223,6 +223,40 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	/**
+	 * piwpi 魔改：运行中切换项目目录（不重启进程）。
+	 * 镜像 switchSession 的替换流程，但目标是"任意新目录"而非既有会话文件：
+	 * 校验目录 → teardownCurrent → 以新 cwd + 项目内会话目录（<cwd>/.piwpi/sessions，
+	 * 与桌面端 --session-dir 约定一致）创建全新 SessionManager → 重建 runtime → session_start(new)。
+	 * 扩展经 session_start 拿到新 ctx.cwd，其数据目录（dataDir）自动跟随新项目。
+	 */
+	async switchProject(
+		cwd: string,
+		options?: {
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
+		},
+	): Promise<{ cancelled: boolean }> {
+		const resolvedCwd = resolve(cwd);
+		if (!existsSync(resolvedCwd)) {
+			throw new Error(`Project directory not found: ${resolvedCwd}`);
+		}
+		const previousSessionFile = this.session.sessionFile;
+		await this.teardownCurrent("new", undefined);
+		const sessionManager = SessionManager.create(resolvedCwd, join(resolvedCwd, ".piwpi", "sessions"));
+		this.apply(
+			await this.createRuntime({
+				cwd: resolvedCwd,
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+				projectTrustContext: options?.projectTrustContextFactory?.(resolvedCwd),
+			}),
+		);
+		await this.finishSessionReplacement(options?.withSession);
+		return { cancelled: false };
+	}
+
 	async newSession(options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;

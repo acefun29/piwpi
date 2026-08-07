@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>piwpi</title>
 <link rel="stylesheet" href="./styles.css">
+<link rel="stylesheet" href="./vendor/hljs-github.min.css">
 </head>
 <body>
 <div id="app">
@@ -16,10 +17,11 @@
       <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round"/></svg>
       <span>新建对话</span>
     </button>
+    <button class="nav-row" id="navProject" title="当前项目目录，点击切换">
+      <span id="projectName">—</span><span class="soon">切换</span>
+    </button>
+    <div class="session-tree" id="sessionTree"></div>
     <div class="side-spacer"></div>
-    <div class="section-label">Workspace</div>
-    <button class="nav-row selected" id="navConv"><span>Conversations</span></button>
-    <button class="nav-row disabled" title="即将推出"><span>Memory</span><span class="soon">即将推出</span></button>
     <button class="nav-row" id="navMap"><span>Project Map</span></button>
     <div class="side-fill"></div>
     <div class="side-status">
@@ -99,6 +101,8 @@
 <div class="banner" id="banner" hidden></div>
 <div class="toast-stack" id="toasts"></div>
 
+<script src="./vendor/markdown-it.min.js"></script>
+<script src="./vendor/hljs.min.js"></script>
 <script type="module" src="./app.js"></script>
 </body>
 </html>

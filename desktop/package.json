@@ -13,6 +13,8 @@
     "typecheck:web": "node --check web/app.js"
   },
   "devDependencies": {
-    "electron": "^37.0.0"
+    "@highlightjs/cdn-assets": "^11.11.1",
+    "electron": "^37.0.0",
+    "markdown-it": "^14.3.0"
   }
 }

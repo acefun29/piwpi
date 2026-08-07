@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -10,7 +10,7 @@ import type { MapEntry, ToolContextPlugin } from "../types.ts";
  * | 数据 | 通道 |
  * |---|---|
  * | 插件状态（不含大段文本，恢复时按范围从磁盘重切） | ctx.sessionManager.appendCustomEntry("piwpi:plugin", data) |
- * | 项目地图（跨会话长期资产） | 独立文件 join(getAgentDir(), "piwpi", safeCwd, "project-map.json") |
+ * | 项目地图（跨会话长期资产） | 独立文件 <项目>/.piwpi/project-map.json（数据跟项目走） |
  *
  * 恢复：session_start（reason === "resume"）时回放 custom entries 重建 store（Harness 内实现重切逻辑）。
  * 注意：ExtensionContext.sessionManager 的类型是 ReadonlySessionManager（Pick 自 SessionManager），
@@ -40,15 +40,48 @@ export function safeCwd(cwd: string): string {
 	return `--${resolved.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
-/** 项目地图文件路径（计划 §6.4） */
-export function projectMapFilePath(agentDir: string, cwd: string): string {
-	return join(agentDir, "piwpi", safeCwd(cwd), "project-map.json");
+/** piwpi 数据目录：$PIWPI_DATA_DIR 覆盖 → 默认 <cwd>/.piwpi（数据跟项目走，M6 新模型） */
+export function dataDirFor(cwd: string): string {
+	if (process.env.PIWPI_DATA_DIR) return process.env.PIWPI_DATA_DIR;
+	return join(cwd, ".piwpi");
 }
 
-/** 默认 agent 目录：$PI_AGENT_DIR 或 ~/.pi/agent（config.ts:515-521） */
+/** 项目地图文件路径（M6 新模型：数据目录内单文件，不再按 safeCwd 分目录——数据目录本身即 per-project） */
+export function projectMapFilePath(dataDir: string): string {
+	return join(dataDir, "project-map.json");
+}
+
+/** 默认 agent 目录：$PI_CODING_AGENT_DIR 或 ~/.pi/agent（与 pi config.ts ENV_AGENT_DIR 一致；仅旧数据迁移用） */
 export function defaultAgentDir(): string {
-	if (process.env.PI_AGENT_DIR) return process.env.PI_AGENT_DIR;
+	if (process.env.PI_CODING_AGENT_DIR) return process.env.PI_CODING_AGENT_DIR;
 	return join(homedir(), ".pi", "agent");
+}
+
+/**
+ * 旧位置 → 新位置一次性迁移：~/.pi/agent/piwpi/<safeCwd>/project-map.json → <dataDir>/project-map.json。
+ * 旧位置无文件或新位置已有文件（不覆盖新数据）则跳过；返回是否执行了迁移。
+ */
+export async function migrateLegacyProjectMap(cwd: string, dataDir: string): Promise<boolean> {
+	const legacy = join(defaultAgentDir(), "piwpi", safeCwd(cwd), "project-map.json");
+	const target = projectMapFilePath(dataDir);
+	try {
+		await access(legacy);
+	} catch {
+		return false;
+	}
+	try {
+		await access(target);
+		return false;
+	} catch {
+		// target 不存在 → 执行迁移
+	}
+	try {
+		await mkdir(dirname(target), { recursive: true });
+		await copyFile(legacy, target);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**

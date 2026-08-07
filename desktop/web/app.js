@@ -38,6 +38,64 @@ function showBanner(text) {
 	else b.hidden = true;
 }
 
+/* ================= Markdown 渲染 ================= */
+// 两库经 index.html 的 <script> 以 UMD 全局加载（离线可用、零构建）
+const md = window.markdownit
+	? new window.markdownit({ html: false, linkify: true, breaks: true })
+	: null;
+// 安全：只允许 http(s)/mailto 链接——封死 [x](javascript:alert(1)) 这类 markdown 链接
+if (md) md.validateLink = (url) => /^(https?:|mailto:)/i.test(String(url).trim());
+const hljs = window.hljs;
+if (hljs) hljs.configure({ ignoreUnescapedHTML: true });
+
+/** 块渲染目标：文本块 → node，思考块 → body */
+function mdTarget(blk) { return blk.type === "thinking" ? blk.body : blk.node; }
+
+/** 同步渲染一整个块；highlight 时对 pre code 做高亮（仅收尾阶段开） */
+function mdRender(blk, { highlight = false } = {}) {
+	const node = mdTarget(blk);
+	if (!node || !node.isConnected) return; // 兜底：块已被替换/移除
+	if (!md) { node.textContent = blk.text; return; } // 兜底：库缺失退回纯文本
+	node.innerHTML = md.render(blk.text);
+	sanitizeLinks(node);
+	if (highlight) highlightCode(node);
+}
+
+/** 链接净化兜底：仅保留 http(s)/mailto，其余剥 href（覆盖 validateLink 之外的边角） */
+function sanitizeLinks(root) {
+	for (const a of root.querySelectorAll("a[href]")) {
+		if (!/^(https?:|mailto:)/i.test(a.getAttribute("href"))) a.removeAttribute("href");
+	}
+}
+
+/** 对节点内 pre code 逐个高亮（markdown-it 产出 language-* 类，hljs 按类取语言） */
+function highlightCode(root) {
+	if (!hljs) return;
+	for (const codeEl of root.querySelectorAll("pre code")) hljs.highlightElement(codeEl);
+}
+
+/* 流式 rAF 节流：按块去重，每帧最多全量重渲染一次 */
+const dirtyMd = new Set();
+let mdRaf = 0;
+function scheduleMd(blk) {
+	dirtyMd.add(blk);
+	if (!mdRaf) mdRaf = requestAnimationFrame(flushMd);
+}
+function flushMd() {
+	mdRaf = 0;
+	const list = [...dirtyMd];
+	dirtyMd.clear();
+	for (const blk of list) mdRender(blk); // 流式中不做高亮，message_end 统一收尾
+	scrollBottom();
+}
+/** 收尾：取消挂起 rAF，把剩余脏块做最终渲染 + 高亮（message_end / agent_settled 用） */
+function finalizeMd(a) {
+	if (mdRaf) { cancelAnimationFrame(mdRaf); mdRaf = 0; }
+	const list = [...dirtyMd];
+	dirtyMd.clear();
+	for (const blk of list) mdRender(blk, { highlight: true });
+}
+
 /* ================= RPC 通道 ================= */
 let reqSeq = 0;
 const pending = new Map(); // id -> {resolve, timer}
@@ -116,7 +174,7 @@ function ensureAssistant() {
 
 /* --- 文本块 --- */
 function blockText() {
-	const node = el("div", "msg");
+	const node = el("div", "msg md-body");
 	return { type: "text", text: "", node };
 }
 /* --- 思考块 --- */
@@ -125,7 +183,7 @@ function blockThinking() {
 	const head = el("div", "think-head");
 	head.innerHTML = `<span class="think-chev">${SVG.chev}</span>`;
 	head.appendChild(el("span", null, "思考过程"));
-	const body = el("div", "think-body");
+	const body = el("div", "think-body md-body");
 	head.addEventListener("click", () => wrap.classList.toggle("open"));
 	wrap.append(head, body);
 	return { type: "thinking", text: "", node: wrap, body };
@@ -265,6 +323,7 @@ function dispatch(evt) {
 			return;
 		case "agent_settled":
 			setStreaming(false);
+			if (currentAssistant) finalizeMd(currentAssistant); // 兜底：没收齐 message_end 时仍完成收尾
 			currentAssistant = null;
 			return;
 		case "agent_end":
@@ -280,6 +339,13 @@ function dispatch(evt) {
 			if (currentAssistant) {
 				for (const b of currentAssistant.blocks.values()) {
 					if (b.type === "thinking") b.node.classList.remove("streaming");
+				}
+				finalizeMd(currentAssistant); // 最终渲染 + 高亮
+				// 兜底：异常/中断消息补状态行（与 rebuildHistory 一致）
+				if (evt.stopReason === "error") {
+					currentAssistant.root.appendChild(el("div", "run-text", "⚠ 该轮以错误结束（stopReason: error，可能是模型鉴权或 API 异常）"));
+				} else if (evt.stopReason === "aborted") {
+					currentAssistant.root.appendChild(el("div", "run-text", "已中断"));
 				}
 			}
 			return;
@@ -341,6 +407,20 @@ function dispatch(evt) {
 			return;
 		case "bridge_hello":
 			setPiStatus(evt.piAlive);
+			refreshProjectInfo();
+			refreshSessions();
+			return;
+		case "session_start":
+			// 启动 / resume / 切换会话都会触发：更新当前会话高亮 + 刷新会话树
+			rpc({ type: "get_state" }, 30000)
+				.then((r) => {
+					if (r.success && typeof r.data?.sessionFile === "string") {
+						currentSessionFile = r.data.sessionFile;
+						refreshSessions();
+					}
+				})
+				.catch(() => {});
+			refreshSessions();
 			return;
 		default:
 			return;
@@ -360,7 +440,7 @@ function handleAssistantDelta(d) {
 		let blk = a.blocks.get(key);
 		if (!blk) { blk = blockText(); a.blocks.set(key, blk); a.root.appendChild(blk.node); }
 		blk.text += d.delta ?? "";
-		blk.node.textContent = blk.text;
+		scheduleMd(blk); // rAF 节流渲染，每帧最多一次全量解析
 		scrollBottom();
 	} else if (d.type === "thinking_start") {
 		const blk = blockThinking();
@@ -371,7 +451,7 @@ function handleAssistantDelta(d) {
 		let blk = a.blocks.get(key);
 		if (!blk) { blk = blockThinking(); a.blocks.set(key, blk); a.root.appendChild(blk.node); }
 		blk.text += d.delta ?? "";
-		blk.body.textContent = blk.text;
+		scheduleMd(blk); // rAF 节流渲染，每帧最多一次全量解析
 		scrollBottom();
 	} else if (d.type === "thinking_end") {
 		const blk = a.blocks.get(key);
@@ -456,6 +536,15 @@ async function initSession() {
 	try {
 		// 等 SSE 打开后再发 rpc，避免响应丢失导致超时
 		await esOpened;
+		// 恢复上次选择的项目（localStorage；switch_project 为运行中切换，pi 不重启）
+		const saved = localStorage.getItem("piwpi.project");
+		if (saved) {
+			const st = await (await fetch("/api/bridge/status")).json();
+			if (st.workspace && normPath(st.workspace) !== normPath(saved)) {
+				await rpc({ type: "switch_project", path: saved }, 30000);
+			}
+		}
+		await refreshProjectInfo();
 		// 首次 initSession 时 pi 还在加载扩展（jiti TS），get_state/get_messages 可能需要 30s+
 		const [stateRes, levelsRes] = await Promise.all([
 			rpc({ type: "get_state" }, 90000),
@@ -465,18 +554,39 @@ async function initSession() {
 			const d = stateRes.data;
 			$("#modelName").textContent = d.model ? `${d.model.name ?? d.model.id}` : "未选择模型";
 			document.title = `piwpi · ${d.model?.id ?? ""}`;
+			if (typeof d.sessionFile === "string") currentSessionFile = d.sessionFile;
 			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], d.thinkingLevel);
 			setStreaming(!!d.isStreaming);
 		}
 		// 恢复历史消息（刷新页面后）
-		const msgsRes = await rpc({ type: "get_messages" }, 60000);
-		if (msgsRes.success && msgsRes.data.messages.length > 0) {
-			rebuildHistory(msgsRes.data.messages);
-		}
+		await rebuildFromMessages();
+		refreshSessions();
 	} catch (err) {
 		console.error(err);
 		toast(`初始化失败：${err.message}`, "error", 8000);
 	}
+}
+
+/** get_messages → rebuildHistory（会话切换/页面刷新共用） */
+async function rebuildFromMessages() {
+	try {
+		const msgsRes = await rpc({ type: "get_messages" }, 60000);
+		if (msgsRes.success && msgsRes.data.messages.length > 0) {
+			rebuildHistory(msgsRes.data.messages);
+		}
+	} catch { /* ignore */ }
+}
+
+/** 清空对话视图并恢复空态（新建会话/项目切换后用） */
+function resetChatView() {
+	msgCol.innerHTML = "";
+	toolCards.clear();
+	currentAssistant = null;
+	setStreaming(false);
+	const hint = el("div", "empty-hint");
+	hint.id = "emptyHint";
+	hint.innerHTML = '<div class="empty-title">开始一段对话</div><div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧 Context 可实时查看。</div>';
+	msgCol.appendChild(hint);
 }
 
 function setupThinkingPicker(levels, current) {
@@ -526,16 +636,16 @@ function rebuildHistory(messages) {
 				if (c.type === "text") {
 					const blk = blockText();
 					blk.text = c.text ?? "";
-					blk.node.textContent = blk.text;
 					a.blocks.set(i, blk);
 					a.root.appendChild(blk.node);
+					mdRender(blk, { highlight: true }); // 历史消息：先挂载再渲染
 				} else if (c.type === "thinking") {
 					const blk = blockThinking();
 					blk.node.classList.remove("streaming");
 					blk.text = c.thinking ?? "";
-					blk.body.textContent = blk.text;
 					a.blocks.set(i, blk);
 					a.root.appendChild(blk.node);
+					mdRender(blk, { highlight: true });
 				} else if (c.type === "toolCall") {
 					const blk = blockToolCall(c.id, c.name, c.arguments);
 					a.blocks.set(i, blk);
@@ -610,16 +720,18 @@ function setupInput() {
 		try {
 			const res = await rpc({ type: "new_session" });
 			if (res.success && !res.data?.cancelled) {
-				msgCol.innerHTML = "";
-				toolCards.clear();
-				currentAssistant = null;
-				setStreaming(false);
-				const hint = el("div", "empty-hint");
-				hint.id = "emptyHint";
-				hint.innerHTML = '<div class="empty-title">开始一段对话</div><div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧 Context 可实时查看。</div>';
-				msgCol.appendChild(hint);
+				resetChatView();
 				$("#sessionTitle").textContent = "piwpi / 新对话";
 				toast("已开始新对话");
+				// 立即刷新当前会话（新会话未落盘，树里以"新对话"常驻项呈现）
+				rpc({ type: "get_state" }, 30000)
+					.then((r) => {
+						if (r.success && typeof r.data?.sessionFile === "string") {
+							currentSessionFile = r.data.sessionFile;
+						}
+					})
+					.catch(() => {});
+				refreshSessions();
 			}
 		} catch (err) {
 			toast(`新建对话失败：${err.message}`, "error");
@@ -816,7 +928,6 @@ function setView(view) {
 	$("#chatFlow").hidden = mapView;
 	document.querySelector(".input-area").hidden = mapView;
 	$("#mapPage").hidden = !mapView;
-	$("#navConv").classList.toggle("selected", !mapView);
 	$("#navMap").classList.toggle("selected", mapView);
 	if (mapView) refreshMap();
 }
@@ -982,13 +1093,288 @@ async function refreshMap() {
 }
 
 function setupMap() {
-	$("#navMap").addEventListener("click", () => setView("map"));
-	$("#navConv").addEventListener("click", () => setView("chat"));
+	// navMap 点击在 chat ↔ map 视图间切换（会话树常驻侧边栏，无需独立 Conversations 导航）
+	$("#navMap").addEventListener("click", () => setView(mapVisible ? "chat" : "map"));
 }
+
+/* ================= 项目目录与会话列表 ================= */
+let currentWorkspace = "";
+let currentSessionFile = ""; // 当前活动会话（侧边栏高亮）
+
+/** 路径归一化（比较用）：反斜杠转正 + 小写 */
+function normPath(p) {
+	return String(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** 轮询扩展 debug 快照直到 cwd 变为目标项目（switch_project 后扩展重载完成） */
+async function waitDebugCwd(target, timeoutMs) {
+	const start = Date.now();
+	for (;;) {
+		try {
+			const state = await (await fetch("/debug/state")).json();
+			if (typeof state.cwd === "string" && normPath(state.cwd) === normPath(target)) return;
+		} catch { /* retry */ }
+		if (Date.now() - start > timeoutMs) throw new Error("项目切换确认超时");
+		await new Promise((r) => setTimeout(r, 250));
+	}
+}
+
+/** 刷新侧边栏项目名（事实源 = 扩展 debug 快照 cwd，switch_project 后自动跟随；fallback bridge status） */
+async function refreshProjectInfo() {
+	try {
+		let cwd = "";
+		try {
+			const state = await (await fetch("/debug/state")).json();
+			if (typeof state.cwd === "string" && state.cwd) cwd = state.cwd;
+		} catch { /* fallthrough */ }
+		if (!cwd) {
+			const st = await (await fetch("/api/bridge/status")).json();
+			if (typeof st.workspace === "string") cwd = st.workspace;
+		}
+		if (cwd) {
+			currentWorkspace = cwd;
+			const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
+			const name = $("#projectName");
+			name.textContent = base;
+			name.title = cwd;
+		}
+	} catch { /* ignore */ }
+}
+
+/** 拉取并渲染当前项目会话列表 */
+async function refreshSessions() {
+	try {
+		const res = await fetch("/api/sessions");
+		const data = await res.json();
+		renderSessions(data.sessions ?? []);
+	} catch { /* ignore */ }
+}
+
+function relTime(ts) {
+	const diff = Date.now() - ts;
+	if (!Number.isFinite(ts) || diff < 0) return "";
+	if (diff < 60_000) return "刚刚";
+	if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+	if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+	if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
+	return new Date(ts).toLocaleDateString("zh-CN");
+}
+
+/** 项目组折叠状态（跨刷新保留）：path -> collapsed */
+const projectCollapsed = new Map();
+
+/**
+ * 侧边栏多项目会话树（对齐 Codex 桌面版：全部项目会话 + 项目标识）。
+ * 按 cwd 分组：当前项目组置顶展开，其他项目组默认折叠；组标题点击 = 切到该项目（switch_project，
+ * 无缝）；会话点击 = switch_session（pi 采纳会话 cwd，跨项目直接切换）。
+ * 当前会话常驻（pi 会话文件惰性落盘，未落盘也显示）；无标题会话用首条消息摘要。
+ */
+function renderSessions(sessions) {
+	const tree = $("#sessionTree");
+	if (!tree) return;
+	tree.innerHTML = "";
+	// 合并当前会话（未落盘）→ 归入当前项目组
+	const known = new Set(sessions.map((s) => s.sessionFile));
+	const current = currentSessionFile && !known.has(currentSessionFile)
+		? [{ sessionFile: currentSessionFile, id: "", name: "新对话", firstMessage: "", modified: Date.now(), messageCount: 0, cwd: currentWorkspace }]
+		: [];
+	const all = [...current, ...sessions];
+	if (all.length === 0) {
+		tree.appendChild(el("div", "sessions-tree-empty", "暂无历史会话"));
+		return;
+	}
+	// 按 cwd 分组，当前项目置顶
+	const groups = new Map();
+	for (const s of all) {
+		const cwd = s.cwd || currentWorkspace || "";
+		if (!groups.has(cwd)) groups.set(cwd, []);
+		groups.get(cwd).push(s);
+	}
+	const order = [...groups.keys()].sort((a, b) => {
+		const an = normPath(a) === normPath(currentWorkspace) ? 0 : 1;
+		const bn = normPath(b) === normPath(currentWorkspace) ? 0 : 1;
+		return an - bn;
+	});
+	for (const cwd of order) {
+		const list = groups.get(cwd);
+		const isCurrentProj = normPath(cwd) === normPath(currentWorkspace);
+		// 组标题：点击 = 切到该项目（当前组则折叠）；chevron = 仅折叠
+		const head = el("div", "proj-group");
+		if (isCurrentProj) head.classList.add("current");
+		const chev = el("span", "proj-chev");
+		chev.innerHTML = SVG.chev;
+		const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
+		const name = el("span", "proj-name", isCurrentProj ? `${base}（当前）` : base);
+		name.title = cwd;
+		const count = el("span", "proj-count", String(list.length));
+		head.append(chev, name, count);
+		head.title = isCurrentProj ? `${cwd}（当前项目）` : `${cwd} — 点击切换到此项目`;
+		const body = el("div", "proj-body");
+		for (const s of list) {
+			const isCurrent = s.sessionFile === currentSessionFile;
+			const item = el("div", "sess-item");
+			if (isCurrent) item.classList.add("active");
+			const label = s.name || s.firstMessage || "(无标题会话)";
+			const title = el("span", "sess-title-min", label);
+			title.title = s.name || s.firstMessage || s.sessionFile;
+			const time = el("span", "sess-time", relTime(s.modified));
+			const del = el("button", "sess-del");
+			del.title = "删除会话";
+			del.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 2l6 6M8 2l-6 6" stroke="#74767C" stroke-width="1.4" stroke-linecap="round"/></svg>';
+			del.addEventListener("click", async (e) => {
+				e.stopPropagation();
+				if (isCurrent) {
+					toast("当前会话不能删除", "warn");
+					return;
+				}
+				if (!confirm(`删除会话「${s.name || s.firstMessage || s.id}」？文件将从磁盘移除，不可恢复。`)) return;
+				try {
+					const res = await fetch(`/api/sessions?file=${encodeURIComponent(s.sessionFile)}`, { method: "DELETE" });
+					if (res.ok) {
+						toast("会话已删除");
+						refreshSessions();
+					} else {
+						toast("删除失败", "error");
+					}
+				} catch (err) {
+					toast(`删除失败：${err.message}`, "error");
+				}
+			});
+			item.append(title, time, del);
+			item.title = s.sessionFile;
+			item.addEventListener("click", () => {
+				if (!isCurrent) resumeSession(s);
+			});
+			body.appendChild(item);
+		}
+		tree.append(head, body);
+		// 折叠：当前项目默认展开；其他默认折叠（用户展开过的保留）
+		const collapsed = isCurrentProj ? false : (projectCollapsed.get(cwd) ?? true);
+		if (collapsed) head.classList.add("collapsed");
+		chev.addEventListener("click", (e) => {
+			e.stopPropagation();
+			head.classList.toggle("collapsed");
+			projectCollapsed.set(cwd, head.classList.contains("collapsed"));
+		});
+		head.addEventListener("click", () => {
+			if (isCurrentProj) {
+				head.classList.toggle("collapsed");
+				projectCollapsed.set(cwd, head.classList.contains("collapsed"));
+			} else {
+				switchProjectPath(cwd);
+			}
+		});
+	}
+}
+
+/** 恢复历史会话：switch_session → 重建对话历史（扩展随会话重载，restorePlugins 恢复挂载） */
+async function resumeSession(s) {
+	try {
+		const res = await rpc({ type: "switch_session", sessionPath: s.sessionFile }, 30000);
+		if (!res.success) {
+			toast(`恢复失败：${res.error ?? "未知原因"}`, "error", 8000);
+			return;
+		}
+		resetChatView();
+		await rebuildFromMessages();
+		toast("已恢复会话");
+	} catch (err) {
+		toast(`恢复失败：${err.message}`, "error", 8000);
+	}
+}
+
+/** 切换项目（运行中切换，pi 不重启）：switch_project RPC → 等扩展 cwd 跟随 → 重建视图 */
+async function switchProjectPath(path) {
+	try {
+		const res = await rpc({ type: "switch_project", path }, 30000);
+		if (!res.success) {
+			toast(`切换失败：${res.error ?? "未知原因"}`, "error", 8000);
+			return;
+		}
+		localStorage.setItem("piwpi.project", res.data?.cwd ?? path);
+		await waitDebugCwd(path, 15000);
+		await refreshProjectInfo();
+		resetChatView();
+		$("#sessionTitle").textContent = "piwpi / 新对话";
+		await initSession();
+		toast(`已切换到项目：${res.data?.cwd ?? path}`);
+	} catch (err) {
+		toast(`切换失败：${err.message}`, "error", 8000);
+	}
+}
+
+/** 项目切换：优先原生目录选择对话框（Electron）；web 调试模式降级文本输入 overlay */
+function openProjectPicker() {
+	fetch("/api/project/picker", { method: "POST" })
+		.then((r) => r.json())
+		.then((data) => {
+			if (data.ok && data.path) {
+				switchProjectPath(data.path);
+			} else {
+				openProjectPickerManual();
+			}
+		})
+		.catch(() => openProjectPickerManual());
+}
+
+/** 文本输入降级 overlay（web 模式 / picker 不可用时） */
+function openProjectPickerManual() {
+	const overlay = el("div");
+	overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:80;display:flex;align-items:center;justify-content:center;";
+	const panel = el("div");
+	panel.style.cssText = "width:520px;max-width:90vw;background:#fff;border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:10px;";
+	const title = el("div", null, "切换项目目录");
+	title.style.cssText = "font-size:14px;font-weight:600;";
+	const sub = el("div", null, "切换为运行中切换（pi 不重启）；会话与 Project Map 数据随项目切换（存于 <项目>/.piwpi/）。");
+	sub.style.cssText = "font-size:12px;color:var(--text-3);line-height:18px;";
+	const input = el("input");
+	input.style.cssText = "padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;font-family:inherit;outline:none;";
+	input.placeholder = "项目目录绝对路径";
+	input.value = currentWorkspace || "";
+	const row = el("div");
+	row.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
+	const cancel = el("button", null, "取消");
+	cancel.style.cssText = "border:1px solid var(--border);background:none;border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;";
+	const confirm = el("button", null, "切换");
+	confirm.style.cssText = "background:var(--brand);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;";
+	const close = () => overlay.remove();
+	cancel.onclick = close;
+	confirm.onclick = () => {
+		const path = input.value.trim();
+		if (!path) return;
+		close();
+		switchProjectPath(path);
+	};
+	row.append(cancel, confirm);
+	panel.append(title, sub, input, row);
+	overlay.appendChild(panel);
+	overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+	document.body.appendChild(overlay);
+	input.focus();
+	input.select();
+}
+
+function setupProject() {
+	$("#navProject").addEventListener("click", openProjectPicker);
+}
+
+/* ================= Markdown 链接 ================= */
+/** 事件委托：一律拦默认导航；http(s) 链接交给系统浏览器（Electron preload 提供），其余剥死 */
+chatFlow.addEventListener("click", (e) => {
+	const a = e.target.closest("a[href]");
+	if (!a) return;
+	e.preventDefault(); // 禁止应用内导航（Electron 已 deny 新窗口 + 限制来源，这里双保险）
+	const href = a.getAttribute("href") ?? "";
+	if (/^https?:\/\//i.test(href)) {
+		if (window.openExternal) window.openExternal(href);
+		else if (window.open) window.open(href, "_blank"); // web 调试模式兜底
+	}
+});
 
 /* ================= 启动 ================= */
 connectEvents();
 setupInput();
 setupDrawer();
 setupMap();
+setupProject();
 initSession();

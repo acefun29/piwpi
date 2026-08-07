@@ -606,6 +606,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "switch_session", result);
 			}
 
+			case "switch_project": {
+				// piwpi 魔改：运行中切换项目目录（不重启进程）
+				const result = await runtimeHost.switchProject(command.path);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "switch_project", { ...result, cwd: session.sessionManager.getCwd() });
+			}
+
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
 				if (!result.cancelled) {

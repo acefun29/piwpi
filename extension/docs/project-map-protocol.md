@@ -5,9 +5,9 @@
 
 ## 1. 存储
 
-- 位置：`<agentDir>/piwpi/<safeCwd>/project-map.json`
-  - `<agentDir>` 默认 `~/.pi/agent`（`PI_CODING_AGENT_DIR` 可覆盖）
-  - `<safeCwd>` 为工作目录的编码（`/` `\` `:` → `-`，规则与 pi session-manager 一致）
+- 位置：`<项目根>/.piwpi/project-map.json`（数据跟项目走；`PIWPI_DATA_DIR` 可覆盖为任意目录）
+  - `<项目根>` = 主 Agent 会话的 cwd（desktop 端由「切换项目」决定，pi 以该目录为工作目录启动）
+  - 旧版本（`~/.pi/agent/piwpi/<safeCwd>/`）数据在首次启动时自动迁移到新位置
 - 格式：**按路径索引的 JSON 字典**，key 为插件 id，value 为 `MapEntry`：
 
 ```jsonc

@@ -12,9 +12,14 @@ Electron 主进程 (electron/main.mjs)
        │    ├─ POST /api/rpc    → 命令写入 pi stdin（JSONL）
        │    ├─ GET  /api/events → SSE 转发 pi stdout（事件 + 响应）
        │    └─ GET  /debug/*    → 反代 piwpi 扩展 debug 服务 (127.0.0.1:8787)
-       └─ spawn pi --mode rpc -e <extension>
+       └─ spawn pi --mode rpc -e <extension> --session-dir <项目>/.piwpi/sessions
             env: PIWPI_DEBUG_PORT=8787, ELECTRON_RUN_AS_NODE=1（Electron 下必须）
-            cwd: piwpi 仓库根（PIWPI_WORKSPACE 可覆盖）
+            cwd: 当前项目目录（默认 piwpi 仓库根，PIWPI_WORKSPACE 可覆盖；侧边栏项目行可切换）
+```
+
+- 数据跟项目走：会话（`--session-dir`）与 Project Map（扩展 `dataDirFor`，默认 `<cwd>/.piwpi`）都落在所选项目目录下
+- 切换项目：原生目录选择对话框（`POST /api/project/picker`，Electron dialog；web 调试模式降级文本输入）→ 前端发 RPC `switch_project`（piwpi 魔改命令：pi **运行中切换 cwd，不重启进程**，参照 switch_session 的 runtime 重建流程）→ 会话与记忆自动切换
+- 会话列表/恢复（`GET /api/sessions`、`DELETE /api/sessions`）：基准 = 扩展 debug 快照的 cwd（切换后自动跟随）；读取 `<项目>/.piwpi/sessions/` 下的 JSONL 会话文件（首行 header + session_info 名称 + 消息计数），点击恢复走 RPC `switch_session`
 ```
 
 - 对话数据走 pi RPC（协议见 `pi/packages/coding-agent/docs/rpc.md`）
@@ -62,7 +67,8 @@ npm run dev:web    # node server/bridge.mjs
 |---|---|---|
 | `PORT` | 8901 | bridge 端口（0 = 随机，Electron 模式用随机） |
 | `PIWPI_DEBUG_PORT` | 8787 | piwpi 扩展 debug 端口（被占自动递增） |
-| `PIWPI_WORKSPACE` | piwpi 仓库根 | pi 进程工作目录 |
+| `PIWPI_WORKSPACE` | piwpi 仓库根 | 初始项目目录（侧边栏可切换；上次选择存 localStorage） |
+| `PIWPI_DATA_DIR` | `<项目>/.piwpi` | 扩展数据目录覆盖（project map 落盘处） |
 | `PIWPI_PI_CLI` | extension/node_modules 内（symlink → packages/coding-agent） | pi-coding-agent dist/cli.js 路径 |
 | `PIWPI_EXT` | ../pi/extension | piwpi 扩展路径 |
 | `PIWPI_PI_ARGS` | `--model deepseek/deepseek-v4-flash` | 额外 pi 参数（默认固定用 DeepSeek；换模型/加参数用此覆盖） |
@@ -83,8 +89,8 @@ node scripts/e2e-chat.mjs   # 真实对话 E2E（会消耗 LLM 额度）
 - [x] 实时 Context 抽屉（挂载文件 segments/hash/锚点/memory + 上下文消息 + SSE 事件流 + 徽标）
 - [x] 刷新后历史重建（get_messages）
 - [x] Project Map 页（目录树 + 详情卡；数据走 /debug/project-map + SSE 增量刷新）
-- [ ] Memory 页（侧边栏仍置灰"即将推出"）
-- [ ] 会话列表 / 恢复 UI
+- [x] 项目目录选择与切换（原生目录选择对话框 + switch_project 运行中切换；数据持久化到 `<项目>/.piwpi/`）
+- [x] 侧边栏会话树（项目 → 会话层级；当前项目全部历史、当前会话高亮、点击恢复、行内删除）
 - [ ] 模型切换 UI（默认已固定 deepseek-v4-flash，切换走 `PIWPI_PI_ARGS=--model ...`）
 
 ## 测试

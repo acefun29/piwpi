@@ -42,3 +42,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# piwpi 项目内数据目录（会话 + Project Map 持久化，数据跟项目走）
+.piwpi/

@@ -473,7 +473,7 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 	it("新文件挂载 → 计数达标 → 批量整理：mapEntry 写 project map、memoryState 置 done、custom entry 写入", async () => {
 		write80Lines();
 		const store = new PluginStore();
-		const agentDir = join(tmp, "agent");
+		const dataDir = join(tmp, "agent");
 		const complete = vi.fn(
 			async (_model: unknown, _context: { messages: { content: { type: string; text?: string }[] }[] }) => ({
 				content: [
@@ -498,7 +498,7 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		const h = createHarness({
 			store,
 			queue: new MemoryQueue(0),
-			agentDir,
+			dataDir,
 			cwd: tmp,
 			memoryDeps: { complete, model: { provider: "faux", model: "faux-1" } },
 			memoryBatchFiles: 1, // 注入小阈值：1 个文件即触发批量整理
@@ -528,7 +528,7 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		const segs = persisted.plugin.metadata as unknown as { segments: Segment[] };
 		expect(segs.segments.every((s) => !("text" in s))).toBe(true);
 
-		const mapFile = projectMapFilePath(agentDir, tmp);
+		const mapFile = projectMapFilePath(dataDir);
 		expect(existsSync(mapFile)).toBe(true);
 		const mapData = JSON.parse(readFileSync(mapFile, "utf8")) as Record<string, { role: string }>;
 		expect(mapData[fileId(absFile)]?.role).toBe("auth");
