@@ -137,9 +137,11 @@ function formatRange(r: LineRange): string {
 
 /**
  * 从 ModelRegistry 上安全取 complete（结构访问）。
- * 发布版 0.83.0 的 ModelRegistry 是同步兼容门面（无 complete），而仓库源码
- * model-registry.ts:99-107 有 complete（custom-compaction.ts:90-102 即用此通道）；
- * 运行时拿不到就返回 undefined → 记忆 Agent 静默禁用，其余功能不受影响。
+ * 仓库源码 model-registry.ts:99-107 的 complete 是 runtime.complete 的透传（custom-compaction 即用此通道）；
+ * 而 npm 发布版 0.83.0 的 ModelRegistry 是同步兼容门面（无 complete），但 runtime 属性在运行时存在
+ * （TS private 不参与运行时），其 ModelRuntime.complete(model, context, options) 形状兼容
+ * （auth 由 runtime.prepareRequest 内部解析，返回 AssistantMessage.content 与下方消费形状一致）。
+ * 两者都拿不到就返回 undefined → 记忆 Agent 禁用（session_start 自检日志会指出原因，不静默）。
  */
 type RegistryComplete = (
 	model: unknown,
@@ -147,14 +149,40 @@ type RegistryComplete = (
 	options?: Record<string, unknown>,
 ) => Promise<{ content: { type: string; text?: string }[] }>;
 
-function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
+/**
+ * complete 通道探测：返回来源模式 + 包装函数（供 asCompleteFn 与启动自检共用，逻辑单一）。
+ * 必须经对象属性调用（complete 是类方法，内部依赖 this——如 runtime.complete 内部调 this.stream，
+ * 门面场景即此形状）；提取成裸函数会丢 this 而崩在调用链深处。
+ * 非空断言说明：外层 typeof 守卫保证存在；闭包内 TS 收窄不穿透，且 mr 参数从不重赋值。
+ */
+function resolveCompleteFn(
+	modelRegistry: unknown,
+): { mode: "registry" | "runtime"; complete: RegistryComplete } | undefined {
 	const mr = modelRegistry as
-		| { complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> }
+		| {
+				complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown>;
+				runtime?: { complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> };
+		  }
 		| undefined;
-	const fn = mr?.complete;
-	if (typeof fn !== "function") return undefined;
-	return (model, context, options) =>
-		fn(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>;
+	if (typeof mr?.complete === "function") {
+		return {
+			mode: "registry",
+			complete: (model, context, options) =>
+				mr!.complete!(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>,
+		};
+	}
+	if (typeof mr?.runtime?.complete === "function") {
+		return {
+			mode: "runtime",
+			complete: (model, context, options) =>
+				mr!.runtime!.complete!(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>,
+		};
+	}
+	return undefined;
+}
+
+function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
+	return resolveCompleteFn(modelRegistry)?.complete;
 }
 
 /**
@@ -206,16 +234,41 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	function rememberCtx(ctx: ExtensionContext): void {
 		cwd = ctx.cwd;
 		modelRegistry ??= ctx.modelRegistry;
-		currentModel = ctx.model;
+		// 只在有值时更新：后续事件（onToolCall/onContext）的 ctx 可能缺 model，无条件覆盖会冲掉已提取的模型
+		if (ctx.model) currentModel = ctx.model;
 		customEntryWriter ??= asCustomEntryWriter(ctx.sessionManager);
 		entriesProvider ??= () => (ctx.sessionManager.getEntries() ?? []) as SessionEntry[];
 	}
 
+	/** 记忆 Agent LLM 通道自检（session_start 输出一次，杜绝"功能未生效但无日志"） */
+	function memoryChannelMode(): string {
+		if (options.memoryDeps) return "injected (HarnessOptions.memoryDeps)";
+		if (!modelRegistry || !currentModel) {
+			return `unavailable (modelRegistry=${!!modelRegistry}, currentModel=${!!currentModel})`;
+		}
+		const resolved = resolveCompleteFn(modelRegistry);
+		if (!resolved) return "unavailable (ModelRegistry 无 complete 通道)";
+		return resolved.mode === "registry" ? "registry.complete" : "runtime.complete (fallback)";
+	}
+
+	let warnedNoDeps = false; // 记忆 Agent 依赖缺失只警告一次，避免每轮批量刷屏
 	function memoryDeps(): MemoryAgentDeps | undefined {
 		if (options.memoryDeps) return options.memoryDeps;
-		if (!modelRegistry || !currentModel) return undefined;
+		if (!modelRegistry || !currentModel) {
+			if (!warnedNoDeps) {
+				warnedNoDeps = true;
+				console.error(`[piwpi] memory deps unavailable: modelRegistry=${!!modelRegistry} currentModel=${!!currentModel}`);
+			}
+			return undefined;
+		}
 		const complete = asCompleteFn(modelRegistry);
-		if (!complete) return undefined;
+		if (!complete) {
+			if (!warnedNoDeps) {
+				warnedNoDeps = true;
+				console.error("[piwpi] memory deps unavailable: ModelRegistry 无 complete 通道（发布版门面缺 runtime.complete？）");
+			}
+			return undefined;
+		}
 		return { complete, model: currentModel };
 	}
 
@@ -940,6 +993,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		async onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
+				console.log(`[piwpi] memory agent LLM channel: ${memoryChannelMode()}`);
 				if (!mapLoaded) {
 					mapLoaded = true;
 					try {

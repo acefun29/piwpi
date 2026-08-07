@@ -13,7 +13,7 @@
 		"test": "vitest run"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@earendil-works/pi-coding-agent": "file:../packages/coding-agent",
 		"@types/node": "22.19.19",
 		"typescript": "5.9.3",
 		"vitest": "4.1.9"

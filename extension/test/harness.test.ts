@@ -551,6 +551,61 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
 	});
 
+	it("ModelRegistry 门面无顶层 complete → 回退 runtime.complete：批量整理仍成功（发布版 0.83.0 兼容）", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const events: string[] = [];
+		// 发布版 0.83.0 形状：registry 是同步兼容门面（无 complete），complete 在内部 runtime 上
+		// （TS private 不参与运行时，结构访问可触达）；memoryDeps 不注入，走 ctx.modelRegistry 提取通道。
+		// 关键：complete 是依赖 this 的类方法（真实实现内部调 this.stream）——裸提取调用会丢 this 崩溃
+		const stream = vi.fn(() => ({
+			result: async () => ({
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							mapEntry: {
+								role: "auth",
+								responsibilities: ["jwt"],
+								keyStructures: ["Auth"],
+								dependencies: [],
+								dependents: [],
+								decisions: [],
+							},
+						}),
+					},
+				],
+			}),
+		}));
+		const runtime = {
+			stream,
+			complete() {
+				return this.stream().result(); // 真实实现同款：this 依赖
+			},
+		};
+		const h = createHarness({
+			store,
+			queue: new MemoryQueue(0),
+			memoryBatchFiles: 1,
+			onEvent: (e) => events.push(e.type),
+		});
+		await h.onSessionStart(
+			{ type: "session_start", reason: "startup" } as never,
+			{
+				cwd: tmp,
+				model: { provider: "faux", id: "faux-1" },
+				modelRegistry: { runtime },
+				sessionManager: { getEntries: () => [] },
+			} as unknown as ExtensionContext,
+		);
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+		await h.shutdown();
+		expect(stream).toHaveBeenCalledTimes(1);
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("done");
+		expect(events).toContain("memory_updated");
+	});
+
 	it("批量整理输出非法 JSON → 保留 pending、project map 不变、主流程不受影响", async () => {
 		write80Lines();
 		const store = new PluginStore();

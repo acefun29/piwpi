@@ -115,7 +115,7 @@ DEMO PASSED — 真实 pi 进程内 piwpi 拦截行为验证通过
 
 ### 新增核对结论（M1-M6 期间）
 
-1. **`ModelRegistry.complete` 只在仓库源码存在**：仓库 `core/model-registry.ts:99-107` 有 `complete`（`custom-compaction.ts:90-102` 即用此通道），但**发布的 npm 0.83.0 包中 ModelRegistry 是同步门面（无 complete）**。扩展以结构访问 `asCompleteFn(modelRegistry)`（`harness.ts`）取用——运行时拿不到就静默禁用记忆 Agent，其余功能不受影响（"换宿主只需重写挂接层"的实证）。
+1. **`ModelRegistry.complete` 只在仓库源码存在（已解决依赖漂移）**：仓库 `core/model-registry.ts:99-107` 有 `complete`（`custom-compaction.ts:90-102` 即用此通道），而**发布的 npm 0.83.0 包中 ModelRegistry 是同步门面（无 complete）**。扩展最初按 npm 包运行时记忆 Agent 通道不可用（曾静默禁用）；修复分两层：① `asCompleteFn`（`harness.ts`）结构访问回退 `modelRegistry.runtime.complete`（TS private 运行时可见），且**必须经对象属性调用保 this**（`runtime.complete` 内部依赖 `this.stream`，裸调用会崩）；② 依赖切换为 `file:../packages/coding-agent`（workspace 链接，见 `desktop/README.md`「单一版本原则」）——运行时即本地构建产物，生产路径直接走 `registry.complete`，`runtime.complete` 兜底分支保留并已有回归测试（`harness.test.ts` 门面形状用例）。会话启动输出自检日志 `[piwpi] memory agent LLM channel: ...`，不再静默。
 2. **`ReadonlySessionManager` 不含 `appendCustomEntry`**：`ExtensionContext.sessionManager` 类型是 `Pick<SessionManager, 14 个读方法>`，但运行时传入的是完整实例；用 `asCustomEntryWriter()` 安全取用（`memory/persist.ts`）。
 3. **`AgentMessage` 联合类型含 `BashExecutionMessage`**（content 为 string）：onContext 遍历消息必须结构访问（`Array.isArray` 守卫），不能直接 `.filter`。
 4. **pi 的 tsconfig 开 `erasableSyntaxOnly`**：piwpi e2e 文件 import 扩展源码时，扩展代码也受此约束（参数属性会报 TS1294）→ `queue.ts` 已改普通字段赋值，`extension/tsconfig.json` 已同步开启该选项防回归。
