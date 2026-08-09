@@ -158,7 +158,6 @@ function buildPlugin(facts: SourceIngestFacts, current: ToolContextPlugin | unde
 		category: "source",
 		source: { toolName: "read", identity },
 		metadata: meta as unknown as Record<string, unknown>,
-		memory: current?.memory,
 	};
 	return plugin;
 }

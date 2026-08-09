@@ -24,9 +24,9 @@ describe("PluginStore（计划 §2.3）", () => {
 	it("同 id 重复 upsert 只保留一份（后到覆盖）", () => {
 		const store = new PluginStore();
 		store.upsert(plugin("source:file:a", "t1"));
-		store.upsert(plugin("source:file:a", "t1", { memory: { summary: "v2" } }));
+		store.upsert(plugin("source:file:a", "t1", { source: { toolName: "read", identity: "v2" } }));
 		expect(store.all()).toHaveLength(1);
-		expect(store.get("source:file:a")?.memory?.summary).toBe("v2");
+		expect(store.get("source:file:a")?.source.identity).toBe("v2");
 	});
 
 	it("findByAnchor 命中正确（含未命中）", () => {

@@ -6,9 +6,8 @@ const FILE_ID_PREFIX = "source:file:";
 
 /**
  * 项目地图聚合（计划 §6.3）。
- * 内存结构 Map<pluginId, MapEntry>；增量更新不重写（依赖/职责等取并集去重，决定按时间追加去重）。
- * 存储 = 按路径索引的 JSON 字典；渲染 = 目录分组 Markdown 缩进树（LLM 与人两用）；依赖图仅在
- * 计算循环依赖/影响面时临时构建（协议见 docs/project-map-protocol.md）。
+ * 内存结构 Map<pluginId, MapEntry>；整体替换（新整理结果覆盖旧内容）。
+ * 存储 = 按路径索引的 JSON 字典；渲染 = 目录分组 Markdown 缩进树（LLM 与人两用）。
  */
 export class ProjectMap {
 	private entries = new Map<string, MapEntry>();
@@ -17,27 +16,16 @@ export class ProjectMap {
 		return this.entries.get(pluginId);
 	}
 
-	/** 增量更新：已有条目在旧值上取并集（PRD §5"在原有理解上继续更新"）。
-	 *  磁盘驱动字段：hash/chunks 取新值（`?? old`，旧调用方兼容）；pendingLines 归零、stale 清
-	 *  （整理即恢复有效，基准 = 本次整理时刻）。 */
+	/** 整体替换：新整理结果覆盖旧内容（含 hash/chunks 取新值 `?? old`，旧调用方兼容；
+	 *  pendingLines 归零、stale 清（整理即恢复有效，基准 = 本次整理时刻；不写 stale 键即清除软删除标记））。 */
 	update(pluginId: string, entry: MapEntry): void {
 		const old = this.entries.get(pluginId);
-		if (!old) {
-			this.entries.set(pluginId, entry);
-			return;
-		}
-		const merge = (a: string[], b: string[]) => [...new Set([...a, ...b])];
 		this.entries.set(pluginId, {
-			role: entry.role || old.role,
-			responsibilities: merge(old.responsibilities, entry.responsibilities),
-			keyStructures: merge(old.keyStructures, entry.keyStructures),
-			dependencies: merge(old.dependencies, entry.dependencies),
-			dependents: merge(old.dependents, entry.dependents),
-			decisions: merge(old.decisions, entry.decisions),
-			hash: entry.hash ?? old.hash,
-			chunks: entry.chunks ?? old.chunks,
+			role: entry.role,
+			responsibilities: entry.responsibilities,
+			hash: entry.hash ?? old?.hash,
+			chunks: entry.chunks ?? old?.chunks,
 			pendingLines: 0,
-			stale: false,
 		});
 	}
 
@@ -67,10 +55,6 @@ export class ProjectMap {
 			lines.push("", `## ${pluginId}`);
 			if (e.role) lines.push(`- 角色: ${e.role}`);
 			if (e.responsibilities.length) lines.push(`- 职责: ${e.responsibilities.join("; ")}`);
-			if (e.keyStructures.length) lines.push(`- 关键结构: ${e.keyStructures.join("; ")}`);
-			if (e.dependencies.length) lines.push(`- 依赖: ${e.dependencies.join("; ")}`);
-			if (e.dependents.length) lines.push(`- 被依赖: ${e.dependents.join("; ")}`);
-			if (e.decisions.length) lines.push(`- 决策: ${e.decisions.join("; ")}`);
 		}
 		return lines.join("\n");
 	}
@@ -107,7 +91,7 @@ export class ProjectMap {
 		return lines.length === 1 ? `${lines[0]}\n（暂无条目）` : lines.join("\n");
 	}
 
-	/** 精简列表（路径 — 角色；依赖），记忆 Agent 整理时的参考上下文（每项一行，控制 token）。 */
+	/** 精简列表（路径 — 角色），记忆 Agent 整理时的参考上下文（每项一行，控制 token）。 */
 	renderBrief(cwd: string): string {
 		const base = process.platform === "win32" ? cwd.toLowerCase() : cwd;
 		const lines: string[] = [];
@@ -116,8 +100,7 @@ export class ProjectMap {
 			const abs = absPathOf(pluginId);
 			const label = abs ? relative(base, abs).replace(/\\/g, "/") : pluginId;
 			const role = e.role || e.responsibilities[0] || "";
-			const dep = e.dependencies.length ? `；依赖: ${e.dependencies.join(", ")}` : "";
-			lines.push(`${label} — ${role}${dep}`);
+			lines.push(`${label} — ${role}`);
 		}
 		return lines.join("\n");
 	}
@@ -127,11 +110,22 @@ export class ProjectMap {
 	}
 
 	/** 从持久化数据载入（M5 会话启动懒加载）。 */
+	/** 白名单载入：只接收当前 MapEntry 字段，旧版本遗留字段（关键结构/依赖/被依赖/决策）直接丢弃 */
 	load(data: unknown): void {
 		if (typeof data !== "object" || data === null) return;
 		for (const [pluginId, entry] of Object.entries(data as Record<string, unknown>)) {
 			if (typeof entry !== "object" || entry === null) continue;
-			this.entries.set(pluginId, entry as MapEntry);
+			const m = entry as Record<string, unknown>;
+			this.entries.set(pluginId, {
+				role: typeof m.role === "string" ? m.role : "",
+				responsibilities: Array.isArray(m.responsibilities)
+					? m.responsibilities.filter((x): x is string => typeof x === "string")
+					: [],
+				hash: typeof m.hash === "string" ? m.hash : undefined,
+				pendingLines: typeof m.pendingLines === "number" ? m.pendingLines : 0,
+				stale: m.stale === true,
+				chunks: typeof m.chunks === "string" ? m.chunks : undefined,
+			});
 		}
 	}
 }

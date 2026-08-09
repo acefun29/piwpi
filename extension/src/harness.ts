@@ -47,7 +47,7 @@ import {
 import { clamp, type LineRange, subtract } from "./ranges.ts";
 import { render } from "./render.ts";
 import { PluginStore } from "./store.ts";
-import type { MemoryJob, Segment, ToolContextPlugin } from "./types.ts";
+import type { Segment, ToolContextPlugin } from "./types.ts";
 
 /**
  * Harness：tool_call / tool_result / context / session_start / shutdown（计划 §4，M3+M4+M5）。
@@ -81,6 +81,8 @@ export interface Harness {
 	onToolResult(event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined>;
 	onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void>;
 	onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void>;
+	/** M5.5：每轮结束阈值递减——未达阈值的小量 pending 在有限轮数内必然触发（触发后重置，攒批保持少调用） */
+	onAgentSettled(): void;
 	shutdown(): Promise<void>;
 	/** 调试/观测快照（debug HTTP 服务用，见 src/debug.ts） */
 	snapshot(): DebugSnapshot;
@@ -222,6 +224,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let lastContext: DebugContextSnapshot | null = null;
 	const memoryBatchFiles = options.memoryBatchFiles ?? 5;
 	const memoryBatchLines = options.memoryBatchLines ?? 1000;
+	/** 当前生效的文件数阈值（M5.5：每轮 settled 递减，下限 1；触发整理后重置为初始值——攒批保持少调用） */
+	let memoryBatchFilesLeft = memoryBatchFiles;
 	/** 渐进式扫描：清单 ≤ SCAN_FULL_LIMIT → 每轮全量；否则每轮 SCAN_BATCH 个 FIFO 循环（单轮成本固定） */
 	const SCAN_FULL_LIMIT = 64;
 	const SCAN_BATCH = 32;
@@ -503,8 +507,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	/**
-	 * M5 新模型：批量整理。只在"新增"驱动——收集全部 pending 插件，逐个调 LLM
-	 * （输入域：挂载内容 + 对话尾部去重摘要 + map 精简列表），写 Project Map。
+	 * M5 新模型：批量整理。只在“新增”驱动——收集全部 pending 插件，整批一次调 LLM
+	 * （输入域：各文件挂载内容 + 对话尾部去重摘要 + map 精简列表），写 Project Map。
 	 * 经 memoryQueue 串行链调度，不阻塞主流程；失败仅记日志，pending 保留下轮再试。
 	 */
 	async function runMemoryBatch(dialogueContext: string): Promise<void> {
@@ -519,32 +523,43 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			emit({ type: "memory_skipped", reason: "no-model", pendingFiles: targets.length });
 			return; // pending 保留，下次触发再试
 		}
-		const mapBrief = projectMap.renderBrief(cwd);
-		let done = 0;
+		const files: { plugin: ToolContextPlugin; lines: string[]; hash: string }[] = [];
 		for (const plugin of targets) {
 			// 引用式：渲染时点统一为任务开始时取到的磁盘内容（LLM 往返期间的变化下轮 scan 自愈）
 			const r = await fileCache.get(plugin.metadata.absPath);
 			if (!r) continue;
 			const lines = r.entry.lines ?? (await fileCache.readLines(plugin.metadata.absPath));
-			const job: MemoryJob = {
-				pluginId: plugin.id,
-				localContext: lastUserText,
-				dialogueContext,
-			};
-			const output = await summarize(deps, plugin, job, mapBrief, lines);
-			if (!output?.mapEntry) continue; // 失败：保留 pending，下轮再试
-			// 磁盘驱动：整理即记录基准（hash/chunks = 本时点磁盘状态；pendingLines 归零/stale 清除由 update 内部强制）
-			projectMap.update(plugin.id, {
-				...output.mapEntry,
-				hash: r.entry.hash,
-				chunks: encodeFingerprint(chunkFingerprint(lines)),
-			});
-			plugin.metadata = { ...plugin.metadata, memoryState: "done" };
-			store.upsert(plugin);
-			await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
-			persistPlugin(plugin);
-			emit({ type: "memory_updated", pluginId: plugin.id });
-			done++;
+			files.push({ plugin, lines, hash: r.entry.hash });
+		}
+		if (files.length === 0) return;
+		const mapBrief = projectMap.renderBrief(cwd);
+		const output = await summarize(
+			deps,
+			files.map(({ plugin, lines }) => ({ plugin, lines })),
+			lastUserText,
+			dialogueContext,
+			mapBrief,
+		);
+		const entries = output?.entries;
+		let done = 0;
+		if (entries) {
+			for (const { plugin, lines, hash } of files) {
+				const entry = entries[plugin.id];
+				if (!entry) continue; // 模型漏掉该文件：保留 pending，下轮再试
+				// 磁盘驱动：整理即记录基准（hash/chunks = 本时点磁盘状态；pendingLines 归零/stale 清除由 update 内部强制）
+				projectMap.update(plugin.id, {
+					role: entry.role,
+					responsibilities: entry.responsibilities,
+					hash,
+					chunks: encodeFingerprint(chunkFingerprint(lines)),
+				});
+				plugin.metadata = { ...plugin.metadata, memoryState: "done" };
+				store.upsert(plugin);
+				persistPlugin(plugin);
+				emit({ type: "memory_updated", pluginId: plugin.id });
+				done++;
+			}
+			if (done > 0) await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
 		}
 		emit({ type: "memory_batch_done", files: done, total: targets.length });
 	}
@@ -760,7 +775,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							pendingFiles: stats.files,
 							pendingLines: stats.lines,
 						});
-						if (stats.files >= memoryBatchFiles || stats.lines >= memoryBatchLines) {
+						if (stats.files >= memoryBatchFilesLeft || stats.lines >= memoryBatchLines) {
+							memoryBatchFilesLeft = memoryBatchFiles; // 触发即新一轮攒批
 							memoryQueue.enqueueTask(() => runMemoryBatch(recentDialogue));
 						}
 						return undefined;
@@ -1040,7 +1056,6 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				category: p.category,
 				source: p.source,
 				metadata: p.metadata as unknown as DebugSnapshot["plugins"][number]["metadata"],
-				memory: p.memory,
 			}));
 			return {
 				cwd,
@@ -1070,6 +1085,16 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		/** M5 新模型：Project Map 目录树渲染（read_project_map 工具用）。 */
 		projectMapTree(): string {
 			return projectMap.renderTree(cwd);
+		},
+
+		/** M5.5：每轮结束阈值递减——未达阈值的小量 pending 在有限轮数内必然触发（触发后重置，攒批保持少调用） */
+		onAgentSettled(): void {
+			if (memoryBatchFilesLeft > 1) memoryBatchFilesLeft--;
+			const stats = pendingStats();
+			if (stats.files >= memoryBatchFilesLeft || stats.lines >= memoryBatchLines) {
+				memoryBatchFilesLeft = memoryBatchFiles; // 触发即新一轮攒批
+				memoryQueue.enqueueTask(() => runMemoryBatch(recentDialogue));
+			}
 		},
 	};
 }

@@ -1,5 +1,5 @@
 import { render } from "../render.ts";
-import type { MapEntry, MemoryJob, ToolContextPlugin } from "../types.ts";
+import type { MapEntry, ToolContextPlugin } from "../types.ts";
 
 /**
  * 记忆 Agent（计划 §6.2）。
@@ -23,66 +23,73 @@ export interface MemoryAgentDeps {
 	model: unknown;
 }
 
-/** 模型要求输出的严格 JSON 形状（M5 新模型：整理产物只进 Project Map） */
+/** 模型要求输出的严格 JSON 形状（M5 新模型：整理产物只进 Project Map，整批一次调用） */
 export interface MemoryOutput {
-	lifecycle?: "keep" | "shrink";
-	mapEntry?: MapEntry;
+	entries?: Record<string, MapEntry>;
+}
+
+/** 批量整理的单文件输入：挂载插件 + 磁盘行（调用方渲染，渲染时点与调用方一致） */
+export interface MemoryFileInput {
+	plugin: ToolContextPlugin;
+	lines: string[];
 }
 
 export const MEMORY_SYSTEM_PROMPT =
-	`You are piwpi's project-map curator. You define the identity of a source file that an agent has just mounted into its context, and record it in the project map.
+	`You are piwpi's project-map curator. A coding agent has just mounted several source files into its context. Define the identity of each listed file and record it in the project map.
 
-You have NO external tools. Base your output ONLY on the three inputs provided in the task:
-1. the file's mounted content
+You have NO external tools. Base your output ONLY on the inputs provided in the task:
+1. each file's mounted content
 2. the agent's recent conversation (deduplicated — tool results keep only their marker line, so they never overlap with the mounted content)
-3. the existing project map entries (brief — to infer dependencies/dependents and avoid redefining known files)
+3. the existing project map entries (brief — for naming consistency)
 
 Output ONE strict JSON object and nothing else:
 
 {
-  "mapEntry": {
-    "role": "one-line identity of this file's role in the project",
-    "responsibilities": ["concise responsibilities, 3-8 items"],
-    "keyStructures": ["class/function/module names defined here"],
-    "dependencies": ["names of files/modules this file depends on — match existing map entries when possible"],
-    "dependents": ["names of files/modules that depend on this file — infer from conversation and map"],
-    "decisions": ["notable design decisions visible in this file"]
-  },
-  "lifecycle": "keep" | "shrink"
+  "entries": {
+    "<pluginId>": {
+      "role": "one-line identity of this file's role in the project",
+      "responsibilities": ["concise responsibilities, 3-8 items"]
+    }
+  }
 }
 
 Rules:
+- Output an entry for EVERY pluginId listed in the task, and for no other id.
 - Use the language of the code comments / user message.
 - Only include facts visible in the provided inputs. Never invent.
-- Reference other files by the same names/paths used in the existing project map.
+- Keep role and responsibilities short; the project map is a lightweight overview, not documentation.
 - Do not wrap the JSON in markdown fences. Do not add any text outside the JSON.`.trim();
 
 /**
- * 组装 LLM 输入（纯函数，可单测）。M5 新模型：输入域严格限定为三段——
- * ① 该文件挂载内容 ② 主 Agent 对话尾部（去重）③ Project Map 精简列表。
+ * 组装 LLM 输入（纯函数，可单测）。M5 新模型：整批一次调用，输入域严格限定为三段——
+ * ① 各文件挂载内容 ② 主 Agent 对话尾部（去重）③ Project Map 精简列表。
  * 引用式：挂载内容由调用方传入磁盘行（lines）渲染，渲染时点与调用方一致。
  */
 export function buildMemoryPrompt(
-	plugin: ToolContextPlugin,
-	job: MemoryJob,
+	files: MemoryFileInput[],
+	localContext: string,
+	dialogueContext: string,
 	mapBrief: string,
-	lines: string[],
 ): string {
 	const out: string[] = [];
-	out.push("# piwpi 记忆整理任务（首次身份定义）");
-	out.push(`文件：${plugin.source.identity}`);
-	out.push(`当前用户消息：${job.localContext || "（无）"}`);
+	out.push("# piwpi 记忆整理任务（批量身份定义）");
+	out.push("待整理文件（pluginId → identity）：");
+	for (const f of files) out.push(`- ${f.plugin.id} → ${f.plugin.source.identity}`);
+	out.push(`当前用户消息：${localContext || "（无）"}`);
 	out.push("");
-	out.push("## 输入一：该文件挂载内容（确定性渲染）");
-	out.push(render(plugin, lines));
-	out.push("");
+	out.push("## 输入一：各文件挂载内容（确定性渲染）");
+	for (const f of files) {
+		out.push(`### ${f.plugin.id}`);
+		out.push(render(f.plugin, f.lines));
+		out.push("");
+	}
 	out.push("## 输入二：主 Agent 最近对话（已去重：工具结果仅保留标记行，与挂载内容不重叠）");
-	out.push(job.dialogueContext || "（无）");
+	out.push(dialogueContext || "（无）");
 	out.push("");
-	out.push("## 输入三：Project Map 已有条目（精简，用于推断依赖/被依赖、避免重复定义）");
+	out.push("## 输入三：Project Map 已有条目（精简）");
 	out.push(mapBrief || "（无）");
 	out.push("");
-	out.push("输出该文件的 Project Map 条目（mapEntry JSON），只输出一个 JSON 对象，不要输出任何其他内容。");
+	out.push("输出 entries JSON（key 为上述 pluginId），只输出一个 JSON 对象，不要输出任何其他内容。");
 	return out.join("\n");
 }
 
@@ -102,38 +109,35 @@ export function parseMemoryJson(text: string): MemoryOutput | null {
 	}
 	if (typeof parsed !== "object" || parsed === null) return null;
 	const obj = parsed as Record<string, unknown>;
-	const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
-	const strArr = (v: unknown): string[] | undefined =>
-		Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : undefined;
-	const output: MemoryOutput = {};
-	if (obj.lifecycle === "keep" || obj.lifecycle === "shrink") output.lifecycle = obj.lifecycle;
-	if (obj.mapEntry && typeof obj.mapEntry === "object") {
-		const m = obj.mapEntry as Record<string, unknown>;
-		output.mapEntry = {
-			role: str(m.role) ?? "",
-			responsibilities: strArr(m.responsibilities) ?? [],
-			keyStructures: strArr(m.keyStructures) ?? [],
-			dependencies: strArr(m.dependencies) ?? [],
-			dependents: strArr(m.dependents) ?? [],
-			decisions: strArr(m.decisions) ?? [],
+	const raw = obj.entries;
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const entries: Record<string, MapEntry> = {};
+	for (const [id, v] of Object.entries(raw as Record<string, unknown>)) {
+		if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+		const m = v as Record<string, unknown>;
+		entries[id] = {
+			role: typeof m.role === "string" && m.role.trim() ? m.role.trim() : "",
+			responsibilities: Array.isArray(m.responsibilities)
+				? m.responsibilities.filter((x): x is string => typeof x === "string")
+				: [],
 		};
 	}
-	return output;
+	return { entries };
 }
 
 /**
- * 执行一次记忆整理：调 LLM → 解析。不修改任何状态（写回由调用方负责）。
+ * 执行一次批量记忆整理：调 LLM → 解析。不修改任何状态（写回由调用方负责）。
  * 返回 null 表示无可用结果（无模型 / LLM 调用失败 / JSON 解析失败）。
  */
 export async function summarize(
 	deps: MemoryAgentDeps,
-	plugin: ToolContextPlugin,
-	job: MemoryJob,
+	files: MemoryFileInput[],
+	localContext: string,
+	dialogueContext: string,
 	mapBrief: string,
-	lines: string[],
 ): Promise<MemoryOutput | null> {
 	if (!deps.model) return null;
-	const prompt = buildMemoryPrompt(plugin, job, mapBrief, lines);
+	const prompt = buildMemoryPrompt(files, localContext, dialogueContext, mapBrief);
 	try {
 		const response = await deps.complete(deps.model, {
 			systemPrompt: MEMORY_SYSTEM_PROMPT,

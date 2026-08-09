@@ -83,7 +83,6 @@ describe("ingest：new（计划 §4.3）", () => {
 		expect(meta.anchorToolCallId).toBe("t9");
 		expect(meta.hash).toBe("abc123def456");
 		expect(meta.updatedAtHashChange).toBe(false);
-		expect(p.memory).toBeUndefined();
 	});
 });
 
@@ -165,11 +164,6 @@ describe("render（计划 §3.4）", () => {
 	it("同一插件状态 + 磁盘行渲染逐字节相同", () => {
 		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new", got: { start: 20, end: 40 } }));
 		expect(sourceAdapter.render(p, diskLines)).toBe(sourceAdapter.render(p, diskLines));
-	});
-	it("M5 新模型：render 不输出 memory 段（整理产物只进 Project Map）", () => {
-		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new" }));
-		p.memory = { summary: "负责认证", relations: ["config.ts"] };
-		expect(sourceAdapter.render(p, diskLines)).not.toContain("[piwpi:memory");
 	});
 	it("输出段标记与头部（文本从传入磁盘行切取）", () => {
 		const p = sourceAdapter.ingest({}, "", undefined, facts({ mode: "new", got: { start: 20, end: 40 } }));

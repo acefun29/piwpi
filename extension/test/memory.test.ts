@@ -153,48 +153,77 @@ describe("countChangedLines（M5 变更量 diff）", () => {
 });
 
 describe("记忆 Agent（M5 新模型）", () => {
-	it("buildMemoryPrompt 三段输入：挂载内容 / 对话尾部（去重说明）/ map 精简列表", () => {
+	it("buildMemoryPrompt 整批形态：两文件挂载内容 / 对话尾部（去重说明）/ map 精简列表", () => {
 		const p = plugin();
-		const prompt = buildMemoryPrompt(p, JOB, "src/b.ts — auth; 依赖: config.ts", LINES);
+		const p2 = plugin({ id: "source:file:b", source: { toolName: "read", identity: "file:b" } });
+		const prompt = buildMemoryPrompt(
+			[
+				{ plugin: p, lines: LINES },
+				{ plugin: p2, lines: LINES },
+			],
+			"改一下认证",
+			"[user] 看看认证",
+			"src/b.ts — auth",
+		);
+		expect(prompt).toContain("source:file:a → file:a");
+		expect(prompt).toContain("source:file:b → file:b");
 		expect(prompt).toContain("改一下认证");
 		expect(prompt).toContain("[piwpi:plugin");
 		expect(prompt).toContain("[user] 看看认证");
 		expect(prompt).toContain("工具结果仅保留标记行");
 		expect(prompt).toContain("src/b.ts — auth");
-		expect(prompt).toContain("mapEntry");
+		expect(prompt).toContain("entries");
 	});
 
-	it("parseMemoryJson：严格 JSON（mapEntry 六字段清洗）", () => {
+	it("parseMemoryJson：entries 多文件解析（role/responsibilities 清洗）", () => {
 		const out = parseMemoryJson(
 			JSON.stringify({
-				lifecycle: "keep",
-				mapEntry: {
-					role: "auth",
-					responsibilities: ["jwt"],
-					keyStructures: [],
-					dependencies: ["config"],
-					dependents: [],
-					decisions: [],
+				entries: {
+					"source:file:a": { role: "auth", responsibilities: ["jwt"] },
+					"source:file:b": { role: "queue", responsibilities: ["串行", "flush"] },
 				},
 			}),
 		);
-		expect(out?.lifecycle).toBe("keep");
-		expect(out?.mapEntry?.role).toBe("auth");
-		expect(out?.mapEntry?.dependencies).toEqual(["config"]);
+		expect(out?.entries?.["source:file:a"]?.role).toBe("auth");
+		expect(out?.entries?.["source:file:a"]?.responsibilities).toEqual(["jwt"]);
+		expect(out?.entries?.["source:file:b"]?.role).toBe("queue");
 	});
 
 	it("parseMemoryJson：容忍 markdown fence 与前后杂音", () => {
 		const out = parseMemoryJson(
-			'好的，以下是结果：\n```json\n{"mapEntry":{"role":"x","responsibilities":[],"keyStructures":[],"dependencies":[],"dependents":[],"decisions":[]}}\n```\n完毕',
+			'好的，以下是结果：\n```json\n{"entries":{"source:file:a":{"role":"x","responsibilities":[]}}}\n```\n完毕',
 		);
-		expect(out?.mapEntry?.role).toBe("x");
+		expect(out?.entries?.["source:file:a"]?.role).toBe("x");
 	});
 
 	it("parseMemoryJson：非法输入返回 null（调用方保留现状）", () => {
 		expect(parseMemoryJson("not json at all")).toBeNull();
 		expect(parseMemoryJson("")).toBeNull();
-		expect(parseMemoryJson('{"mapEntry":')).toBeNull();
+		expect(parseMemoryJson('{"entries":')).toBeNull();
 		expect(parseMemoryJson("[1,2,3]")).toBeNull();
+	});
+
+	it("parseMemoryJson：entries 缺失/非对象 → null；非对象条目丢弃；多余字段不保留", () => {
+		expect(parseMemoryJson('{"mapEntry":{"role":"x"}}')).toBeNull();
+		expect(parseMemoryJson('{"entries":[1,2]}')).toBeNull();
+		expect(parseMemoryJson('{"entries":"x"}')).toBeNull();
+		const out = parseMemoryJson(
+			JSON.stringify({
+				entries: {
+					"source:file:a": "not-an-object",
+					"source:file:b": {
+						role: "queue",
+						responsibilities: ["x"],
+						keyStructures: ["Q"],
+						dependencies: [],
+						dependents: [],
+						decisions: [],
+					},
+				},
+			}),
+		);
+		expect(out?.entries?.["source:file:a"]).toBeUndefined(); // 非对象条目丢弃
+		expect(out?.entries?.["source:file:b"]).toEqual({ role: "queue", responsibilities: ["x"] });
 	});
 
 	it("summarize：成功路径返回解析结果；失败路径返回 null", async () => {
@@ -203,35 +232,30 @@ describe("记忆 Agent（M5 新模型）", () => {
 				{
 					type: "text",
 					text: JSON.stringify({
-						mapEntry: {
-							role: "新角色",
-							responsibilities: [],
-							keyStructures: [],
-							dependencies: [],
-							dependents: [],
-							decisions: [],
+						entries: {
+							"source:file:a": { role: "新角色", responsibilities: [] },
 						},
 					}),
 				},
 			],
 		}));
-		const out = await summarize({ complete, model: { provider: "faux" } }, plugin(), JOB, "", LINES);
-		expect(out?.mapEntry?.role).toBe("新角色");
+		const files = [{ plugin: plugin(), lines: LINES }];
+		const out = await summarize({ complete, model: { provider: "faux" } }, files, "改一下认证", "", "");
+		expect(out?.entries?.["source:file:a"]?.role).toBe("新角色");
 
 		const bad = vi.fn(async () => ({ content: [{ type: "text", text: "oops" }] }));
-		expect(await summarize({ complete: bad, model: { provider: "faux" } }, plugin(), JOB, "", LINES)).toBeNull();
+		expect(await summarize({ complete: bad, model: { provider: "faux" } }, files, "", "", "")).toBeNull();
 
 		const throwing = vi.fn(async () => {
 			throw new Error("LLM down");
 		});
-		expect(
-			await summarize({ complete: throwing, model: { provider: "faux" } }, plugin(), JOB, "", LINES),
-		).toBeNull();
+		expect(await summarize({ complete: throwing, model: { provider: "faux" } }, files, "", "", "")).toBeNull();
 	});
 
 	it("无模型 → 直接返回 null（不调 LLM）", async () => {
 		const complete = vi.fn();
-		expect(await summarize({ complete, model: undefined }, plugin(), JOB, "", LINES)).toBeNull();
+		const files = [{ plugin: plugin(), lines: LINES }];
+		expect(await summarize({ complete, model: undefined }, files, "", "", "")).toBeNull();
 		expect(complete).not.toHaveBeenCalled();
 	});
 
@@ -242,28 +266,19 @@ describe("记忆 Agent（M5 新模型）", () => {
 });
 
 describe("ProjectMap（计划 §6.3）", () => {
-	it("增量更新取并集去重，不重写", () => {
+	it("整体替换：新整理结果覆盖旧内容，不残留", () => {
 		const map = new ProjectMap();
 		map.update("p1", {
 			role: "r",
-			responsibilities: ["a"],
-			keyStructures: [],
-			dependencies: ["x"],
-			dependents: [],
-			decisions: ["d1"],
+			responsibilities: ["a", "b"],
 		});
 		map.update("p1", {
 			role: "r2",
-			responsibilities: ["a", "b"],
-			keyStructures: ["K"],
-			dependencies: ["y"],
-			dependents: [],
-			decisions: ["d1", "d2"],
+			responsibilities: ["c"],
 		});
 		const e = map.get("p1")!;
 		expect(e.role).toBe("r2");
-		expect(e.responsibilities).toEqual(["a", "b"]);
-		expect(e.decisions).toEqual(["d1", "d2"]);
+		expect(e.responsibilities).toEqual(["c"]);
 	});
 
 	it("renderMarkdown 包含插件节；toJSON/load 往返一致", () => {
@@ -271,10 +286,6 @@ describe("ProjectMap（计划 §6.3）", () => {
 		map.update("p1", {
 			role: "auth",
 			responsibilities: ["jwt"],
-			keyStructures: ["Auth"],
-			dependencies: ["config"],
-			dependents: [],
-			decisions: [],
 		});
 		const md = map.renderMarkdown();
 		expect(md).toContain("## p1");
@@ -285,15 +296,37 @@ describe("ProjectMap（计划 §6.3）", () => {
 		expect(map2.get("p1")?.role).toBe("auth");
 	});
 
+	it("load 白名单：旧版本遗留字段（关键结构/依赖/被依赖/决策）直接丢弃", () => {
+		const map = new ProjectMap();
+		map.load({
+			p1: {
+				role: "auth",
+				responsibilities: ["jwt"],
+				keyStructures: ["Auth"],
+				dependencies: ["config"],
+				dependents: ["api"],
+				decisions: ["d1"],
+				hash: "h",
+				pendingLines: 3,
+				stale: false,
+				chunks: "c",
+			},
+		});
+		expect(map.get("p1")).toEqual({
+			role: "auth",
+			responsibilities: ["jwt"],
+			hash: "h",
+			pendingLines: 3,
+			stale: false,
+			chunks: "c",
+		});
+	});
+
 	it("delete 移除条目（失效语义 = 删除，无 tombstone）", () => {
 		const map = new ProjectMap();
 		map.update("p1", {
 			role: "r",
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: [],
-			dependents: [],
-			decisions: [],
 		});
 		map.delete("p1");
 		expect(map.get("p1")).toBeUndefined();
@@ -305,10 +338,6 @@ describe("ProjectMap（计划 §6.3）", () => {
 		const entry = (role: string) => ({
 			role,
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: [],
-			dependents: [],
-			decisions: [],
 		});
 		map.update(`source:file:${join(tmp, "src", "auth.ts").toLowerCase()}`, entry("认证与授权"));
 		map.update(`source:file:${join(tmp, "src", "memory", "agent.ts").toLowerCase()}`, entry("记忆 Agent"));
@@ -331,26 +360,18 @@ describe("ProjectMap（计划 §6.3）", () => {
 		map.update("execution:bash", {
 			role: "shell",
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: [],
-			dependents: [],
-			decisions: [],
 		});
 		expect(map.renderTree(tmp)).toContain("execution:bash — shell");
 	});
 
-	it("renderBrief：每项一行（路径 — 角色；依赖）", () => {
+	it("renderBrief：每项一行（路径 — 角色）", () => {
 		const map = new ProjectMap();
 		map.update(`source:file:${join(tmp, "src", "a.ts").toLowerCase()}`, {
 			role: "入口",
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: ["b.ts"],
-			dependents: [],
-			decisions: [],
 		});
 		const brief = map.renderBrief(tmp);
-		expect(brief).toContain("src/a.ts — 入口；依赖: b.ts");
+		expect(brief).toContain("src/a.ts — 入口");
 	});
 });
 

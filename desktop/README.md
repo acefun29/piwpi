@@ -29,14 +29,41 @@ Electron 主进程 (electron/main.mjs)
 > **单一版本原则（重要）**：`pi/extension` 对 `@earendil-works/pi-coding-agent` 的依赖是
 > `file:../packages/coding-agent`（workspace 链接），**不装 npm 发布版**——扩展的运行时 CLI、类型、
 > ModelRegistry API 全部来自 `pi/packages/coding-agent` 的本地构建产物，与魔改的 pi 源码永远同版本。
-> 修改 pi 源码后必须重新构建，扩展才生效：
->
-> ```bash
-> cd pi/packages/coding-agent && npm run build
-> ```
->
 > 记忆 Agent 的 LLM 通道在会话启动时会打印自检日志（`[piwpi] memory agent LLM channel: ...`），
 > 可据此判断走的是 `registry.complete`（本地包）还是 `runtime.complete`（兜底）。
+
+## 构建方式（什么时候要构建）
+
+桌面版测试前不用找构建步骤，规则就三条：
+
+| 改了什么 | 要做什么 | 原因 |
+|---|---|---|
+| `pi/extension/**`（扩展源码/测试/文档） | **什么都不用做**，直接重启桌面 | 扩展由 pi 的 jiti 运行时加载 TS 源码（`loader.ts`），改动即时生效 |
+| `pi/packages/coding-agent/**`（pi 源码） | `cd pi/packages/coding-agent && npm run build` | 桌面版 spawn 的是 `dist/cli.js`，dist 不自动跟随源码 |
+| `pi/desktop/**`（electron/server/web） | 什么都不用做，直接重启 | 前端为零构建纯 ES Module，Electron 壳直接跑 |
+
+执行：
+
+```bash
+# 只改过 extension 或 desktop：直接启动
+cd desktop && npm start
+
+# 改过 pi 源码：先构建再启动
+cd pi/packages/coding-agent && npm run build
+cd desktop && npm start
+```
+
+加载链路（可据此判断改动有没有生效）：
+
+```
+desktop/electron → server/bridge.mjs → spawn packages/coding-agent/dist/cli.js --mode rpc -e ../pi/extension
+                                        └─ dist/cli.js 内 jiti 加载 extension/index.ts（TS 源码，非构建产物）
+```
+
+改动生效判据：
+- extension 改动：重启桌面即可（jiti 每次新建 jiti 实例加载，`moduleCache: false`，无缓存问题）；
+- pi 源码改动：构建后看 `dist/cli.js` 时间戳更新，再重启桌面；
+- 会话启动日志出现 `[piwpi] memory agent LLM channel: ...` 即扩展已加载。
 
 ## 运行
 

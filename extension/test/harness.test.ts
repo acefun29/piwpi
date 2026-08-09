@@ -309,10 +309,6 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		projectMap.update(fileId(absFile), {
 			role: "旧角色",
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: [],
-			dependents: [],
-			decisions: [],
 		});
 		const events: string[] = [];
 		const h = createHarness({ store, projectMap, onEvent: (e) => events.push(e.type) });
@@ -411,10 +407,6 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 		projectMap.update(fileId(absFile), {
 			role: "旧角色",
 			responsibilities: [],
-			keyStructures: [],
-			dependencies: [],
-			dependents: [],
-			decisions: [],
 		});
 		const events: string[] = [];
 		const h = createHarness({ store, projectMap, onEvent: (e) => events.push(e.type) });
@@ -470,7 +462,7 @@ describe("M4 §5 / M5 新模型：文件变化（updated 分支）", () => {
 });
 
 describe("M5 新模型：记忆批量整理与持久化", () => {
-	it("新文件挂载 → 计数达标 → 批量整理：mapEntry 写 project map、memoryState 置 done、custom entry 写入", async () => {
+	it("新文件挂载 → 计数达标 → 批量整理：entries 写 project map、memoryState 置 done、custom entry 写入", async () => {
 		write80Lines();
 		const store = new PluginStore();
 		const dataDir = join(tmp, "agent");
@@ -480,14 +472,8 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 					{
 						type: "text",
 						text: JSON.stringify({
-							lifecycle: "keep",
-							mapEntry: {
-								role: "auth",
-								responsibilities: ["jwt"],
-								keyStructures: ["Auth"],
-								dependencies: ["config.ts"],
-								dependents: [],
-								decisions: [],
+							entries: {
+								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
 							},
 						}),
 					},
@@ -518,7 +504,7 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		expect(complete).toHaveBeenCalledTimes(1);
 		// 整理 prompt 含三段输入
 		const prompt = complete.mock.calls[0]![1]!.messages[0]!.content[0]!.text ?? "";
-		expect(prompt).toContain("输入一：该文件挂载内容");
+		expect(prompt).toContain("输入一：各文件挂载内容");
 		expect(prompt).toContain("输入二：主 Agent 最近对话");
 		expect(prompt).toContain("输入三：Project Map 已有条目");
 
@@ -532,6 +518,106 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		expect(existsSync(mapFile)).toBe(true);
 		const mapData = JSON.parse(readFileSync(mapFile, "utf8")) as Record<string, { role: string }>;
 		expect(mapData[fileId(absFile)]?.role).toBe("auth");
+	});
+
+	it("两个 pending 文件 → 整批一次 LLM 调用；未知 pluginId 被忽略、真实文件按各自条目落库", async () => {
+		write80Lines();
+		const absFile2 = join(tmp, "b.ts");
+		writeFileSync(absFile2, lines(80));
+		const store = new PluginStore();
+		const projectMap = new ProjectMap();
+		const complete = vi.fn(
+			async (_model: unknown, _context: { messages: { content: { type: string; text?: string }[] }[] }) => ({
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							entries: {
+								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
+								[fileId(absFile2)]: { role: "队列", responsibilities: ["串行"] },
+								"source:file:unknown": { role: "编造", responsibilities: [] },
+							},
+						}),
+					},
+				],
+			}),
+		);
+		const h = createHarness({
+			store,
+			projectMap,
+			queue: new MemoryQueue(0),
+			cwd: tmp,
+			memoryDeps: { complete, model: { provider: "faux" } },
+			memoryBatchFiles: 2, // 两个 pending 文件同时达阈值 → 只调一次 LLM
+		});
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+		await h.onToolCall(readCall("t2", { path: "b.ts", offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t2", { path: "b.ts", offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+
+		await h.shutdown(); // flush 批量整理链
+
+		expect(complete).toHaveBeenCalledTimes(1); // 整批一次，而非逐文件 N 次
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("done");
+		expect(sourceMeta(store.get(fileId(absFile2))!).memoryState).toBe("done");
+		expect(projectMap.get(fileId(absFile))?.role).toBe("auth");
+		expect(projectMap.get(fileId(absFile2))?.role).toBe("队列");
+		expect(projectMap.get("source:file:unknown")).toBeUndefined(); // 编造 id 被忽略
+	});
+
+	it("agent_settled 阈值递减：未达阈值的小量 pending 在有限轮数内攒批触发（非每轮一次）", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const projectMap = new ProjectMap();
+		const queue = new MemoryQueue(0);
+		const complete = vi.fn(
+			async (_model: unknown, _context: { messages: { content: { type: string; text?: string }[] }[] }) => ({
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							entries: {
+								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
+							},
+						}),
+					},
+				],
+			}),
+		);
+		const h = createHarness({
+			store,
+			projectMap,
+			queue,
+			cwd: tmp,
+			memoryDeps: { complete, model: { provider: "faux" } },
+			// memoryBatchFiles 保持默认 5：1 个 pending 不触发挂载路径，靠 settled 逐轮递减（5→1）触发
+		});
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+
+		// 未达阈值：批量整理尚未排队
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
+
+		// 前 3 轮 settled：阈值 5→4→3→2，pending=1 未达标 → 不调用 LLM（攒批，不每轮整理）
+		h.onAgentSettled();
+		h.onAgentSettled();
+		h.onAgentSettled();
+		await queue.flush();
+		expect(complete).not.toHaveBeenCalled();
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
+
+		// 第 4 轮 settled：阈值降到 1 → 触发，整批一次调用
+		h.onAgentSettled();
+		await queue.flush();
+		expect(complete).toHaveBeenCalledTimes(1);
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("done");
+		expect(projectMap.get(fileId(absFile))?.role).toBe("auth");
+		expect(projectMap.get(fileId(absFile))?.responsibilities).toEqual(["jwt"]);
+
+		// 触发后已重置；无 pending 时后续 settled 直接返回（幂等，无副作用）
+		h.onAgentSettled();
+		await queue.flush();
+		expect(complete).toHaveBeenCalledTimes(1);
 	});
 
 	it("批量整理无模型 → memory_skipped，pending 保留（下次触发再试）", async () => {
@@ -564,13 +650,8 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 					{
 						type: "text",
 						text: JSON.stringify({
-							mapEntry: {
-								role: "auth",
-								responsibilities: ["jwt"],
-								keyStructures: ["Auth"],
-								dependencies: [],
-								dependents: [],
-								decisions: [],
+							entries: {
+								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
 							},
 						}),
 					},
@@ -640,7 +721,6 @@ describe("M5 §6.4：session_start 恢复", () => {
 				anchorToolCallId: "t1",
 				updatedAtHashChange: false,
 			},
-			memory: { summary: "旧记忆" },
 			...over,
 		};
 		return serializePlugin(plugin);
@@ -659,7 +739,6 @@ describe("M5 §6.4：session_start 恢复", () => {
 
 		await h.onSessionStart({ type: "session_start", reason: "resume" } as never, ctx());
 		const p = store.get(fileId(absFile))!;
-		expect(p.memory?.summary).toBe("旧记忆");
 		expect(sourceMeta(p).segments).toEqual([{ start: 20, end: 40 }]); // 只恢复范围
 		expect(sourceMeta(p).anchorToolCallId).toBe("t1");
 	});
@@ -794,7 +873,7 @@ describe("M3 §4.5：降级与兜底", () => {
 		expect(await h.onContext({ type: "context", messages: [] } as unknown as ContextEvent, ctx())).toBeUndefined();
 	});
 
-	it("index 默认导出为工厂函数，且订阅 5 个事件 + 注册 read_project_map 工具", async () => {
+	it("index 默认导出为工厂函数，且订阅 6 个事件 + 注册 read_project_map 工具", async () => {
 		const mod = await import("../index.ts");
 		expect(typeof mod.default).toBe("function");
 		const subscribed: string[] = [];
@@ -808,7 +887,14 @@ describe("M3 §4.5：降级与兜底", () => {
 			},
 		} as unknown as ExtensionAPI;
 		mod.default(pi);
-		expect(subscribed).toEqual(["tool_call", "tool_result", "context", "session_start", "session_shutdown"]);
-		expect(registered).toEqual(["read_project_map"]);
+		expect(subscribed).toEqual([
+			"tool_call",
+			"tool_result",
+			"context",
+			"session_start",
+			"agent_settled",
+			"session_shutdown",
+		]);
+		expect(registered).toEqual(["read_project_map", "request_user_input", "update_plan_document"]);
 	});
 });

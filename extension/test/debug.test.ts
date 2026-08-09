@@ -188,13 +188,11 @@ describe("debug 服务（SSE 实时事件）", () => {
 				{
 					type: "text",
 					text: JSON.stringify({
-						mapEntry: {
-							role: "auth",
-							responsibilities: [],
-							keyStructures: [],
-							dependencies: [],
-							dependents: [],
-							decisions: [],
+						entries: {
+							[fileId(absFile)]: {
+								role: "auth",
+								responsibilities: [],
+							},
 						},
 					}),
 				},

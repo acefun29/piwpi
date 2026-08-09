@@ -58,7 +58,6 @@ export interface DebugPluginState {
 	category: string;
 	source: { toolName: string; identity: string };
 	metadata: SourcePluginMeta;
-	memory?: ToolContextPlugin["memory"];
 }
 
 /** /api/state 全量快照 */

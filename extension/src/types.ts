@@ -14,11 +14,6 @@ export interface ToolContextPlugin {
 	source: { toolName: string; identity: string };
 	/** Source 插件内部结构见 SourcePluginMeta（挂载引用式重构：内容不驻留，见 file-cache.ts） */
 	metadata: Record<string, unknown>;
-	memory?: {
-		summary?: string;
-		understanding?: string;
-		relations?: string[];
-	};
 }
 
 /** 工具上下文适配器（计划 §2.1） */
@@ -85,10 +80,6 @@ export interface MemoryJob {
 export interface MapEntry {
 	role: string;
 	responsibilities: string[];
-	keyStructures: string[];
-	dependencies: string[];
-	dependents: string[];
-	decisions: string[];
 	/** 整理时文件的 sha256(hex)——磁盘驱动基准（基准 = 整理时刻，不属于任何会话） */
 	hash?: string;
 	/** 自整理以来累计变更行数（块指纹量化；达阈值 → stale）。跨会话沿用（随 project-map.json 落盘） */
