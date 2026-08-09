@@ -154,7 +154,7 @@ export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOption
 }
 
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
-	return {
+	const tools: Record<ToolName, ToolDef> = {
 		read: createReadToolDefinition(cwd, options?.read),
 		bash: createBashToolDefinition(cwd, options?.bash),
 		edit: createEditToolDefinition(cwd, options?.edit),
@@ -163,6 +163,10 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		find: createFindToolDefinition(cwd, options?.find),
 		ls: createLsToolDefinition(cwd, options?.ls),
 	};
+	for (const name of ["read", "grep", "find", "ls"] as const) {
+		tools[name].collaborationModes = ["default", "plan"];
+	}
+	return tools;
 }
 
 export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {

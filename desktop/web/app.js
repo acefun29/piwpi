@@ -19,6 +19,8 @@ const SVG = {
 	edit: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M8.5 2.5l3 3L5 12H2V9l6.5-6.5Z" stroke="#74767C" stroke-width="1.2" stroke-linejoin="round"/></svg>',
 	search: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="6.5" cy="6.5" r="4.5" stroke="#74767C" stroke-width="1.4"/><path d="M10 10L13 13" stroke="#74767C" stroke-width="1.4" stroke-linecap="round"/></svg>',
 	wrench: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 2.5a3 3 0 0 0-3.8 3.8L2 9.5 4.5 12l3.2-3.2A3 3 0 0 0 11.5 5L9.7 6.8 7.2 4.3 9 2.5Z" stroke="#74767C" stroke-width="1.2" stroke-linejoin="round"/></svg>',
+	folder: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M2.5 6h11" stroke="currentColor" stroke-width="1.35"/></svg>',
+	plan: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 2.5h8v11H4v-11Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M6.25 5.5h3.5M6.25 8h3.5M6.25 10.5h2.25" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>',
 };
 function toolIcon(name) {
 	if (name === "bash" || name === "shell") return SVG.term;
@@ -43,8 +45,13 @@ function showBanner(text) {
 const md = window.markdownit
 	? new window.markdownit({ html: false, linkify: true, breaks: true })
 	: null;
-// 安全：只允许 http(s)/mailto 链接——封死 [x](javascript:alert(1)) 这类 markdown 链接
-if (md) md.validateLink = (url) => /^(https?:|mailto:)/i.test(String(url).trim());
+function sourcePathFromHref(href) {
+	const value = decodeURIComponent(String(href).trim());
+	if (!/^(?:[a-zA-Z]:[\\/]|\/(?!\/))/.test(value)) return null;
+	return value.replace(/:\d+(?::\d+)?$/, "");
+}
+// 安全：只允许 http(s)/mailto 与绝对本地源文件链接，封死 javascript: 等可执行协议
+if (md) md.validateLink = (url) => /^(https?:|mailto:)/i.test(String(url).trim()) || sourcePathFromHref(url) !== null;
 const hljs = window.hljs;
 if (hljs) hljs.configure({ ignoreUnescapedHTML: true });
 
@@ -61,10 +68,18 @@ function mdRender(blk, { highlight = false } = {}) {
 	if (highlight) highlightCode(node);
 }
 
-/** 链接净化兜底：仅保留 http(s)/mailto，其余剥 href（覆盖 validateLink 之外的边角） */
+/** 链接净化兜底：本地绝对路径标为源文件引用，其余仅保留 http(s)/mailto。 */
 function sanitizeLinks(root) {
 	for (const a of root.querySelectorAll("a[href]")) {
-		if (!/^(https?:|mailto:)/i.test(a.getAttribute("href"))) a.removeAttribute("href");
+		const href = a.getAttribute("href") ?? "";
+		const sourcePath = sourcePathFromHref(href);
+		if (sourcePath) {
+			a.classList.add("source-ref");
+			a.dataset.sourcePath = sourcePath;
+			a.title = sourcePath;
+		} else if (!/^(https?:|mailto:)/i.test(href)) {
+			a.removeAttribute("href");
+		}
 	}
 }
 
@@ -132,6 +147,7 @@ function rpc(cmd, timeoutMs = 15000) {
 const msgCol = $("#msgCol");
 const chatFlow = $("#chatFlow");
 let streaming = false;
+let collaborationMode = "default";
 let currentAssistant = null; // { root, blocks: Map<contentIndex, block>, order: [] }
 const toolCards = new Map(); // toolCallId -> card refs
 
@@ -293,9 +309,15 @@ function hideRunning() {
 
 function setStreaming(on) {
 	streaming = on;
+	updateActionBtn();
+}
+
+function updateActionBtn() {
+	const on = streaming;
 	const btn = $("#btnAction");
 	btn.classList.toggle("streaming", on);
 	btn.title = on ? "中断" : "发送";
+	$("#modeSel").disabled = on;
 	if (!on) hideRunning();
 }
 
@@ -347,6 +369,15 @@ function dispatch(evt) {
 					currentAssistant.root.appendChild(el("div", "run-text", "⚠ 该轮以错误结束（stopReason: error，可能是模型鉴权或 API 异常）"));
 				} else if (evt.stopReason === "aborted") {
 					currentAssistant.root.appendChild(el("div", "run-text", "已中断"));
+				}
+				let hasInteractivePlan = false;
+				for (const blk of currentAssistant.blocks.values()) {
+					if (blk.type !== "text") continue;
+					const planCard = renderPlanArtifact(blk);
+					if (planCard && collaborationMode === "plan" && !hasInteractivePlan) {
+						appendPlanActions(planCard);
+						hasInteractivePlan = true;
+					}
 				}
 			}
 			scheduleCtxRingRefresh(); // assistant 消息提交
@@ -402,6 +433,9 @@ function dispatch(evt) {
 		case "extension_ui_request":
 			handleExtensionUI(evt);
 			return;
+		case "collaboration_mode_changed":
+			setModePicker(evt.mode);
+			return;
 		case "extension_error":
 			toast(`扩展错误（${evt.event}）：${evt.error}`, "error", 8000);
 			return;
@@ -418,8 +452,9 @@ function dispatch(evt) {
 			// 启动 / resume / 切换会话都会触发：更新当前会话高亮 + 刷新会话树
 			rpc({ type: "get_state" }, 30000)
 				.then((r) => {
-					if (r.success && typeof r.data?.sessionFile === "string") {
-						currentSessionFile = r.data.sessionFile;
+					if (r.success) {
+						if (typeof r.data?.sessionFile === "string") currentSessionFile = r.data.sessionFile;
+						if (typeof r.data?.collaborationMode === "string") setModePicker(r.data.collaborationMode);
 						refreshSessions();
 					}
 				})
@@ -497,15 +532,81 @@ function handleAssistantDelta(d) {
 	}
 }
 
-/* --- 扩展 UI 子协议：弹窗类自动取消（阶段一策略），通知类 toast --- */
+/* --- 扩展 UI 子协议 --- */
 function handleExtensionUI(evt) {
-	const dialog = ["select", "confirm", "input", "editor"];
-	if (dialog.includes(evt.method)) {
-		toast(`扩展请求「${evt.title ?? evt.method}」已自动取消（阶段一）`, "warn", 6000);
-		rpcRaw({ type: "extension_ui_response", id: evt.id, cancelled: true }).catch(() => {});
-	} else if (evt.method === "notify") {
+	if (evt.method === "notify") {
 		toast(evt.message ?? "扩展通知", evt.notifyType === "error" ? "error" : evt.notifyType === "warning" ? "warn" : "info");
+		return;
 	}
+	if (!["select", "confirm", "input", "editor"].includes(evt.method)) return;
+
+	const overlay = el("div", "dialog-overlay");
+	const panel = el("div", "dialog-panel");
+	const title = el("div", "dialog-title", evt.title ?? evt.method);
+	panel.appendChild(title);
+	let completed = false;
+	const finish = (response) => {
+		if (completed) return;
+		completed = true;
+		document.removeEventListener("keydown", onKeyDown);
+		overlay.remove();
+		rpcRaw({ type: "extension_ui_response", id: evt.id, ...response }).catch((err) => {
+			toast(`提交扩展交互失败：${err.message}`, "error");
+		});
+	};
+	const cancel = () => finish({ cancelled: true });
+	const onKeyDown = (event) => {
+		if (event.key === "Escape") cancel();
+	};
+
+	if (evt.method === "select") {
+		const options = el("div", "dialog-options");
+		for (const value of evt.options ?? []) {
+			const option = el("button", "dialog-option", value);
+			option.type = "button";
+			option.onclick = () => finish({ value });
+			options.appendChild(option);
+		}
+		panel.appendChild(options);
+	} else if (evt.method === "confirm") {
+		if (evt.message) panel.appendChild(el("div", "dialog-title", evt.message));
+		const foot = el("div", "dialog-foot");
+		const no = el("button", "plan-action", "否");
+		const yes = el("button", "plan-action primary", "是");
+		no.type = "button";
+		yes.type = "button";
+		no.onclick = () => finish({ confirmed: false });
+		yes.onclick = () => finish({ confirmed: true });
+		foot.append(no, yes);
+		panel.appendChild(foot);
+	} else {
+		const input = evt.method === "editor" ? el("textarea", "dialog-input") : el("input", "dialog-input");
+		input.placeholder = evt.placeholder ?? "";
+		input.value = evt.prefill ?? "";
+		const foot = el("div", "dialog-foot");
+		const cancelButton = el("button", "plan-action", "取消");
+		const submitButton = el("button", "plan-action primary", "提交");
+		cancelButton.type = "button";
+		submitButton.type = "button";
+		cancelButton.onclick = cancel;
+		submitButton.onclick = () => finish({ value: input.value });
+		if (evt.method === "input") {
+			input.addEventListener("keydown", (event) => {
+				if (event.key === "Enter" && !event.isComposing) {
+					event.preventDefault();
+					finish({ value: input.value });
+				}
+			});
+		}
+		foot.append(cancelButton, submitButton);
+		panel.append(input, foot);
+		setTimeout(() => input.focus(), 0);
+	}
+
+	overlay.appendChild(panel);
+	overlay.addEventListener("click", (event) => { if (event.target === overlay) cancel(); });
+	document.addEventListener("keydown", onKeyDown);
+	document.body.appendChild(overlay);
 }
 
 /* ================= SSE 连接 ================= */
@@ -560,6 +661,7 @@ async function initSession() {
 			$("#modelName").textContent = d.model ? `${d.model.name ?? d.model.id}` : "未选择模型";
 			document.title = `piwpi · ${d.model?.id ?? ""}`;
 			if (typeof d.sessionFile === "string") currentSessionFile = d.sessionFile;
+			setupModePicker(d.collaborationMode ?? "default");
 			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], d.thinkingLevel);
 			setStreaming(!!d.isStreaming);
 		}
@@ -615,6 +717,111 @@ function setupThinkingPicker(levels, current) {
 	};
 }
 
+function setModePicker(mode) {
+	collaborationMode = mode === "plan" ? "plan" : "default";
+	const sel = $("#modeSel");
+	sel.value = collaborationMode;
+	sel.closest(".mode-picker")?.classList.toggle("plan", collaborationMode === "plan");
+}
+
+function setupModePicker(current) {
+	const sel = $("#modeSel");
+	setModePicker(current);
+	sel.onchange = async () => {
+		const previous = collaborationMode;
+		const next = sel.value;
+		sel.disabled = true;
+		try {
+			const res = await rpc({ type: "set_collaboration_mode", mode: next });
+			if (!res.success) throw new Error(res.error ?? "未知原因");
+			setModePicker(next);
+			toast(next === "plan" ? "已进入计划模式" : "已切换为默认模式");
+		} catch (err) {
+			setModePicker(previous);
+			toast(`模式切换失败：${err.message}`, "error");
+		} finally {
+			sel.disabled = streaming;
+		}
+	};
+}
+
+function splitProposedPlan(text) {
+	const matches = [...text.matchAll(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/g)];
+	if (matches.length !== 1) return null;
+	const match = matches[0];
+	return {
+		before: text.slice(0, match.index).trim(),
+		plan: match[1].trim(),
+		after: text.slice((match.index ?? 0) + match[0].length).trim(),
+	};
+}
+
+function appendPlanActions(root) {
+	if (root.querySelector(".plan-actions")) return;
+	const actions = el("div", "plan-actions");
+	actions.appendChild(el("div", "plan-actions-title", "计划已完成，下一步怎么做？"));
+	const buttons = el("div", "plan-actions-buttons");
+	const compact = el("button", "plan-action primary", "压缩对话并开始实现");
+	const direct = el("button", "plan-action", "直接开始实现");
+	const refine = el("button", "plan-action", "继续完善计划");
+	for (const button of [compact, direct, refine]) button.type = "button";
+	const implement = async (strategy) => {
+		for (const button of [compact, direct, refine]) button.disabled = true;
+		try {
+			// 计划实施走 pi 侧 implement_plan RPC：compact 策略内部压缩；成功后 pi 自动进入实施
+			const res = await rpc({ type: "implement_plan", strategy }, 240000);
+			if (!res.success) throw new Error(res.error ?? "未知原因");
+			const badge = root.querySelector(".plan-card-badge");
+			if (badge) {
+				badge.textContent = "已批准";
+				badge.classList.add("approved");
+			}
+			actions.remove();
+		} catch (err) {
+			for (const button of [compact, direct, refine]) button.disabled = false;
+			toast(`开始实现失败：${err.message}`, "error", 8000);
+		}
+	};
+	compact.onclick = () => implement("compact");
+	direct.onclick = () => implement("direct");
+	refine.onclick = () => actions.remove();
+	buttons.append(compact, direct, refine);
+	actions.appendChild(buttons);
+	root.appendChild(actions);
+}
+
+/** 把 assistant 文本中的唯一 proposed_plan 控制块提升为独立的计划文档 artifact。 */
+function renderPlanArtifact(blk) {
+	const parts = splitProposedPlan(blk.text);
+	if (!parts) return null;
+
+	const wrap = el("div", "plan-message");
+	const before = parts.before ? el("div", "msg md-body") : null;
+	if (before) wrap.appendChild(before);
+
+	const card = el("section", "plan-card");
+	card.dataset.planArtifact = "true";
+	const head = el("div", "plan-card-head");
+	const identity = el("div", "plan-card-identity");
+	const icon = el("span", "plan-card-icon");
+	icon.innerHTML = SVG.plan;
+	identity.append(icon, el("span", "plan-card-title", "实施计划"));
+	const badge = el("span", "plan-card-badge", collaborationMode === "plan" ? "待确认" : "计划文档");
+	head.append(identity, badge);
+	const body = el("div", "plan-card-body md-body");
+	card.append(head, body);
+	wrap.appendChild(card);
+
+	const after = parts.after ? el("div", "msg md-body") : null;
+	if (after) wrap.appendChild(after);
+	blk.node.replaceWith(wrap);
+
+	if (before) mdRender({ type: "text", text: parts.before, node: before }, { highlight: true });
+	mdRender({ type: "text", text: parts.plan, node: body }, { highlight: true });
+	if (after) mdRender({ type: "text", text: parts.after, node: after }, { highlight: true });
+	return card;
+}
+
 /** 从历史消息重建对话（role: user / assistant / toolResult / bashExecution） */
 function rebuildHistory(messages) {
 	toolCards.clear();
@@ -637,13 +844,20 @@ function rebuildHistory(messages) {
 		} else if (m.role === "assistant") {
 			beginAssistant();
 			const a = currentAssistant;
+			let hasInteractivePlan = false;
 			(m.content ?? []).forEach((c, i) => {
 				if (c.type === "text") {
 					const blk = blockText();
 					blk.text = c.text ?? "";
 					a.blocks.set(i, blk);
 					a.root.appendChild(blk.node);
-					mdRender(blk, { highlight: true }); // 历史消息：先挂载再渲染
+					const planCard = renderPlanArtifact(blk);
+					if (planCard && collaborationMode === "plan" && !hasInteractivePlan) {
+						appendPlanActions(planCard);
+						hasInteractivePlan = true;
+					} else if (!planCard) {
+						mdRender(blk, { highlight: true }); // 历史消息：先挂载再渲染
+					}
 				} else if (c.type === "thinking") {
 					const blk = blockThinking();
 					blk.node.classList.remove("streaming");
@@ -722,6 +936,7 @@ function setupInput() {
 		else sendMessage();
 	});
 	$("#btnNewChat").addEventListener("click", async () => {
+		setView("chat");
 		try {
 			const res = await rpc({ type: "new_session" });
 			if (res.success && !res.data?.cancelled) {
@@ -1315,10 +1530,7 @@ async function refreshProjectInfo() {
 		}
 		if (cwd) {
 			currentWorkspace = cwd;
-			const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
-			const name = $("#projectName");
-			name.textContent = base;
-			name.title = cwd;
+			$("#navProject").title = `切换项目目录（当前：${cwd}）`;
 		}
 	} catch { /* ignore */ }
 }
@@ -1332,22 +1544,12 @@ async function refreshSessions() {
 	} catch { /* ignore */ }
 }
 
-function relTime(ts) {
-	const diff = Date.now() - ts;
-	if (!Number.isFinite(ts) || diff < 0) return "";
-	if (diff < 60_000) return "刚刚";
-	if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-	if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
-	if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`;
-	return new Date(ts).toLocaleDateString("zh-CN");
-}
-
 /** 项目组折叠状态（跨刷新保留）：path -> collapsed */
 const projectCollapsed = new Map();
 
 /**
  * 侧边栏多项目会话树（对齐 Codex 桌面版：全部项目会话 + 项目标识）。
- * 按 cwd 分组：当前项目组置顶展开，其他项目组默认折叠；组标题点击 = 切到该项目（switch_project，
+ * 按 cwd 分组：当前项目组置顶，各项目默认展开；组标题点击 = 切到该项目（switch_project，
  * 无缝）；会话点击 = switch_session（pi 采纳会话 cwd，跨项目直接切换）。
  * 当前会话常驻（pi 会话文件惰性落盘，未落盘也显示）；无标题会话用首条消息摘要。
  */
@@ -1383,13 +1585,14 @@ function renderSessions(sessions) {
 		// 组标题：点击 = 切到该项目（当前组则折叠）；chevron = 仅折叠
 		const head = el("div", "proj-group");
 		if (isCurrentProj) head.classList.add("current");
+		const folder = el("span", "proj-folder");
+		folder.innerHTML = SVG.folder;
+		const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
+		const name = el("span", "proj-name", base);
+		name.title = cwd;
 		const chev = el("span", "proj-chev");
 		chev.innerHTML = SVG.chev;
-		const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
-		const name = el("span", "proj-name", isCurrentProj ? `${base}（当前）` : base);
-		name.title = cwd;
-		const count = el("span", "proj-count", String(list.length));
-		head.append(chev, name, count);
+		head.append(folder, name, chev);
 		head.title = isCurrentProj ? `${cwd}（当前项目）` : `${cwd} — 点击切换到此项目`;
 		const body = el("div", "proj-body");
 		for (const s of list) {
@@ -1399,7 +1602,6 @@ function renderSessions(sessions) {
 			const label = s.name || s.firstMessage || "(无标题会话)";
 			const title = el("span", "sess-title-min", label);
 			title.title = s.name || s.firstMessage || s.sessionFile;
-			const time = el("span", "sess-time", relTime(s.modified));
 			const del = el("button", "sess-del");
 			del.title = "删除会话";
 			del.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 2l6 6M8 2l-6 6" stroke="#74767C" stroke-width="1.4" stroke-linecap="round"/></svg>';
@@ -1422,16 +1624,17 @@ function renderSessions(sessions) {
 					toast(`删除失败：${err.message}`, "error");
 				}
 			});
-			item.append(title, time, del);
+			item.append(title, del);
 			item.title = s.sessionFile;
 			item.addEventListener("click", () => {
+				setView("chat");
 				if (!isCurrent) resumeSession(s);
 			});
 			body.appendChild(item);
 		}
 		tree.append(head, body);
-		// 折叠：当前项目默认展开；其他默认折叠（用户展开过的保留）
-		const collapsed = isCurrentProj ? false : (projectCollapsed.get(cwd) ?? true);
+		// 折叠：默认展开，用户主动折叠后保留状态；当前项目始终展开
+		const collapsed = isCurrentProj ? false : (projectCollapsed.get(cwd) ?? false);
 		if (collapsed) head.classList.add("collapsed");
 		chev.addEventListener("click", (e) => {
 			e.stopPropagation();
@@ -1451,15 +1654,41 @@ function renderSessions(sessions) {
 
 /** 恢复历史会话：switch_session → 重建对话历史（扩展随会话重载，restorePlugins 恢复挂载） */
 async function resumeSession(s) {
+	setView("chat");
 	try {
 		const res = await rpc({ type: "switch_session", sessionPath: s.sessionFile }, 30000);
 		if (!res.success) {
 			toast(`恢复失败：${res.error ?? "未知原因"}`, "error", 8000);
 			return;
 		}
+		if (res.data?.cancelled) return;
+		currentSessionFile = s.sessionFile;
+		if (s.cwd) {
+			currentWorkspace = s.cwd;
+			localStorage.setItem("piwpi.project", s.cwd);
+		}
+		const projectName = (s.cwd || currentWorkspace).split(/[\\/]/).filter(Boolean).at(-1) || "piwpi";
+		const sessionName = s.name || s.firstMessage || "新对话";
+		$("#sessionTitle").textContent = `${projectName} / ${sessionName}`;
+		const [stateRes, levelsRes, messagesRes] = await Promise.all([
+			rpc({ type: "get_state" }, 30000),
+			rpc({ type: "get_available_thinking_levels" }, 30000),
+			rpc({ type: "get_messages" }, 60000),
+			refreshProjectInfo(),
+		]);
+		if (stateRes.success) {
+			const state = stateRes.data;
+			if (typeof state.sessionFile === "string") currentSessionFile = state.sessionFile;
+			$("#modelName").textContent = state.model ? `${state.model.name ?? state.model.id}` : "未选择模型";
+			setupModePicker(state.collaborationMode ?? "default");
+			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], state.thinkingLevel);
+			setStreaming(!!state.isStreaming);
+		}
 		resetChatView();
-		await rebuildFromMessages();
-		toast("已恢复会话");
+		if (messagesRes.success && messagesRes.data.messages.length > 0) {
+			rebuildHistory(messagesRes.data.messages);
+		}
+		refreshSessions();
 	} catch (err) {
 		toast(`恢复失败：${err.message}`, "error", 8000);
 	}
@@ -1476,6 +1705,7 @@ async function switchProjectPath(path) {
 		localStorage.setItem("piwpi.project", res.data?.cwd ?? path);
 		await waitDebugCwd(path, 15000);
 		await refreshProjectInfo();
+		setView("chat");
 		resetChatView();
 		$("#sessionTitle").textContent = "piwpi / 新对话";
 		await initSession();
@@ -1541,13 +1771,17 @@ function setupProject() {
 }
 
 /* ================= Markdown 链接 ================= */
-/** 事件委托：一律拦默认导航；http(s) 链接交给系统浏览器（Electron preload 提供），其余剥死 */
-chatFlow.addEventListener("click", (e) => {
+/** 事件委托：外链交给系统浏览器；源文件引用交给桌面主进程打开。 */
+chatFlow.addEventListener("click", async (e) => {
 	const a = e.target.closest("a[href]");
 	if (!a) return;
 	e.preventDefault(); // 禁止应用内导航（Electron 已 deny 新窗口 + 限制来源，这里双保险）
 	const href = a.getAttribute("href") ?? "";
-	if (/^https?:\/\//i.test(href)) {
+	const sourcePath = a.dataset.sourcePath;
+	if (sourcePath && window.openSourceFile) {
+		const result = await window.openSourceFile(sourcePath, currentWorkspace);
+		if (!result?.ok) toast(`打开源文件失败：${result?.error ?? "未知原因"}`, "error");
+	} else if (/^https?:\/\//i.test(href)) {
 		if (window.openExternal) window.openExternal(href);
 		else if (window.open) window.open(href, "_blank"); // web 调试模式兜底
 	}

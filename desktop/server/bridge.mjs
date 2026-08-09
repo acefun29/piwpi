@@ -70,7 +70,10 @@ export async function startBridge(opts = {}) {
 	// desktop/ 位于 pi 仓库根下：REPO = pi 仓库根，piwpi 扩展即 REPO/extension
 	const piCli = opts.piCli ?? process.env.PIWPI_PI_CLI ?? join(REPO, "extension", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 	const extPath = opts.extPath ?? process.env.PIWPI_EXT ?? join(REPO, "extension");
-	const extraArgs = (process.env.PIWPI_PI_ARGS ?? "--model deepseek/deepseek-v4-flash").split(" ").filter(Boolean);
+	const extraArgs = (
+		process.env.PIWPI_PI_ARGS ??
+		"--model deepseek/deepseek-v4-flash --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document"
+	).split(" ").filter(Boolean);
 	const onPiExit = opts.onPiExit ?? (() => {});
 
 	if (!existsSync(piCli)) {
@@ -334,6 +337,16 @@ export async function startBridge(opts = {}) {
 
 	/* ================= 静态文件 ================= */
 	async function serveStatic(pathname, res) {
+		if (pathname === "/logo.svg") {
+			try {
+				const data = await readFile(join(REPO, "logo.svg"));
+				res.writeHead(200, { "content-type": MIME[".svg"] });
+				res.end(data);
+			} catch {
+				res.writeHead(404).end("not found");
+			}
+			return;
+		}
 		const rel = pathname === "/" ? "/index.html" : pathname;
 		const filePath = normalize(join(WEB_DIR, rel));
 		const relCheck = relative(WEB_DIR, filePath);

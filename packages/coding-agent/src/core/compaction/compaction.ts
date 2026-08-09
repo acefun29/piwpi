@@ -488,6 +488,12 @@ Use this EXACT format:
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
+## Plan State
+- [Current collaboration/plan state, approved plan artifact, and unresolved decisions]
+
+## Tool Evidence
+- [Important commands, results, errors, and evidence needed to continue]
+
 ## Next Steps
 1. [Ordered list of what should happen next]
 
@@ -527,6 +533,12 @@ Use this EXACT format:
 
 ## Key Decisions
 - **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Plan State
+- [Preserve the current collaboration/plan state and approved plan artifact]
+
+## Tool Evidence
+- [Preserve important commands, results, errors, and evidence]
 
 ## Next Steps
 1. [Update based on current state]

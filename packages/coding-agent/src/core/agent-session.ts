@@ -53,6 +53,7 @@ import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import { type CollaborationMode, instructionsForCollaborationMode } from "./collaboration-mode.ts";
 import {
 	type CompactionResult,
 	calculateContextTokens,
@@ -156,6 +157,7 @@ export type AgentSessionEvent =
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "collaboration_mode_changed"; mode: CollaborationMode }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -374,6 +376,7 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	private _collaborationMode: CollaborationMode = "default";
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -390,6 +393,11 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "collaboration_mode_change") {
+				this._collaborationMode = entry.mode;
+			}
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -470,6 +478,12 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			if (!this._toolCanExecuteInCurrentMode(toolCall.name)) {
+				return {
+					block: true,
+					reason: `Tool "${toolCall.name}" is unavailable in ${this._collaborationMode} mode`,
+				};
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -911,6 +925,30 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
+	private _toolCanExecuteInCurrentMode(name: string): boolean {
+		const modes = this._toolDefinitions.get(name)?.definition.collaborationModes;
+		return modes ? modes.includes(this._collaborationMode) : this._collaborationMode === "default";
+	}
+
+	/** Current collaboration mode. */
+	get collaborationMode(): CollaborationMode {
+		return this._collaborationMode;
+	}
+
+	/** Persist and apply a collaboration mode change. */
+	setCollaborationMode(mode: CollaborationMode): void {
+		if (mode === this._collaborationMode) return;
+		if (this.isStreaming || this.isCompacting) {
+			throw new Error("Cannot change collaboration mode while the session is running");
+		}
+
+		this._collaborationMode = mode;
+		this.sessionManager.appendCollaborationModeChange(mode);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._emit({ type: "collaboration_mode_changed", mode });
+	}
+
 	/**
 	 * Set active tools by name.
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
@@ -1044,6 +1082,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
+			modeInstructions: instructionsForCollaborationMode(this._collaborationMode),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -2772,6 +2811,9 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		if (this._collaborationMode === "plan") {
+			throw new Error("Bash execution is unavailable in plan mode");
+		}
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 

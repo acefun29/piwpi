@@ -85,17 +85,19 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 // Message Serialization
 // ============================================================================
 
-/** Maximum characters for a tool result in serialized summaries. */
-const TOOL_RESULT_MAX_CHARS = 2000;
+/** Maximum characters for tool payloads in serialized summaries. */
+const TOOL_PAYLOAD_MAX_CHARS = 2000;
 
 /**
  * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
+ * Keeps both ends so command headers and final errors remain available.
  */
-function truncateForSummary(text: string, maxChars: number): string {
+export function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	const headChars = Math.ceil(maxChars / 2);
+	const tailChars = Math.floor(maxChars / 2);
+	return `${text.slice(0, headChars)}\n\n[... ${truncatedChars} characters compacted ...]\n\n${text.slice(-tailChars)}`;
 }
 
 /**
@@ -112,7 +114,12 @@ export function serializeConversation(messages: Message[]): string {
 	for (const msg of messages) {
 		if (msg.role === "user") {
 			const content = contentText(msg.content, "");
-			if (content) parts.push(`[User]: ${content}`);
+			if (content) {
+				const serialized = content.startsWith("Ran `")
+					? `[Bash execution; originalChars=${content.length}]: ${truncateForSummary(content, TOOL_PAYLOAD_MAX_CHARS)}`
+					: `[User]: ${content}`;
+				parts.push(serialized);
+			}
 		} else if (msg.role === "assistant") {
 			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
@@ -125,7 +132,7 @@ export function serializeConversation(messages: Message[]): string {
 					const argsStr = Object.entries(args)
 						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
 						.join(", ");
-					toolCalls.push(`${block.name}(${argsStr})`);
+					toolCalls.push(`${block.name}(${truncateForSummary(argsStr, TOOL_PAYLOAD_MAX_CHARS)})`);
 				}
 			}
 
@@ -140,9 +147,10 @@ export function serializeConversation(messages: Message[]): string {
 			}
 		} else if (msg.role === "toolResult") {
 			const content = contentText(msg.content, "");
-			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
-			}
+			const imageCount = msg.content.filter((block) => block.type === "image").length;
+			const status = msg.isError ? "error" : "success";
+			const header = `[Tool result name=${msg.toolName} status=${status} originalChars=${content.length} images=${imageCount}]`;
+			parts.push(content ? `${header}: ${truncateForSummary(content, TOOL_PAYLOAD_MAX_CHARS)}` : header);
 		}
 	}
 

@@ -9,6 +9,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
+import type { CollaborationMode } from "../../core/collaboration-mode.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
@@ -271,6 +272,16 @@ export class RpcClient {
 	 */
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		await this.send({ type: "set_thinking_level", level });
+	}
+
+	/** Set the collaboration mode. */
+	async setCollaborationMode(mode: CollaborationMode): Promise<void> {
+		await this.send({ type: "set_collaboration_mode", mode });
+	}
+
+	/** Approve the latest proposed plan and begin implementation. */
+	async implementPlan(strategy: "compact" | "direct"): Promise<void> {
+		await this.send({ type: "implement_plan", strategy });
 	}
 
 	/**

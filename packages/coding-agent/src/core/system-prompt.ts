@@ -16,6 +16,8 @@ export interface BuildSystemPromptOptions {
 	promptGuidelines?: string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
+	/** Fixed collaboration-mode instructions appended as the final system-prompt section. */
+	modeInstructions?: string;
 	/** Working directory. */
 	cwd: string;
 	/** Pre-loaded context files. */
@@ -32,6 +34,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		toolSnippets,
 		promptGuidelines,
 		appendSystemPrompt,
+		modeInstructions,
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
@@ -67,6 +70,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		}
 
 		prompt += `\nCurrent working directory: ${promptCwd}`;
+		if (modeInstructions) {
+			prompt += `\n\n${modeInstructions}`;
+		}
 
 		return prompt;
 	}
@@ -157,6 +163,9 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 	}
 
 	prompt += `\nCurrent working directory: ${promptCwd}`;
+	if (modeInstructions) {
+		prompt += `\n\n${modeInstructions}`;
+	}
 
 	return prompt;
 }

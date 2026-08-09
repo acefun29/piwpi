@@ -16,6 +16,17 @@ const path = require("node:path");
 let bridge = null;
 let win = null;
 
+ipcMain.handle("open-source-file", async (_event, filePath, workspace) => {
+	const root = path.resolve(String(workspace));
+	const source = path.resolve(String(filePath));
+	const relative = path.relative(root, source);
+	if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+		return { ok: false, error: "源文件不在当前项目内" };
+	}
+	const error = await shell.openPath(source);
+	return error ? { ok: false, error } : { ok: true };
+});
+
 // 单实例：防止两个窗口各自 spawn pi 抢占 debug 端口/会话锁
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {

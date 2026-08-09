@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { DEFAULT_MODE_INSTRUCTIONS, PLAN_MODE_INSTRUCTIONS } from "../src/core/collaboration-mode.ts";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
 
 describe("buildSystemPrompt", () => {
@@ -111,5 +112,34 @@ describe("buildSystemPrompt", () => {
 
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
 		});
+	});
+
+	test("appends collaboration mode instructions as the final prompt section", () => {
+		const modeInstructions = "# Collaboration Mode: Plan\n\nPlan-only tail instructions.";
+		const prompt = buildSystemPrompt({
+			selectedTools: ["read", "bash"],
+			contextFiles: [{ path: "AGENTS.md", content: "Repository instructions" }],
+			skills: [],
+			cwd: process.cwd(),
+			modeInstructions,
+		});
+
+		expect(prompt.endsWith(modeInstructions)).toBe(true);
+		expect(prompt.indexOf("Repository instructions")).toBeLessThan(prompt.indexOf(modeInstructions));
+	});
+
+	test("keeps an identical cacheable prefix across collaboration modes", () => {
+		const options = {
+			selectedTools: ["read", "bash"],
+			contextFiles: [{ path: "AGENTS.md", content: "Repository instructions" }],
+			skills: [],
+			cwd: process.cwd(),
+		};
+		const defaultPrompt = buildSystemPrompt({ ...options, modeInstructions: DEFAULT_MODE_INSTRUCTIONS });
+		const planPrompt = buildSystemPrompt({ ...options, modeInstructions: PLAN_MODE_INSTRUCTIONS });
+
+		expect(defaultPrompt.slice(0, -DEFAULT_MODE_INSTRUCTIONS.length)).toBe(
+			planPrompt.slice(0, -PLAN_MODE_INSTRUCTIONS.length),
+		);
 	});
 });

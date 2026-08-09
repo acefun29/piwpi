@@ -1,7 +1,7 @@
 > **piwpi** — a fork of [Pi](https://github.com/earendil-works/pi) by [@mariozechner](https://github.com/mariozechner) ([MIT](LICENSE)), extended with a tool-context plugin system (`extension/`).
 
 <p align="center">
-  <img alt="piwpi logo" src="pwp-logo.png" width="200">
+  <img alt="piwpi logo" src="logo.svg" width="300">
 </p>
 
 # piwpi

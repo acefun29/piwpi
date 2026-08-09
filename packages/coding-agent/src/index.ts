@@ -24,6 +24,12 @@ export {
 	type SessionStats,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
+export {
+	type CollaborationMode,
+	DEFAULT_MODE_INSTRUCTIONS,
+	instructionsForCollaborationMode,
+	PLAN_MODE_INSTRUCTIONS,
+} from "./core/collaboration-mode.ts";
 // Compaction
 export {
 	type BranchPreparation,

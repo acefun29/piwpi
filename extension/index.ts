@@ -1,7 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { createDebugServer, type DebugServer, parseDebugPort } from "./src/debug.ts";
 import { createHarness } from "./src/harness.ts";
+import { dataDirFor } from "./src/memory/persist.ts";
 
 /**
  * piwpi 扩展入口（阶段一完成）。
@@ -52,10 +55,81 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			"需要项目级理解（找文件、依赖关系、影响面）时调用 read_project_map",
 			"项目地图由 piwpi 记忆 Agent 在新文件挂载累计后批量整理生成",
 		],
+		collaborationModes: ["default", "plan"],
 		parameters: Type.Object({}),
 		execute: async () => ({
 			content: [{ type: "text", text: harness.projectMapTree() }],
 			details: {},
 		}),
+	});
+
+	pi.registerTool({
+		name: "request_user_input",
+		label: "Request user input",
+		description:
+			"在计划模式中向用户提出一个会改变方案的决策问题。一次只能问一个问题，提供 2-3 个互斥选项，并把推荐项放在第一位。",
+		promptSnippet: "计划模式单题决策访谈",
+		collaborationModes: ["plan"],
+		parameters: Type.Object({
+			header: Type.String({ description: "短标题" }),
+			question: Type.String({ description: "单个决策问题" }),
+			options: Type.Array(
+				Type.Object({
+					label: Type.String(),
+					description: Type.String(),
+				}),
+				{ minItems: 2, maxItems: 3 },
+			),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const renderedOptions = params.options.map((option) => `${option.label} — ${option.description}`);
+			const other = "其他…";
+			const selected = await ctx.ui.select(`${params.header}\n\n${params.question}`, [...renderedOptions, other]);
+			if (!selected) {
+				return { content: [{ type: "text", text: "User cancelled the question." }], details: {} };
+			}
+			if (selected === other) {
+				const answer = await ctx.ui.input(params.header, "输入你的答案");
+				return {
+					content: [{ type: "text", text: answer ? `User answer: ${answer}` : "User cancelled the question." }],
+					details: {},
+				};
+			}
+			const index = renderedOptions.indexOf(selected);
+			const option = params.options[index];
+			return {
+				content: [{ type: "text", text: `User selected: ${option.label}\n${option.description}` }],
+				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "update_plan_document",
+		label: "Update plan document",
+		description:
+			"更新当前计划模式会话的私有 Markdown 计划文档。每次提交完整文档；正式输出前使用 proposed 状态。",
+		promptSnippet: "更新会话私有计划文档",
+		collaborationModes: ["plan"],
+		parameters: Type.Object({
+			status: Type.Union([Type.Literal("draft"), Type.Literal("proposed")]),
+			markdown: Type.String(),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const plansDir = join(dataDirFor(ctx.cwd), "plans");
+			const planPath = join(plansDir, `${ctx.sessionManager.getSessionId()}.md`);
+			await mkdir(plansDir, { recursive: true });
+			await writeFile(planPath, params.markdown, "utf8");
+			pi.appendEntry("piwpi.plan_document", {
+				version: 1,
+				status: params.status,
+				markdown: params.markdown,
+				path: planPath,
+			});
+			return {
+				content: [{ type: "text", text: `Plan document updated: ${planPath}` }],
+				details: { path: planPath, status: params.status },
+			};
+		},
 	});
 }

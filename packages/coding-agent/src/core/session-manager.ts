@@ -19,6 +19,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import type { CollaborationMode } from "./collaboration-mode.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -27,7 +28,7 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 
-export const CURRENT_SESSION_VERSION = 3;
+export const CURRENT_SESSION_VERSION = 4;
 
 export interface SessionHeader {
 	type: "session";
@@ -64,6 +65,11 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+export interface CollaborationModeChangeEntry extends SessionEntryBase {
+	type: "collaboration_mode_change";
+	mode: CollaborationMode;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -145,6 +151,7 @@ export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| CollaborationModeChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -274,6 +281,16 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 	}
 }
 
+/** Migrate v3 → v4: collaboration mode is entry-based; existing sessions start in Default mode. */
+function migrateV3ToV4(entries: FileEntry[]): void {
+	for (const entry of entries) {
+		if (entry.type === "session") {
+			entry.version = 4;
+			break;
+		}
+	}
+}
+
 /**
  * Run all necessary migrations to bring entries to current version.
  * Mutates entries in place. Returns true if any migration was applied.
@@ -286,6 +303,7 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 
 	if (version < 2) migrateV1ToV2(entries);
 	if (version < 3) migrateV2ToV3(entries);
+	if (version < 4) migrateV3ToV4(entries);
 
 	return true;
 }
@@ -1088,6 +1106,19 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a collaboration mode change as child of current leaf, then advance leaf. */
+	appendCollaborationModeChange(mode: CollaborationMode): string {
+		const entry: CollaborationModeChangeEntry = {
+			type: "collaboration_mode_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			mode,
 		};
 		this._appendEntry(entry);
 		return entry.id;

@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { contentText } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -457,8 +458,77 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
+					collaborationMode: session.collaborationMode,
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_collaboration_mode": {
+				session.setCollaborationMode(command.mode);
+				return success(id, "set_collaboration_mode");
+			}
+
+			case "implement_plan": {
+				if (session.collaborationMode !== "plan") {
+					return error(id, "implement_plan", "The session is not in plan mode");
+				}
+				if (session.isStreaming || session.isCompacting) {
+					return error(id, "implement_plan", "The session is busy");
+				}
+
+				const lastAssistant = session.messages.at(-1);
+				const lastAssistantText = lastAssistant?.role === "assistant" ? contentText(lastAssistant.content) : "";
+				const planMatches = [...lastAssistantText.matchAll(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/g)];
+				const approvedPlan = planMatches.length === 1 ? planMatches[0][1].trim() : "";
+				if (!approvedPlan) {
+					return error(id, "implement_plan", "The latest assistant message does not contain one proposed plan");
+				}
+
+				if (command.strategy === "compact") {
+					try {
+						await session.compact(
+							"Preserve resolved requirements, constraints, decisions, glossary, implementation evidence, and the approved plan state.",
+						);
+					} catch (cause) {
+						// 会话太小（"Nothing to compact (session too small)"）或刚压缩过（"Already compacted"，
+						// 见 core/agent-session.ts compact()）时跳过压缩直接实施；其他压缩错误保持阻断
+						const message = cause instanceof Error ? cause.message : String(cause);
+						if (!message.includes("Nothing to compact") && !message.includes("Already compacted")) {
+							return error(id, "implement_plan", `Compaction failed: ${message}`);
+						}
+					}
+				}
+
+				session.setCollaborationMode("default");
+				const implementationPrompt = `<approved_plan>\n${approvedPlan}\n</approved_plan>\n\nPlan Mode is now explicitly ended. Implement the approved plan now. Do not re-plan unless a new blocker makes the approved plan impossible.`;
+				let responseSent = false;
+				const restorePlanMode = () => {
+					if (session.collaborationMode === "default" && !session.isStreaming && !session.isCompacting) {
+						session.setCollaborationMode("plan");
+					}
+				};
+				session
+					.prompt(implementationPrompt, {
+						expandPromptTemplates: false,
+						source: "rpc",
+						preflightResult: (didSucceed) => {
+							if (responseSent) return;
+							responseSent = true;
+							if (didSucceed) {
+								output(success(id, "implement_plan"));
+							} else {
+								restorePlanMode();
+								output(error(id, "implement_plan", "Implementation prompt was rejected"));
+							}
+						},
+					})
+					.catch((cause: Error) => {
+						if (responseSent) return;
+						responseSent = true;
+						restorePlanMode();
+						output(error(id, "implement_plan", cause.message));
+					});
+				return undefined;
 			}
 
 			// =================================================================

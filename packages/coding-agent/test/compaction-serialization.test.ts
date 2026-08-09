@@ -18,11 +18,10 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toContain("[Tool result]:");
-		expect(result).toContain("[... 3000 more characters truncated]");
-		expect(result).not.toContain("x".repeat(3000));
-		// First 2000 chars should be present
-		expect(result).toContain("x".repeat(2000));
+		expect(result).toContain("[Tool result name=read status=success originalChars=5000 images=0]");
+		expect(result).toContain("[... 3000 characters compacted ...]");
+		expect(result).not.toContain("x".repeat(2001));
+		expect(result).toContain("x".repeat(1000));
 	});
 
 	it("should not truncate short tool results", () => {
@@ -40,8 +39,29 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toBe(`[Tool result]: ${shortContent}`);
+		expect(result).toBe(`[Tool result name=read status=success originalChars=1500 images=0]: ${shortContent}`);
 		expect(result).not.toContain("truncated");
+	});
+
+	it("preserves the head and tail of long tool evidence", () => {
+		const middle = "m".repeat(4000);
+		const messages: Message[] = [
+			{
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "bash",
+				content: [{ type: "text", text: `COMMAND_HEADER\n${middle}\nFINAL_ERROR` }],
+				isError: true,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = serializeConversation(messages);
+
+		expect(result).toContain("name=bash status=error");
+		expect(result).toContain("COMMAND_HEADER");
+		expect(result).toContain("FINAL_ERROR");
+		expect(result).toContain("characters compacted");
 	});
 
 	it("should not truncate assistant or user messages", () => {

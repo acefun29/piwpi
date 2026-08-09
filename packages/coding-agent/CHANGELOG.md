@@ -9,6 +9,7 @@
 
 ### Added
 
+- Added persistent Default/Plan collaboration modes with stable tool schemas, execution-time tool permissions, RPC controls, and plan-aware context compaction.
 - Added built-in Baseten provider support with `BASETEN_API_KEY` authentication and `zai-org/GLM-5.2` as the default model.
 - Added chainable `pi.registerMarkdownTransformer()` hooks for display-only transformation of user and assistant Markdown.
 - Added an experimental fullscreen UI mode, selectable through `--ui-mode fullscreen` or `/settings` ([#7304](https://github.com/earendil-works/pi/issues/7304)).
@@ -20,6 +21,7 @@
 
 ### Fixed
 
+- Fixed plan approval rejecting the visible proposed plan because its Markdown differed from the private planning artifact; implementation now uses the plan the user actually approved without an artifact-alignment gate.
 - Fixed fullscreen shutdown leaking terminal capability-query replies into the parent shell prompt.
 - Fixed bare exact `--model` IDs shared by multiple providers choosing the first catalog entry instead of the sole authenticated provider or a clear ambiguity error ([#7327](https://github.com/earendil-works/pi/issues/7327)).
 - Fixed standalone x64 binaries requiring Haswell-era AVX2/BMI2 instructions by compiling release executables against Bun's baseline runtime ([#7149](https://github.com/earendil-works/pi/issues/7149)).

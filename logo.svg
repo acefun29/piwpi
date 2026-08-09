@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" width="100%" height="100%">
+  <defs>
+    <linearGradient id="logo-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#3B91FD" />
+      <stop offset="25%" stop-color="#4178F9" />
+      <stop offset="50%" stop-color="#4449E9" />
+      <stop offset="75%" stop-color="#472EDC" />
+      <stop offset="100%" stop-color="#4826D9" />
+    </linearGradient>
+  </defs>
+
+  <!-- Perfectly Vectorized Rectangular Logo -->
+  <path fill="url(#logo-gradient)" fill-rule="evenodd" d="
+    M 0 0 H 300 V 100 H 400 V 300 H 300 V 400 H 100 V 500 H 0 Z 
+    M 100 100 V 300 H 300 V 100 Z
+
+    M 400 300 H 500 V 200 H 700 V 300 H 600 V 400 H 500 V 500 H 400 Z
+
+    M 800 100 H 900 V 400 H 800 V 500 H 700 V 300 H 800 Z
+  " />
+</svg>
