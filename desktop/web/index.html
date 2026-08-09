@@ -95,8 +95,22 @@
       <div class="page-pad-sm">
         <div class="page-title">Project Map</div>
         <div class="page-sub">记忆 Agent 逐步建立的项目理解</div>
-        <div class="body-row">
-          <div class="tree-card" id="mapTree"></div>
+        <div class="map-body" id="mapBody">
+          <div class="map-picker collapsed" id="mapPicker">
+            <div class="picker-head" id="pickerHead">
+              <span class="picker-folder">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M2.5 6h11" stroke="currentColor" stroke-width="1.35"/></svg>
+              </span>
+              <span class="picker-current" id="pickerCurrent">选择一个文件</span>
+              <span class="picker-chev">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M4.5 3L7.5 6L4.5 9" stroke="#A2A3A8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+            </div>
+            <div class="picker-body" id="pickerBody">
+              <input class="picker-search" id="pickerSearch" type="text" placeholder="搜索文件…" autocomplete="off">
+              <div class="picker-tree" id="pickerTree"></div>
+            </div>
+          </div>
           <div class="detail-card map-detail" id="mapDetail"></div>
         </div>
       </div>

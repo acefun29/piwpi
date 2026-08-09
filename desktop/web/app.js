@@ -1307,8 +1307,13 @@ function renderContext(ctx) {
 }
 
 /* ================= Project Map 页面（debug API） ================= */
-const mapTree = $("#mapTree");
 const mapDetail = $("#mapDetail");
+const mapPicker = $("#mapPicker");
+const pickerHead = $("#pickerHead");
+const pickerBody = $("#pickerBody");
+const pickerSearch = $("#pickerSearch");
+const pickerTree = $("#pickerTree");
+const pickerCurrent = $("#pickerCurrent");
 let mapVisible = false;
 let debugCwd = "";            // 会话内稳定，从 /debug/state 缓存
 let mapEntries = {};          // 最近一次 entries（重选文件时重渲染用）
@@ -1372,13 +1377,32 @@ function buildMapTree(entries) {
 	return root;
 }
 
-function renderTreeDom(root) {
-	mapTree.innerHTML = "";
+function renderPickerTree(root, query) {
+	pickerTree.innerHTML = "";
 	const rootName = (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目";
 	const rootRow = el("div", "tree-root", rootName);
 	rootRow.title = debugCwd || "";
-	mapTree.appendChild(rootRow);
-	emitMapNode(root, mapTree, "");
+	pickerTree.appendChild(rootRow);
+
+	const term = (query ?? "").trim().toLowerCase();
+	if (term) {
+		const matches = mapFileList.filter((f) => f.rel.toLowerCase().includes(term));
+		if (matches.length === 0) {
+			pickerTree.appendChild(el("div", "tree-empty", "无匹配文件"));
+		} else {
+			for (const f of matches) {
+				const row = el("div", "tree-node");
+				row.innerHTML = SVG.file;
+				row.appendChild(el("span", null, f.rel));
+				row.title = f.rel;
+				if (f.id === selectedMapId) row.classList.add("selected");
+				row.addEventListener("click", () => selectMapFile(f.id));
+				pickerTree.appendChild(row);
+			}
+		}
+	} else {
+		emitMapNode(root, pickerTree, "");
+	}
 }
 
 function emitMapNode(node, parent, dirPath) {
@@ -1393,7 +1417,8 @@ function emitMapNode(node, parent, dirPath) {
 		emitMapNode(dir, children, path);
 		parent.append(row, children);
 		if (mapCollapsed.has(path)) row.classList.add("collapsed");
-		row.addEventListener("click", () => {
+		row.addEventListener("click", (e) => {
+			e.stopPropagation();
 			row.classList.toggle("collapsed");
 			if (row.classList.contains("collapsed")) mapCollapsed.add(path);
 			else mapCollapsed.delete(path);
@@ -1406,12 +1431,25 @@ function emitMapNode(node, parent, dirPath) {
 		row.appendChild(el("span", null, f.name));
 		row.title = f.rel;
 		if (f.id === selectedMapId) row.classList.add("selected");
-		row.addEventListener("click", () => {
-			selectedMapId = f.id;
-			renderMapPage(mapEntries);
+		row.addEventListener("click", (e) => {
+			e.stopPropagation();
+			selectMapFile(f.id);
 		});
 		parent.appendChild(row);
 	}
+}
+
+function selectMapFile(id) {
+	selectedMapId = id;
+	pickerSearch.value = "";
+	mapPicker.classList.add("collapsed");
+	renderMapPage(mapEntries);
+}
+
+function updatePickerCurrent() {
+	const sel = mapFileList.find((f) => f.id === selectedMapId);
+	pickerCurrent.textContent = sel ? sel.rel : "选择一个文件";
+	pickerCurrent.title = sel ? sel.rel : "";
 }
 
 /** 详情卡：纯 Map 数据（作用/职责/结构/依赖/决策），空字段省略行 */
@@ -1452,18 +1490,20 @@ function renderMapPage(entries) {
 	mapEntries = entries;
 	const root = buildMapTree(entries);
 	if (mapFileList.length === 0) {
-		mapTree.innerHTML = "";
-		mapTree.appendChild(el("div", "tree-root", (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目"));
-		mapTree.appendChild(el("div", "tree-empty", "（暂无条目）对话中 agent 读取文件后，记忆 Agent 会累计整理生成项目地图。"));
+		pickerTree.innerHTML = "";
+		pickerTree.appendChild(el("div", "tree-root", (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目"));
+		pickerTree.appendChild(el("div", "tree-empty", "（暂无条目）对话中 agent 读取文件后，记忆 Agent 会累计整理生成项目地图。"));
 		mapDetail.innerHTML = "";
-		mapDetail.appendChild(el("div", "tree-empty", "从左侧选择一个文件查看详情"));
+		mapDetail.appendChild(el("div", "tree-empty", "从卡片中选择一个文件查看详情"));
+		updatePickerCurrent();
 		return;
 	}
 	// 选中态保持：条目失效/消失时回退到第一个文件
 	if (!selectedMapId || !mapFileList.some((f) => f.id === selectedMapId)) {
 		selectedMapId = mapFileList[0].id;
 	}
-	renderTreeDom(root);
+	renderPickerTree(root, pickerSearch.value);
+	updatePickerCurrent();
 	const sel = mapFileList.find((f) => f.id === selectedMapId);
 	renderMapDetail(sel.entry, sel.rel);
 }
@@ -1483,15 +1523,23 @@ async function refreshMap() {
 		const data = await res.json();
 		renderMapPage(data.entries ?? {});
 	} catch {
-		mapTree.innerHTML = "";
-		mapTree.appendChild(el("div", "tree-empty", "debug 服务未连接（扩展未启动？），正在重连…"));
+		pickerTree.innerHTML = "";
+		pickerTree.appendChild(el("div", "tree-empty", "debug 服务未连接（扩展未启动？），正在重连…"));
 		mapDetail.innerHTML = "";
+		updatePickerCurrent();
 	}
 }
 
 function setupMap() {
 	// navMap 点击在 chat ↔ map 视图间切换（会话树常驻侧边栏，无需独立 Conversations 导航）
 	$("#navMap").addEventListener("click", () => setView(mapVisible ? "chat" : "map"));
+
+	// 文件选择器：点击头部展开/折叠，搜索实时过滤
+	pickerHead.addEventListener("click", () => mapPicker.classList.toggle("collapsed"));
+	pickerSearch.addEventListener("input", () => {
+		const root = buildMapTree(mapEntries);
+		renderPickerTree(root, pickerSearch.value);
+	});
 }
 
 /* ================= 项目目录与会话列表 ================= */
