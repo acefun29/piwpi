@@ -367,6 +367,54 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	/**
+	 * 单条消息 → debug 摘要（文本截断，防快照膨胀）。
+	 * onContext（实时快照）与恢复（历史消息）共用，保证结构一致。
+	 */
+	function toDebugSummary(m: unknown): DebugMessageSummary {
+		const mm = m as { role?: string; toolCallId?: unknown; content?: unknown };
+		const content = Array.isArray(mm.content) ? mm.content : [];
+		const text = content
+			.filter(
+				(c): c is { type: string; text?: string } =>
+					typeof c === "object" && c !== null && (c as { type?: string }).type === "text",
+			)
+			.map((c) => c.text ?? "")
+			.join("\n");
+		return {
+			role: mm.role ?? "",
+			toolCallId: typeof mm.toolCallId === "string" ? mm.toolCallId : undefined,
+			hasImage: content.some((c) => (c as { type?: string }).type === "image"),
+			text: text.slice(0, MAX_CONTEXT_TEXT),
+		};
+	}
+
+	/**
+	 * 恢复上下文消息摘要（resume 时从会话 entries 重建 lastContext）。
+	 * 消息已持久化在会话 JSONL（type:"message" 条目），无需单独保存——只读内存 entries 重建，无 IO。
+	 * 空会话不覆盖（保持 null，前端显示"等待第一次 LLM 请求…"）。
+	 */
+	function restoreContextFromEntries(): void {
+		if (!entriesProvider) return;
+		let entries: SessionEntry[];
+		try {
+			entries = entriesProvider();
+		} catch (err) {
+			console.error("[piwpi] restore context error:", err);
+			return;
+		}
+		const messages: DebugMessageSummary[] = [];
+		let toolResultCount = 0;
+		for (const e of entries) {
+			if (e.type !== "message") continue;
+			const summary = toDebugSummary(e.message);
+			if (summary.role === "toolResult") toolResultCount++;
+			messages.push(summary);
+		}
+		if (messages.length === 0) return;
+		lastContext = { ts: Date.now(), messageCount: messages.length, toolResultCount, messages };
+	}
+
+	/**
 	 * 主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
 	 * 引用式：经 file-cache 的 stat 快速通道，文件未变（hash 同）→ 完全跳过，零读盘零渲染。
 	 * 按渐进式队列迭代（挂载文件 + map 条目文件，一次 get 双重校验）：
@@ -976,23 +1024,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					}
 				}
 				// 上下文摘要（debug 服务用）：每条消息文本截断，防快照膨胀
-				const summaries: DebugMessageSummary[] = event.messages.map((m) => {
-					const mm = m as { role?: string; toolCallId?: unknown; content?: unknown };
-					const content = Array.isArray(mm.content) ? mm.content : [];
-					const text = content
-						.filter(
-							(c): c is { type: string; text?: string } =>
-								typeof c === "object" && c !== null && (c as { type?: string }).type === "text",
-						)
-						.map((c) => c.text ?? "")
-						.join("\n");
-					return {
-						role: mm.role ?? "",
-						toolCallId: typeof mm.toolCallId === "string" ? mm.toolCallId : undefined,
-						hasImage: content.some((c) => (c as { type?: string }).type === "image"),
-						text: text.slice(0, MAX_CONTEXT_TEXT),
-					};
-				});
+				const summaries: DebugMessageSummary[] = event.messages.map((m) => toDebugSummary(m));
 				lastContext = {
 					ts: Date.now(),
 					messageCount: event.messages.length,
@@ -1024,7 +1056,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						console.error("[piwpi] project map load error:", err);
 					}
 				}
-				if (event.reason === "resume") await restorePlugins();
+				if (event.reason === "resume") {
+					await restorePlugins();
+					restoreContextFromEntries(); // 消息同样从会话 entries 重建（无单独保存）
+				}
 				emit({ type: "session_start", reason: event.reason });
 			} catch (err) {
 				console.error("[piwpi] onSessionStart error:", err);

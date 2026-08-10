@@ -963,6 +963,8 @@ function setupInput() {
 const drawer = $("#drawer");
 let debugEvents = null;
 let refreshTimer = null;
+let lastDebugRefresh = 0; // 最近一次成功刷新快照的时间戳（兜底轮询基准）
+let drawerIdleTimer = null; // 抽屉打开时的 30s 兜底轮询（SSE 事件丢失时自行拉一次）
 
 function setupDrawer() {
 	const ctxBtn = $("#btnContext");
@@ -973,9 +975,16 @@ function setupDrawer() {
 			requestAnimationFrame(() => drawer.classList.add("open"));
 			ctxBtn.classList.add("open");
 			refreshDebugState();
+			// 兜底：事件驱动为主，仅当 30s 内无任何刷新（事件丢失/断线窗口）才自行拉一次
+			clearInterval(drawerIdleTimer);
+			drawerIdleTimer = setInterval(() => {
+				if (Date.now() - lastDebugRefresh > 30000) refreshDebugState();
+			}, 30000);
 		} else {
 			drawer.classList.remove("open");
 			ctxBtn.classList.remove("open");
+			clearInterval(drawerIdleTimer);
+			drawerIdleTimer = null;
 			setTimeout(() => (drawer.hidden = true), 220);
 		}
 	});
@@ -1004,7 +1013,9 @@ function connectDebugEvents() {
 		}
 	});
 	debugEvents.onopen = () => {
-		if (drawer.hidden) refreshDebugState();
+		// 重连成功一律补拉快照（抽屉开着也要：断线窗口内的 restore/context 事件已丢失，
+		// 不补拉就会一直停在旧状态，直到手动开关抽屉）
+		refreshDebugState();
 		// debug 服务晚启动：重连成功后补刷新 map 页（此前可能停在"未连接"错误态）
 		if (mapVisible) refreshMap();
 	};
@@ -1042,6 +1053,7 @@ async function refreshDebugState() {
 		if (state.cwd) debugCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
 		renderPlugins(state.plugins ?? []);
 		renderContext(state.context);
+		lastDebugRefresh = Date.now(); // 刷新成功即重置兜底计时
 	} catch {
 		$("#ctxBadge").textContent = "!";
 	}
@@ -1068,7 +1080,10 @@ function renderPlugins(plugins) {
 			const chip = el("span", "hash-chip", `#${String(meta.hash).slice(0, 8)}`);
 			metaRow.appendChild(chip);
 		}
-		if (meta.anchorToolCallId) metaRow.appendChild(el("span", null, `锚点 ${meta.anchorToolCallId}`));
+		if (meta.anchorToolCallId) {
+			const shortId = String(meta.anchorToolCallId).replace(/^call_/, "").slice(0, 8);
+			metaRow.appendChild(el("span", null, `锚点 ${shortId}`));
+		}
 		if (meta.truncatedNote) metaRow.appendChild(el("span", null, "⚠ 已截段"));
 		if (p.category) metaRow.appendChild(el("span", null, p.category));
 		card.appendChild(metaRow);
@@ -1287,22 +1302,163 @@ function setupCtxRing() {
   scheduleCtxRingRefresh(); // 页面加载即拉一次
 }
 
-function renderContext(ctx) {
+const CTX_PAGE_SIZE = 18;
+let contextMessages = [];
+let contextQuery = "";
+let contextFilter = "all";
+let contextPage = 1;
+let contextFollowLatest = true;
+let contextDetailIndex = -1;
+
+function contextRoleName(message) {
+	if (message.role === "toolResult") return "工具";
+	if (message.role === "user") return "用户";
+	if (message.role === "assistant") return "助手";
+	return message.role || "消息";
+}
+
+function contextRoleClass(message) {
+	if (message.role === "toolResult") return "tool";
+	if (message.role === "user") return "user";
+	if (message.role === "assistant") return "assistant";
+	return "other";
+}
+
+function contextMessageText(message) {
+	return message.text || (message.hasImage ? "[图片]" : "");
+}
+
+function filteredContextMessages() {
+	const query = contextQuery.toLocaleLowerCase();
+	return contextMessages
+		.map((message, index) => ({ message, index }))
+		.filter(({ message }) => {
+			if (contextFilter !== "all" && message.role !== contextFilter) return false;
+			if (!query) return true;
+			const haystack = `${message.role} ${message.toolCallId ?? ""} ${contextMessageText(message)}`.toLocaleLowerCase();
+			return haystack.includes(query);
+		});
+}
+
+function contextPageTotal(matches) {
+	return Math.max(1, Math.ceil(matches.length / CTX_PAGE_SIZE));
+}
+
+function renderContextDetail(index) {
+	const message = contextMessages[index];
+	if (!message) return;
+	$("#ctxDetailIndex").textContent = `消息 #${index + 1}`;
+	$("#ctxDetailRole").textContent = contextRoleName(message);
+	$("#ctxDetailMeta").textContent = message.toolCallId ? `工具 ID · ${message.toolCallId}` : "上下文原文摘要";
+	$("#ctxDetailText").textContent = contextMessageText(message) || "（无文本内容）";
+}
+
+function openContextDetail(index) {
+	contextDetailIndex = index;
+	renderContextDetail(index);
+	$("#ctxDetail").hidden = false;
+	renderContextIndex();
+}
+
+function closeContextDetail() {
+	contextDetailIndex = -1;
+	$("#ctxDetail").hidden = true;
+}
+
+function renderContextIndex() {
 	const list = $("#ctxList");
+	const matches = filteredContextMessages();
+	const totalPages = contextPageTotal(matches);
+	if (contextFollowLatest) contextPage = totalPages;
+	contextPage = Math.min(Math.max(contextPage, 1), totalPages);
+
+	const start = (contextPage - 1) * CTX_PAGE_SIZE;
+	const pageMatches = matches.slice(start, start + CTX_PAGE_SIZE);
+	const end = start + pageMatches.length;
+	$("#ctxPageTotal").textContent = String(totalPages);
+	$("#ctxPageInput").value = String(contextPage);
+	$("#ctxPageInput").max = String(totalPages);
+	$("#ctxPrev").disabled = contextPage <= 1;
+	$("#ctxNext").disabled = contextPage >= totalPages;
+	$("#ctxRange").textContent = matches.length > 0 ? `${start + 1}–${end} / ${matches.length}` : "0 条结果";
+	$("#ctxMatchCount").textContent = contextQuery || contextFilter !== "all" ? `${matches.length} 条匹配` : "";
+
 	list.innerHTML = "";
-	if (!ctx) {
-		$("#msgCount").textContent = "0";
-		$("#ctxMeta").textContent = "等待第一次 LLM 请求…";
+	if (pageMatches.length === 0) {
+		list.appendChild(el("div", "drawer-empty", contextMessages.length ? "没有匹配的消息" : "暂无上下文消息"));
 		return;
 	}
-	$("#msgCount").textContent = String(ctx.messageCount ?? 0);
-	$("#ctxMeta").textContent = `最近刷新 ${new Date(ctx.ts).toLocaleTimeString("zh-CN", { hour12: false })} · ${ctx.messageCount} 条消息 · ${ctx.toolResultCount} 条工具结果`;
-	for (const m of ctx.messages ?? []) {
-		const item = el("div", `ctx-msg role-${m.role}`);
-		const roleText = m.role === "toolResult" ? `toolResult ${m.toolCallId ?? ""}` : m.role;
-		item.appendChild(el("div", "m-role", roleText));
-		item.appendChild(el("div", "m-text", m.text ?? (m.hasImage ? "[图片]" : "")));
-		list.appendChild(item);
+
+	for (const { message, index } of pageMatches) {
+		const row = el("button", `ctx-index-row ctx-role-${contextRoleClass(message)}`);
+		row.type = "button";
+		row.classList.toggle("selected", index === contextDetailIndex);
+		row.title = contextMessageText(message) || "（无文本内容）";
+		row.appendChild(el("span", "ctx-index-no", `#${String(index + 1).padStart(3, "0")}`));
+		row.appendChild(el("span", "ctx-role-dot"));
+		row.appendChild(el("span", "ctx-index-role", contextRoleName(message)));
+		const preview = contextMessageText(message).replace(/\s+/g, " ").trim() || "（无文本内容）";
+		row.appendChild(el("span", "ctx-index-preview", preview));
+		if (message.toolCallId) {
+			row.appendChild(el("span", "ctx-index-id", String(message.toolCallId).replace(/^call_/, "").slice(0, 7)));
+		}
+		row.addEventListener("click", () => openContextDetail(index));
+		list.appendChild(row);
+	}
+}
+
+function moveContextPage(delta) {
+	const totalPages = contextPageTotal(filteredContextMessages());
+	contextPage = Math.min(Math.max(contextPage + delta, 1), totalPages);
+	contextFollowLatest = contextPage === totalPages;
+	renderContextIndex();
+}
+
+function setupContextNavigator() {
+	$("#ctxSearch").addEventListener("input", (event) => {
+		contextQuery = event.target.value.trim();
+		contextPage = 1;
+		contextFollowLatest = false;
+		renderContextIndex();
+	});
+	$("#ctxFilter").addEventListener("change", (event) => {
+		contextFilter = event.target.value;
+		contextPage = 1;
+		contextFollowLatest = false;
+		renderContextIndex();
+	});
+	$("#ctxPrev").addEventListener("click", () => moveContextPage(-1));
+	$("#ctxNext").addEventListener("click", () => moveContextPage(1));
+	$("#ctxPageInput").addEventListener("change", (event) => {
+		const totalPages = contextPageTotal(filteredContextMessages());
+		const requested = Number.parseInt(event.target.value, 10);
+		contextPage = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), totalPages) : 1;
+		contextFollowLatest = contextPage === totalPages;
+		renderContextIndex();
+	});
+	$("#ctxDetailClose").addEventListener("click", closeContextDetail);
+}
+
+function renderContext(ctx) {
+	const hadMessages = contextMessages.length > 0;
+	if (!ctx) {
+		contextMessages = [];
+		contextPage = 1;
+		contextFollowLatest = true;
+		$("#msgCount").textContent = "0";
+		$("#ctxMeta").textContent = "等待第一次 LLM 请求…";
+		closeContextDetail();
+		renderContextIndex();
+		return;
+	}
+	contextMessages = Array.isArray(ctx.messages) ? ctx.messages : [];
+	if (!hadMessages && contextMessages.length > 0) contextFollowLatest = true;
+	$("#msgCount").textContent = String(ctx.messageCount ?? contextMessages.length);
+	$("#ctxMeta").textContent = `刷新 ${new Date(ctx.ts).toLocaleTimeString("zh-CN", { hour12: false })} · ${ctx.toolResultCount ?? 0} 条工具结果`;
+	renderContextIndex();
+	if (!$("#ctxDetail").hidden && contextDetailIndex >= 0) {
+		if (contextMessages[contextDetailIndex]) renderContextDetail(contextDetailIndex);
+		else closeContextDetail();
 	}
 }
 
@@ -1839,6 +1995,7 @@ chatFlow.addEventListener("click", async (e) => {
 connectEvents();
 setupInput();
 setupDrawer();
+setupContextNavigator();
 setupCtxRing();
 setupMap();
 setupProject();

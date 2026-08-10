@@ -120,19 +120,65 @@
   <!-- ===== Context 抽屉 ===== -->
   <aside class="drawer" id="drawer" hidden>
     <div class="drawer-head">
-      <span class="drawer-title">Current Context</span>
+      <div class="drawer-heading">
+        <span class="drawer-title">Current Context</span>
+        <span class="drawer-kicker">实时索引</span>
+      </div>
     </div>
 
     <div class="drawer-scroll">
-      <div class="drawer-label">已挂载文件 <span class="drawer-count" id="fileCount">0</span></div>
-      <div id="fileList" class="drawer-group"><div class="drawer-empty">暂无挂载</div></div>
+      <section class="ctx-section ctx-files-section">
+        <div class="drawer-label">已挂载文件 <span class="drawer-count" id="fileCount">0</span></div>
+        <div id="fileList" class="drawer-group"><div class="drawer-empty">暂无挂载</div></div>
+      </section>
 
-      <div class="drawer-label">上下文消息 <span class="drawer-count" id="msgCount">0</span></div>
-      <div class="drawer-meta" id="ctxMeta">等待第一次 LLM 请求…</div>
-      <div id="ctxList" class="drawer-group"></div>
+      <section class="ctx-section ctx-messages-section">
+        <div class="ctx-section-head">
+          <div class="drawer-label">上下文消息 <span class="drawer-count" id="msgCount">0</span></div>
+          <span class="ctx-match-count" id="ctxMatchCount"></span>
+        </div>
+        <div class="ctx-toolbar">
+          <label class="ctx-search" for="ctxSearch">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 10L13 13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+            <input id="ctxSearch" type="search" placeholder="搜索消息或工具 ID…" autocomplete="off">
+          </label>
+          <select id="ctxFilter" class="ctx-filter" aria-label="消息类型">
+            <option value="all">全部</option>
+            <option value="user">用户</option>
+            <option value="assistant">助手</option>
+            <option value="toolResult">工具</option>
+          </select>
+        </div>
+        <div class="ctx-meta-row">
+          <div class="drawer-meta" id="ctxMeta">等待第一次 LLM 请求…</div>
+          <div class="ctx-range" id="ctxRange"></div>
+        </div>
+        <div id="ctxList" class="drawer-group ctx-index"></div>
+        <div class="ctx-pager" aria-label="消息分页">
+          <button id="ctxPrev" class="ctx-page-btn" type="button" aria-label="上一页">上一页</button>
+          <label class="ctx-page-number"><input id="ctxPageInput" type="number" min="1" value="1" aria-label="页码"><span>/</span><span id="ctxPageTotal">1</span></label>
+          <button id="ctxNext" class="ctx-page-btn" type="button" aria-label="下一页">下一页</button>
+        </div>
+      </section>
 
-      <div class="drawer-label">实时事件</div>
-      <div id="eventList" class="drawer-group event-log"></div>
+      <details class="ctx-events-section">
+        <summary class="drawer-label">实时事件 <span class="ctx-event-hint">默认收起</span></summary>
+        <div id="eventList" class="drawer-group event-log"></div>
+      </details>
+    </div>
+
+    <div class="ctx-detail" id="ctxDetail" hidden>
+      <div class="ctx-detail-head">
+        <div class="ctx-detail-heading">
+          <span id="ctxDetailIndex" class="ctx-detail-index"></span>
+          <span id="ctxDetailRole" class="ctx-detail-role"></span>
+        </div>
+        <button id="ctxDetailClose" class="icon-btn" type="button" title="返回消息索引" aria-label="返回消息索引">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 3.5L5.5 8L10 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div id="ctxDetailMeta" class="ctx-detail-meta"></div>
+      <pre id="ctxDetailText" class="ctx-detail-text"></pre>
     </div>
   </aside>
 

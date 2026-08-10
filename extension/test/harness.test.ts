@@ -771,6 +771,60 @@ describe("M5 §6.4：session_start 恢复", () => {
 		expect(sourceMeta(store.get(fileId(absFile))!).segments).toEqual([{ start: 20, end: 40 }]);
 	});
 
+	it("resume：从会话 message entries 恢复上下文消息（无需单独保存，与插件同机制）", async () => {
+		const longText = "x".repeat(500);
+		const entries = [
+			{ type: "message", id: "m1", message: { role: "user", content: [{ type: "text", text: "你好" }] } },
+			{
+				type: "message",
+				id: "m2",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: longText }, { type: "image", image: "x" }],
+				},
+			},
+			{
+				type: "message",
+				id: "m3",
+				message: {
+					role: "toolResult",
+					toolCallId: "t1",
+					content: [{ type: "text", text: "ok" }],
+				},
+			},
+		] as unknown as SessionEntry[];
+		const h = createHarness({ store: new PluginStore(), entriesProvider: () => entries });
+
+		await h.onSessionStart({ type: "session_start", reason: "resume" } as never, ctx());
+		const ctxSnap = h.snapshot().context;
+		expect(ctxSnap).not.toBeNull();
+		expect(ctxSnap!.messageCount).toBe(3);
+		expect(ctxSnap!.toolResultCount).toBe(1);
+		expect(ctxSnap!.messages[0]).toEqual({ role: "user", text: "你好", hasImage: false, toolCallId: undefined });
+		expect(ctxSnap!.messages[1]).toEqual({
+			role: "assistant",
+			hasImage: true,
+			toolCallId: undefined,
+			text: longText.slice(0, 300),
+		}); // 截断到 MAX_CONTEXT_TEXT
+		expect(ctxSnap!.messages[2]).toEqual({ role: "toolResult", toolCallId: "t1", text: "ok", hasImage: false });
+	});
+
+	it("resume 但会话无消息：lastContext 保持 null（前端显示等待首次 LLM 请求）", async () => {
+		const h = createHarness({ store: new PluginStore(), entriesProvider: () => [] });
+		await h.onSessionStart({ type: "session_start", reason: "resume" } as never, ctx());
+		expect(h.snapshot().context).toBeNull();
+	});
+
+	it("startup（非 resume）：不恢复消息", async () => {
+		const entries = [
+			{ type: "message", id: "m1", message: { role: "user", content: [{ type: "text", text: "你好" }] } },
+		] as unknown as SessionEntry[];
+		const h = createHarness({ store: new PluginStore(), entriesProvider: () => entries });
+		await h.onSessionStart({ type: "session_start", reason: "startup" } as never, ctx());
+		expect(h.snapshot().context).toBeNull();
+	});
+
 	it("startup（非 resume）：不恢复", async () => {
 		write80Lines();
 		const store = new PluginStore();

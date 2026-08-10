@@ -20,17 +20,26 @@ import { dataDirFor } from "./src/memory/persist.ts";
  * 调试观测服务（可选）：设置环境变量 PIWPI_DEBUG_PORT=<port> 后监听 127.0.0.1，
  * HTTP 快照 + SSE 实时事件，接口文档见 extension/docs/debug-api.md。
  */
-export default async function (pi: ExtensionAPI): Promise<void> {
+	export default async function (pi: ExtensionAPI): Promise<void> {
 	let debugServer: DebugServer | undefined;
 	const harness = createHarness({ onEvent: (event) => debugServer?.handleEvent(event) });
 
 	const debugPort = parseDebugPort(process.env.PIWPI_DEBUG_PORT);
 	if (debugPort) {
-		try {
-			debugServer = await createDebugServer(harness, debugPort);
-			console.log(`[piwpi] debug server listening on http://127.0.0.1:${debugServer.port} (PIWPI_DEBUG_PORT)`);
-		} catch (err) {
-			console.error("[piwpi] debug server failed to start:", err);
+		// 旧实例的 server 在 session_shutdown 时 close()，但端口要等 SSE 连接真正关闭才释放；
+		// 新实例（会话切换时 factory 重跑）立即绑定会 EADDRINUSE → 短延迟退避重试（不阻塞主流程）
+		for (let attempt = 0; attempt < 20; attempt++) {
+			try {
+				debugServer = await createDebugServer(harness, debugPort);
+				console.log(`[piwpi] debug server listening on http://127.0.0.1:${debugServer.port} (PIWPI_DEBUG_PORT)`);
+				break;
+			} catch (err) {
+				if (attempt === 19) {
+					console.error("[piwpi] debug server failed to start:", err);
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 100));
+			}
 		}
 	}
 

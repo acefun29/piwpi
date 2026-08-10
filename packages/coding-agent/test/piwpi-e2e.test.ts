@@ -30,10 +30,7 @@ function fileLines(n: number): string {
 
 function textOf(msg: { content: unknown[] }): string {
 	return msg.content
-		.filter(
-			(c): c is TextContent =>
-				typeof c === "object" && c !== null && (c as { type?: string }).type === "text",
-		)
+		.filter((c): c is TextContent => typeof c === "object" && c !== null && (c as { type?: string }).type === "text")
 		.map((c) => c.text)
 		.join("\n");
 }
@@ -124,9 +121,7 @@ describe("piwpi e2e（计划 §7.2 验收）", () => {
 });
 
 describe("piwpi e2e（计划 §7.3 token 对比实验，红线）", () => {
-	async function runScenario(
-		withPiwpi: boolean,
-	): Promise<{ requestBytesFromSecond: number; total: number }> {
+	async function runScenario(withPiwpi: boolean): Promise<{ requestBytesFromSecond: number; total: number }> {
 		const responses = [
 			{ toolCalls: [{ name: "read", args: { path: "a.ts", offset: 1, limit: 2000 } }] },
 			{ toolCalls: [{ name: "read", args: { path: "a.ts", offset: 1, limit: 2000 } }] },
