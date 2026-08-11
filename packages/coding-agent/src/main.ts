@@ -664,6 +664,8 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+	let reusableModelRuntime: ModelRuntime | undefined;
+	let reusableModelRuntimeCwd: string | undefined;
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -686,6 +688,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
+			modelRuntime: reusableModelRuntimeCwd === cwd ? reusableModelRuntime : undefined,
 			settingsManager: runtimeSettingsManager,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
@@ -727,6 +730,8 @@ export async function main(args: string[], options?: MainOptions) {
 				extensionFactories,
 			},
 		});
+		reusableModelRuntime = services.modelRuntime;
+		reusableModelRuntimeCwd = cwd;
 		const { settingsManager, modelRuntime, resourceLoader } = services;
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,

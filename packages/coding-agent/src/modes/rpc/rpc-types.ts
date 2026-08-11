@@ -35,6 +35,10 @@ export type RpcCommand =
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model" }
 	| { id?: string; type: "get_available_models" }
+	| { id?: string; type: "get_provider_catalog" }
+	| { id?: string; type: "set_provider_api_key"; provider: string; apiKey: string }
+	| { id?: string; type: "remove_provider_api_key"; provider: string }
+	| { id?: string; type: "reload_models" }
 
 	// Thinking
 	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
@@ -114,6 +118,19 @@ export interface RpcSessionState {
 	collaborationMode: CollaborationMode;
 }
 
+export interface RpcProviderCatalogEntry {
+	id: string;
+	name: string;
+	api?: string;
+	baseUrl?: string;
+	apiKeyLogin: boolean;
+	apiKeyName?: string;
+	configured: boolean;
+	authSource?: string;
+	authLabel?: string;
+	models: Model<any>[];
+}
+
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
@@ -151,6 +168,22 @@ export type RpcResponse =
 			id?: string;
 			type: "response";
 			command: "get_available_models";
+			success: true;
+			data: { models: Model<any>[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_provider_catalog";
+			success: true;
+			data: { providers: RpcProviderCatalogEntry[] };
+	  }
+	| { id?: string; type: "response"; command: "set_provider_api_key"; success: true }
+	| { id?: string; type: "response"; command: "remove_provider_api_key"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "reload_models";
 			success: true;
 			data: { models: Model<any>[] };
 	  }

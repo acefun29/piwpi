@@ -11,6 +11,7 @@ Electron 主进程 (electron/main.mjs)
        │    ├─ 静态托管 web/
        │    ├─ POST /api/rpc    → 命令写入 pi stdin（JSONL）
        │    ├─ GET  /api/events → SSE 转发 pi stdout（事件 + 响应）
+       │    ├─ /api/providers   → 自定义供应商配置与真实模型发现
        │    └─ GET  /debug/*    → 反代 piwpi 扩展 debug 服务 (127.0.0.1:8787)
        └─ spawn pi --mode rpc -e <extension> --session-dir <项目>/.piwpi/sessions
             env: PIWPI_DEBUG_PORT=8787, ELECTRON_RUN_AS_NODE=1（Electron 下必须）
@@ -98,9 +99,26 @@ npm run dev:web    # node server/bridge.mjs
 | `PIWPI_DATA_DIR` | `<项目>/.piwpi` | 扩展数据目录覆盖（project map 落盘处） |
 | `PIWPI_PI_CLI` | extension/node_modules 内（symlink → packages/coding-agent） | pi-coding-agent dist/cli.js 路径 |
 | `PIWPI_EXT` | ../pi/extension | piwpi 扩展路径 |
-| `PIWPI_PI_ARGS` | `--model deepseek/deepseek-v4-flash` | 额外 pi 参数（默认固定用 DeepSeek；换模型/加参数用此覆盖） |
+| `PIWPI_PI_ARGS` | `--offline --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document` | 额外 pi 参数；桌面端不硬编码默认模型，并关闭启动阶段的后台模型目录网络刷新 |
 
-> 默认模型固定为 DeepSeek（`deepseek/deepseek-v4-flash`）。如需换回 OpenAI 系：先把本地网关（`OPENAI_BASE_URL` 指向的服务，如 localhost:8080）启动，再设 `PIWPI_PI_ARGS=--model openai/gpt-5.5`。
+## 模型供应商
+
+桌面端直接展示 pi `ModelRuntime` 的完整供应商和模型目录，不再单独维护内置供应商副本。支持交互式 API Key 登录的供应商可直接在页面保存凭据；其他供应商仍会展示，并标明需要由 pi 的环境凭据或 OAuth 流程配置。未选择模型时发送按钮不可用。
+
+其他服务通过四种接口类型接入：`openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`。自定义供应商支持从服务端模型接口真实发现模型，也支持手动填写模型 ID。
+
+- API Key 由 pi 的凭据运行时写入全局 `~/.pi/agent/auth.json`，不会写入 `models.json`、localStorage、日志或 HTTP 响应。
+- 自定义供应商写入全局 `~/.pi/agent/models.json`，ID 使用 `piwpi-custom-<uuid>`；读写时保留该文件中的其他供应商。
+- 当前只支持 API Key，不包含 OAuth、自定义请求头、无密钥本地服务、回退或重试配置。
+
+## 性能
+
+- 桌面端默认以 `--offline` 启动 pi，避免 RPC 就绪后立即触发后台模型目录网络刷新；正常模型请求不受影响。
+- pi 子进程启用 Node 编译缓存，降低重复启动时的大型模块解析开销。
+- 同一项目内切换会话会复用 pi 的模型运行时，扩展没有注册供应商时不再重复刷新完整供应商鉴权状态。
+- 会话列表摘要按文件修改时间和大小缓存，并且最多读取前 2000 行，不再为侧边栏反复读取完整 JSONL。
+- 历史消息首次显示后再分批执行代码高亮，并使用浏览器内容可见性跳过屏幕外消息布局。
+- Windows 使用隐藏系统标题栏和原生窗口控制叠层，页面提供 40px 可拖动应用标题栏。
 
 ## 测试
 
@@ -118,7 +136,7 @@ node scripts/e2e-chat.mjs   # 真实对话 E2E（会消耗 LLM 额度）
 - [x] Project Map 页（目录树 + 详情卡；数据走 /debug/project-map + SSE 增量刷新）
 - [x] 项目目录选择与切换（原生目录选择对话框 + switch_project 运行中切换；数据持久化到 `<项目>/.piwpi/`）
 - [x] 侧边栏会话树（项目 → 会话层级；当前项目全部历史、当前会话高亮、点击恢复、行内删除）
-- [ ] 模型切换 UI（默认已固定 deepseek-v4-flash，切换走 `PIWPI_PI_ARGS=--model ...`）
+- [x] 模型供应商管理与模型切换（pi 完整目录 + 4 种自定义接口类型）
 
 ## 测试
 

@@ -4,6 +4,8 @@
  * - 上下文占用：通过 /debug/* 获取快照，随会话事件主动刷新
  */
 
+if (window.desktopShell) document.body.classList.add("desktop-shell");
+
 /* ================= 工具函数 ================= */
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -115,6 +117,7 @@ function finalizeMd(a) {
 let reqSeq = 0;
 const pending = new Map(); // id -> {resolve, timer}
 let piConnected = false;
+let currentModel = null;
 
 async function rpcRaw(cmd) {
 	const res = await fetch("/api/rpc", {
@@ -150,6 +153,8 @@ let streaming = false;
 let collaborationMode = "default";
 let currentAssistant = null; // { root, blocks: Map<contentIndex, block>, order: [] }
 const toolCards = new Map(); // toolCallId -> card refs
+let historyRebuilding = false;
+let historyHighlightGeneration = 0;
 
 function nearBottom() {
 	return chatFlow.scrollHeight - chatFlow.scrollTop - chatFlow.clientHeight < 120;
@@ -168,7 +173,7 @@ function addUserMsg(text, queued) {
 	const m = el("div", "msg user", text);
 	if (queued) m.appendChild(el("span", "queued-tag", "已排队，将在本轮结束后发送"));
 	msgCol.appendChild(m);
-	scrollBottom(true);
+	if (!historyRebuilding) scrollBottom(true);
 }
 
 function beginAssistant() {
@@ -180,7 +185,26 @@ function beginAssistant() {
 	root.style.gap = "12px";
 	msgCol.appendChild(root);
 	currentAssistant = { root, blocks: new Map() };
-	scrollBottom(true);
+	if (!historyRebuilding) scrollBottom(true);
+}
+
+function scheduleHistoryHighlight() {
+	if (!hljs) return;
+	const generation = ++historyHighlightGeneration;
+	const codeBlocks = [...msgCol.querySelectorAll("pre code:not([data-highlighted])")];
+	let index = 0;
+	const run = (deadline) => {
+		if (generation !== historyHighlightGeneration) return;
+		while (index < codeBlocks.length && (!deadline || deadline.timeRemaining() > 2)) {
+			hljs.highlightElement(codeBlocks[index++]);
+		}
+		if (index < codeBlocks.length) {
+			if (window.requestIdleCallback) window.requestIdleCallback(run);
+			else setTimeout(() => run(), 16);
+		}
+	};
+	if (window.requestIdleCallback) window.requestIdleCallback(run);
+	else setTimeout(() => run(), 16);
 }
 
 function ensureAssistant() {
@@ -316,9 +340,19 @@ function updateActionBtn() {
 	const on = streaming;
 	const btn = $("#btnAction");
 	btn.classList.toggle("streaming", on);
-	btn.title = on ? "中断" : "发送";
+	btn.disabled = !on && !currentModel;
+	btn.title = on ? "中断" : currentModel ? "发送" : "请先配置并选择模型";
 	$("#modeSel").disabled = on;
 	if (!on) hideRunning();
+}
+
+function setCurrentModel(model) {
+	currentModel = model ?? null;
+	const label = currentModel ? (currentModel.name ?? currentModel.id) : "未选择模型";
+	$("#modelName").textContent = label;
+	$("#modelPickerBtn").textContent = label;
+	document.title = `piwpi${currentModel ? ` · ${currentModel.id}` : ""}`;
+	updateActionBtn();
 }
 
 /* ================= pi 事件分发 ================= */
@@ -341,7 +375,7 @@ function dispatch(evt) {
 			showRunning("正在思考…");
 			return;
 		case "turn_start":
-			if (streaming) showRunning("正在执行…");
+			// turn_start 是一次模型推理轮次，不代表工具正在执行。
 			return;
 		case "agent_settled":
 			setStreaming(false);
@@ -413,7 +447,7 @@ function dispatch(evt) {
 				setToolStatus(refs, evt.isError ? "error" : "done");
 				fillToolDetail(refs, refs.args, toolResultText(evt.result), evt.isError);
 			}
-			if (streaming) showRunning("执行完成，继续处理…");
+			if (streaming) showRunning("执行完成，继续思考…");
 			scheduleContextUsageRefresh(); // toolResult 已入上下文
 			return;
 		}
@@ -658,8 +692,7 @@ async function initSession() {
 		]);
 		if (stateRes.success) {
 			const d = stateRes.data;
-			$("#modelName").textContent = d.model ? `${d.model.name ?? d.model.id}` : "未选择模型";
-			document.title = `piwpi · ${d.model?.id ?? ""}`;
+			setCurrentModel(d.model);
 			if (typeof d.sessionFile === "string") currentSessionFile = d.sessionFile;
 			setupModePicker(d.collaborationMode ?? "default");
 			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], d.thinkingLevel);
@@ -721,6 +754,16 @@ function setupThinkingPicker(levels, current) {
 			toast(`切换失败：${err.message}`, "error");
 		}
 	};
+}
+
+async function refreshThinkingPicker() {
+	const [stateResult, levelsResult] = await Promise.all([
+		rpc({ type: "get_state" }, 30000),
+		rpc({ type: "get_available_thinking_levels" }, 30000),
+	]);
+	if (!stateResult.success) throw new Error(stateResult.error);
+	if (!levelsResult.success) throw new Error(levelsResult.error);
+	setupThinkingPicker(levelsResult.data.levels, stateResult.data.thinkingLevel);
 }
 
 function setModePicker(mode) {
@@ -831,6 +874,8 @@ function renderPlanArtifact(blk) {
 /** 从历史消息重建对话（role: user / assistant / toolResult / bashExecution） */
 function rebuildHistory(messages) {
 	toolCards.clear();
+	historyRebuilding = true;
+	msgCol.hidden = true;
 	for (const m of messages) {
 		if (m.role === "user") {
 			const texts = [];
@@ -862,7 +907,7 @@ function rebuildHistory(messages) {
 						appendPlanActions(planCard);
 						hasInteractivePlan = true;
 					} else if (!planCard) {
-						mdRender(blk, { highlight: true }); // 历史消息：先挂载再渲染
+						mdRender(blk);
 					}
 				} else if (c.type === "thinking") {
 					const blk = blockThinking();
@@ -870,7 +915,7 @@ function rebuildHistory(messages) {
 					blk.text = c.thinking ?? "";
 					a.blocks.set(i, blk);
 					a.root.appendChild(blk.node);
-					mdRender(blk, { highlight: true });
+					mdRender(blk);
 				} else if (c.type === "toolCall") {
 					const blk = blockToolCall(c.id, c.name, c.arguments);
 					a.blocks.set(i, blk);
@@ -902,7 +947,10 @@ function rebuildHistory(messages) {
 			currentAssistant = null;
 		}
 	}
+	msgCol.hidden = false;
+	historyRebuilding = false;
 	scrollBottom(true);
+	scheduleHistoryHighlight();
 }
 
 /* ================= 发送 / 中断 / 新建 ================= */
@@ -910,6 +958,11 @@ async function sendMessage() {
 	const box = $("#inputBox");
 	const text = box.value.trim();
 	if (!text) return;
+	if (!currentModel) {
+		setView("providers");
+		toast("请先配置并选择模型", "warn");
+		return;
+	}
 	box.value = "";
 	autoGrow(box);
 	const cmd = streaming
@@ -1350,6 +1403,391 @@ function renderContext(ctx) {
 	if (!$("#ctxAllViewer").hidden) renderContextViewer();
 }
 
+/* ================= 模型供应商 ================= */
+const API_TYPE_LABELS = {
+	"openai-completions": "OpenAI Chat Completions",
+	"openai-responses": "OpenAI Responses",
+	"anthropic-messages": "Anthropic Messages",
+	"google-generative-ai": "Google Generative AI",
+};
+let providerConfiguration = { builtins: [], custom: [] };
+let providerCatalog = new Map();
+let selectedProviderId = "openai";
+
+async function jsonRequest(url, options) {
+	const response = await fetch(url, options);
+	const data = await response.json();
+	if (!response.ok || data.ok === false) throw new Error(data.error ?? `HTTP ${response.status}`);
+	return data;
+}
+
+function providerField(label, input) {
+	const field = el("label", "provider-field");
+	field.append(el("span", null, label), input);
+	return field;
+}
+
+function providerButton(text, className = "secondary-btn") {
+	const button = el("button", className, text);
+	button.type = "button";
+	return button;
+}
+
+async function refreshProviderState() {
+	try {
+		const [configuration, catalogResult] = await Promise.all([
+			jsonRequest("/api/providers"),
+			rpc({ type: "get_provider_catalog" }, 90000),
+		]);
+		if (!catalogResult.success) throw new Error(catalogResult.error);
+		providerCatalog = new Map(catalogResult.data.providers.map((provider) => [provider.id, provider]));
+		const customIds = new Set(configuration.custom.map((provider) => provider.id));
+		providerConfiguration = {
+			builtins: catalogResult.data.providers.filter((provider) => !customIds.has(provider.id)),
+			custom: configuration.custom,
+		};
+		const known = [...providerConfiguration.builtins, ...providerConfiguration.custom].some((provider) => provider.id === selectedProviderId);
+		if (!known && selectedProviderId !== "__new__") selectedProviderId = providerConfiguration.builtins[0]?.id ?? "__new__";
+		renderProviderList();
+		renderProviderDetail();
+		if (!$("#modelMenu").hidden) renderModelMenu();
+	} catch (err) {
+		$("#providerDetail").innerHTML = "";
+		$("#providerDetail").appendChild(el("div", "provider-empty", `加载失败：${err.message}`));
+		toast(`供应商加载失败：${err.message}`, "error", 8000);
+	}
+}
+
+function renderProviderList() {
+	const list = $("#providerList");
+	list.innerHTML = "";
+	const appendGroup = (title, providers) => {
+		if (providers.length === 0) return;
+		list.appendChild(el("div", "provider-list-title", title));
+		for (const provider of providers) {
+			const item = el("button", "provider-item");
+			item.type = "button";
+			item.classList.toggle("selected", selectedProviderId === provider.id);
+			const status = providerCatalog.get(provider.id);
+			const statusNode = el("span", `provider-status${status?.configured ? " on" : ""}`, status?.configured ? "已配置" : "未配置");
+			item.append(el("span", null, provider.name), statusNode);
+			item.addEventListener("click", () => {
+				selectedProviderId = provider.id;
+				renderProviderList();
+				renderProviderDetail();
+			});
+			list.appendChild(item);
+		}
+	};
+	const configured = [...providerConfiguration.builtins, ...providerConfiguration.custom]
+		.filter((provider) => providerCatalog.get(provider.id)?.configured);
+	const unconfiguredBuiltins = providerConfiguration.builtins
+		.filter((provider) => !providerCatalog.get(provider.id)?.configured);
+	const unconfiguredCustom = providerConfiguration.custom
+		.filter((provider) => !providerCatalog.get(provider.id)?.configured);
+	appendGroup("已配置", configured);
+	appendGroup("pi 供应商目录", unconfiguredBuiltins);
+	appendGroup("自定义供应商", unconfiguredCustom);
+}
+
+function renderProviderDetail() {
+	if (selectedProviderId === "__new__") {
+		renderCustomProviderForm(null);
+		return;
+	}
+	const builtin = providerConfiguration.builtins.find((provider) => provider.id === selectedProviderId);
+	if (builtin) {
+		renderBuiltinProvider(builtin);
+		return;
+	}
+	const custom = providerConfiguration.custom.find((provider) => provider.id === selectedProviderId);
+	if (custom) renderCustomProviderForm(custom);
+}
+
+function renderBuiltinProvider(provider) {
+	const detail = $("#providerDetail");
+	detail.innerHTML = "";
+	const form = el("div", "provider-form");
+	form.append(el("h2", null, provider.name));
+	const status = providerCatalog.get(provider.id);
+	const statusText = status?.configured
+		? `已配置${status.authLabel ? ` · ${status.authLabel}` : ""}`
+		: provider.apiKeyLogin
+			? "使用 API Key 连接此供应商。"
+			: "此供应商由 pi 管理，但没有可交互的 API Key 登录入口。";
+	form.append(el("div", "form-note", statusText));
+	const type = el("input");
+	type.value = API_TYPE_LABELS[provider.api] ?? provider.api ?? "由 pi 供应商实现决定";
+	type.readOnly = true;
+	const base = el("input");
+	base.value = provider.baseUrl ?? "由 pi 供应商运行时决定";
+	base.readOnly = true;
+	const key = el("input");
+	key.type = "password";
+	key.placeholder = status?.configured ? "输入新 Key 可替换现有凭据" : (provider.apiKeyName ?? "输入 API Key");
+	key.autocomplete = "off";
+	key.disabled = !provider.apiKeyLogin;
+	form.append(providerField("接口类型", type), providerField("Base URL", base), providerField("API Key", key));
+	const actions = el("div", "provider-actions");
+	if (provider.apiKeyLogin) {
+		const connect = providerButton(status?.configured ? "更新 API Key" : "保存 API Key", "primary-btn");
+		connect.addEventListener("click", async () => {
+			const apiKey = key.value.trim();
+			if (!apiKey) { toast("请输入 API Key", "warn"); return; }
+			connect.disabled = true;
+			try {
+				const result = await rpc({ type: "set_provider_api_key", provider: provider.id, apiKey }, 90000);
+				if (!result.success) throw new Error(result.error);
+				key.value = "";
+				await refreshProviderState();
+				toast("API Key 已保存到 pi 凭据库");
+			} catch (err) {
+				toast(`连接失败：${err.message}`, "error", 8000);
+			} finally {
+				connect.disabled = false;
+			}
+		});
+		actions.appendChild(connect);
+	} else {
+		form.appendChild(el("div", "form-note", "此供应商没有 API Key 登录入口，当前前端不处理它的环境凭据或 OAuth 登录。"));
+	}
+	if (status?.authSource === "stored" && provider.apiKeyLogin) {
+		const disconnect = providerButton("移除已保存 Key", "danger-btn");
+		disconnect.addEventListener("click", async () => {
+			if (!confirm(`移除 ${provider.name} 的已保存 API Key？`)) return;
+			try {
+				const result = await rpc({ type: "remove_provider_api_key", provider: provider.id }, 90000);
+				if (!result.success) throw new Error(result.error);
+				await refreshProviderState();
+				toast("已移除已保存 Key");
+			} catch (err) { toast(`移除失败：${err.message}`, "error"); }
+		});
+		actions.appendChild(disconnect);
+	}
+	form.appendChild(actions);
+	const models = status?.models ?? [];
+	form.appendChild(el("div", "form-note", `pi 当前目录中有 ${models.length} 个模型；连接后可在输入框模型菜单中选择。`));
+	detail.appendChild(form);
+}
+
+function renderCustomProviderForm(provider) {
+	const detail = $("#providerDetail");
+	detail.innerHTML = "";
+	const form = el("div", "provider-form");
+	form.append(el("h2", null, provider ? provider.name : "添加自定义供应商"));
+	form.append(el("div", "form-note", "只支持 API Key。模型可以从服务端真实发现，也可以手动填写 ID。"));
+	const name = el("input");
+	name.value = provider?.name ?? "";
+	name.placeholder = "例如：公司网关";
+	const api = el("select");
+	for (const [value, label] of Object.entries(API_TYPE_LABELS)) {
+		const option = el("option", null, label);
+		option.value = value;
+		api.appendChild(option);
+	}
+	api.value = provider?.api ?? "openai-completions";
+	const baseUrl = el("input");
+	baseUrl.value = provider?.baseUrl ?? "";
+	baseUrl.placeholder = "https://example.com/v1";
+	const key = el("input");
+	key.type = "password";
+	key.autocomplete = "off";
+	key.placeholder = providerCatalog.get(provider?.id)?.configured ? "留空则保留现有 Key" : "API Key";
+	form.append(providerField("供应商名称", name), providerField("接口类型", api), providerField("Base URL", baseUrl), providerField("API Key", key));
+
+	let models = (provider?.models ?? []).map((model) => ({ ...model }));
+	const selected = new Set(models.map((model) => model.id));
+	let preferredModelId = currentModel?.provider === provider?.id ? currentModel.id : models[0]?.id ?? "";
+	const modelBox = el("div", "provider-models");
+	const renderModels = () => {
+		modelBox.innerHTML = "";
+		if (!models.length) {
+			modelBox.appendChild(el("div", "provider-empty", "尚未添加模型"));
+			return;
+		}
+		for (const model of models) {
+			const row = el("label", "provider-model-row");
+			const checkbox = el("input");
+			checkbox.type = "checkbox";
+			checkbox.checked = selected.has(model.id);
+			const radio = el("input");
+			radio.type = "radio";
+			radio.name = "custom-current-model";
+			radio.title = "保存后设为当前模型";
+			radio.checked = preferredModelId === model.id;
+			radio.disabled = !checkbox.checked;
+			checkbox.addEventListener("change", () => {
+				if (checkbox.checked) selected.add(model.id); else selected.delete(model.id);
+				radio.disabled = !checkbox.checked;
+				if (!checkbox.checked && preferredModelId === model.id) preferredModelId = "";
+			});
+			radio.addEventListener("change", () => { if (radio.checked) preferredModelId = model.id; });
+			row.append(checkbox, radio, el("span", null, model.name ? `${model.name} (${model.id})` : model.id));
+			modelBox.appendChild(row);
+		}
+	};
+	renderModels();
+	const discover = providerButton("从接口获取模型");
+	discover.addEventListener("click", async () => {
+		if (!key.value.trim()) { toast("发现模型需要输入 API Key", "warn"); return; }
+		discover.disabled = true;
+		try {
+			const data = await jsonRequest("/api/providers/discover", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ api: api.value, baseUrl: baseUrl.value.trim(), apiKey: key.value.trim() }),
+			});
+			models = data.models;
+			selected.clear();
+			for (const model of models) selected.add(model.id);
+			preferredModelId = models[0]?.id ?? "";
+			renderModels();
+			toast(`获取到 ${models.length} 个模型`);
+		} catch (err) { toast(`获取失败：${err.message}`, "error", 8000); }
+		finally { discover.disabled = false; }
+	});
+	const manualRow = el("div", "manual-model-row");
+	const manual = el("input");
+	manual.placeholder = "手动输入模型 ID";
+	const addModel = providerButton("添加");
+	addModel.addEventListener("click", () => {
+		const id = manual.value.trim();
+		if (!id) return;
+		if (!models.some((model) => model.id === id)) models.push({ id });
+		selected.add(id);
+		if (!preferredModelId) preferredModelId = id;
+		manual.value = "";
+		renderModels();
+	});
+	manualRow.append(manual, addModel);
+	form.append(el("div", "form-note", "模型列表：复选框决定保存哪些模型，单选框决定保存后切换到哪个模型。"), discover, modelBox, manualRow);
+
+	const actions = el("div", "provider-actions");
+	const save = providerButton("保存并使用", "primary-btn");
+	save.addEventListener("click", async () => {
+		const chosen = models.filter((model) => selected.has(model.id));
+		if (!name.value.trim() || !baseUrl.value.trim()) { toast("请填写名称和 Base URL", "warn"); return; }
+		if (!chosen.length) { toast("至少选择一个模型", "warn"); return; }
+		if (!preferredModelId || !selected.has(preferredModelId)) { toast("请选择保存后使用的模型", "warn"); return; }
+		if (!provider && !key.value.trim()) { toast("新供应商必须填写 API Key", "warn"); return; }
+		save.disabled = true;
+		try {
+			const saved = await jsonRequest("/api/providers", {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ id: provider?.id, name: name.value.trim(), api: api.value, baseUrl: baseUrl.value.trim(), models: chosen }),
+			});
+			let result = await rpc({ type: "reload_models" }, 90000);
+			if (!result.success) throw new Error(result.error);
+			if (key.value.trim()) {
+				result = await rpc({ type: "set_provider_api_key", provider: saved.provider.id, apiKey: key.value.trim() }, 90000);
+				if (!result.success) throw new Error(result.error);
+			}
+			result = await rpc({ type: "set_model", provider: saved.provider.id, modelId: preferredModelId }, 90000);
+			if (!result.success) throw new Error(result.error);
+			setCurrentModel(result.data);
+			await refreshThinkingPicker();
+			selectedProviderId = saved.provider.id;
+			await refreshProviderState();
+			toast("自定义供应商已保存并启用");
+		} catch (err) { toast(`保存失败：${err.message}`, "error", 8000); }
+		finally { save.disabled = false; }
+	});
+	actions.appendChild(save);
+	if (provider) {
+		const status = providerCatalog.get(provider.id);
+		if (status?.configured) {
+			const disconnect = providerButton("移除已保存 Key", "secondary-btn");
+			disconnect.addEventListener("click", async () => {
+				try {
+					const result = await rpc({ type: "remove_provider_api_key", provider: provider.id }, 90000);
+					if (!result.success) throw new Error(result.error);
+					await refreshProviderState();
+					toast("已移除已保存 Key");
+				} catch (err) { toast(`移除失败：${err.message}`, "error"); }
+			});
+			actions.appendChild(disconnect);
+		}
+		const remove = providerButton("删除供应商", "danger-btn");
+		remove.addEventListener("click", async () => {
+			if (currentModel?.provider === provider.id) { toast("当前正在使用此供应商，请先切换模型", "warn"); return; }
+			if (!confirm(`删除自定义供应商「${provider.name}」？`)) return;
+			try {
+				if (status?.configured) {
+					const result = await rpc({ type: "remove_provider_api_key", provider: provider.id }, 90000);
+					if (!result.success) throw new Error(result.error);
+				}
+				await jsonRequest(`/api/providers?id=${encodeURIComponent(provider.id)}`, { method: "DELETE" });
+				const result = await rpc({ type: "reload_models" }, 90000);
+				if (!result.success) throw new Error(result.error);
+				selectedProviderId = providerConfiguration.builtins[0]?.id ?? "__new__";
+				await refreshProviderState();
+				toast("供应商已删除");
+			} catch (err) { toast(`删除失败：${err.message}`, "error"); }
+		});
+		actions.appendChild(remove);
+	}
+	form.appendChild(actions);
+	detail.appendChild(form);
+}
+
+function renderModelMenu() {
+	const list = $("#modelList");
+	list.innerHTML = "";
+	const query = $("#modelSearch").value.trim().toLowerCase();
+	let count = 0;
+	for (const provider of providerCatalog.values()) {
+		if (!provider.configured) continue;
+		const models = provider.models.filter((model) => `${model.name ?? ""} ${model.id}`.toLowerCase().includes(query));
+		if (!models.length) continue;
+		list.appendChild(el("div", "model-group-title", provider.name));
+		for (const model of models) {
+			count++;
+			const button = el("button", "model-option");
+			button.type = "button";
+			button.classList.toggle("selected", currentModel?.provider === provider.id && currentModel.id === model.id);
+			button.append(el("span", null, model.name ?? model.id), el("small", null, model.id));
+			button.addEventListener("click", async () => {
+				try {
+					const result = await rpc({ type: "set_model", provider: provider.id, modelId: model.id }, 90000);
+					if (!result.success) throw new Error(result.error);
+					setCurrentModel(result.data);
+					await refreshThinkingPicker();
+					$("#modelMenu").hidden = true;
+					toast(`已切换到 ${model.name ?? model.id}`);
+				} catch (err) { toast(`切换失败：${err.message}`, "error"); }
+			});
+			list.appendChild(button);
+		}
+	}
+	if (!count) list.appendChild(el("div", "provider-empty", query ? "没有匹配的模型" : "尚无已配置模型"));
+}
+
+function setupProviders() {
+	$("#navProviders").addEventListener("click", () => setView("providers"));
+	$("#addCustomProvider").addEventListener("click", () => {
+		selectedProviderId = "__new__";
+		renderProviderList();
+		renderProviderDetail();
+	});
+	$("#modelPickerBtn").addEventListener("click", async () => {
+		const menu = $("#modelMenu");
+		menu.hidden = !menu.hidden;
+		if (!menu.hidden) {
+			await refreshProviderState();
+			if (!menu.hidden) $("#modelSearch").focus();
+		}
+	});
+	$("#modelSearch").addEventListener("input", renderModelMenu);
+	$("#modelManage").addEventListener("click", () => {
+		$("#modelMenu").hidden = true;
+		setView("providers");
+	});
+	document.addEventListener("pointerdown", (event) => {
+		if (!event.target.closest("#modelMenu") && !event.target.closest("#modelPickerBtn")) $("#modelMenu").hidden = true;
+	});
+}
+
 /* ================= Project Map 页面（debug API） ================= */
 const mapDetail = $("#mapDetail");
 const mapPicker = $("#mapPicker");
@@ -1366,16 +1804,25 @@ let selectedMapId = null;
 const mapCollapsed = new Set(); // 折叠的目录路径（跨刷新保留）
 let mapRefreshTimer = null;
 
-/** 视图切换：chat ↔ map。map 视图隐藏 topbar/chat-flow/input-area，显示 mapPage */
+/** 视图切换：对话、项目地图、供应商。 */
 function setView(view) {
 	const mapView = view === "map";
+	const providersView = view === "providers";
+	if (view !== "chat") {
+		drawer.classList.remove("open");
+		$("#btnContext").classList.remove("open");
+		drawer.hidden = true;
+	}
 	mapVisible = mapView;
-	document.querySelector(".topbar").hidden = mapView;
-	$("#chatFlow").hidden = mapView;
-	document.querySelector(".input-area").hidden = mapView;
+	document.querySelector(".topbar").hidden = mapView || providersView;
+	$("#chatFlow").hidden = mapView || providersView;
+	document.querySelector(".input-area").hidden = mapView || providersView;
 	$("#mapPage").hidden = !mapView;
+	$("#providersPage").hidden = !providersView;
 	$("#navMap").classList.toggle("selected", mapView);
+	$("#navProviders").classList.toggle("selected", providersView);
 	if (mapView) refreshMap();
+	if (providersView) refreshProviderState();
 }
 
 /** 相对路径（无 node:path 的浏览器实现，语义对齐 project-map.ts renderTree 的 relative） */
@@ -1589,6 +2036,7 @@ function setupMap() {
 /* ================= 项目目录与会话列表 ================= */
 let currentWorkspace = "";
 let currentSessionFile = ""; // 当前活动会话（侧边栏高亮）
+let sessionSwitching = false;
 
 /** 路径归一化（比较用）：反斜杠转正 + 小写 */
 function normPath(p) {
@@ -1638,6 +2086,7 @@ async function refreshSessions() {
 
 /** 项目组折叠状态（跨刷新保留）：path -> collapsed */
 const projectCollapsed = new Map();
+let sessionTreeSignature = "";
 
 /**
  * 侧边栏多项目会话树（对齐 Codex 桌面版：全部项目会话 + 项目标识）。
@@ -1648,6 +2097,13 @@ const projectCollapsed = new Map();
 function renderSessions(sessions) {
 	const tree = $("#sessionTree");
 	if (!tree) return;
+	const signature = JSON.stringify({
+		currentSessionFile,
+		currentWorkspace,
+		sessions: sessions.map((session) => [session.sessionFile, session.modified, session.name, session.messageCount, session.cwd]),
+	});
+	if (signature === sessionTreeSignature) return;
+	sessionTreeSignature = signature;
 	tree.innerHTML = "";
 	// 合并当前会话（未落盘）→ 归入当前项目组
 	const known = new Set(sessions.map((s) => s.sessionFile));
@@ -1746,7 +2202,10 @@ function renderSessions(sessions) {
 
 /** 恢复历史会话：switch_session → 重建对话历史（扩展随会话重载，restorePlugins 恢复挂载） */
 async function resumeSession(s) {
+	if (sessionSwitching) return;
+	sessionSwitching = true;
 	setView("chat");
+	showBanner("正在切换会话…");
 	try {
 		const res = await rpc({ type: "switch_session", sessionPath: s.sessionFile }, 30000);
 		if (!res.success) {
@@ -1771,7 +2230,7 @@ async function resumeSession(s) {
 		if (stateRes.success) {
 			const state = stateRes.data;
 			if (typeof state.sessionFile === "string") currentSessionFile = state.sessionFile;
-			$("#modelName").textContent = state.model ? `${state.model.name ?? state.model.id}` : "未选择模型";
+			setCurrentModel(state.model);
 			setupModePicker(state.collaborationMode ?? "default");
 			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], state.thinkingLevel);
 			setStreaming(!!state.isStreaming);
@@ -1785,6 +2244,9 @@ async function resumeSession(s) {
 		refreshContextUsage();
 	} catch (err) {
 		toast(`恢复失败：${err.message}`, "error", 8000);
+	} finally {
+		sessionSwitching = false;
+		showBanner("");
 	}
 }
 
@@ -1888,4 +2350,5 @@ setupDrawer();
 setupContextDashboard();
 setupMap();
 setupProject();
+setupProviders();
 initSession();

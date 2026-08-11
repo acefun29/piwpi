@@ -50,7 +50,7 @@ import { dataDirFor } from "./src/memory/persist.ts";
 	pi.on("agent_settled", () => harness.onAgentSettled());
 	pi.on("session_shutdown", async () => {
 		await harness.shutdown();
-		debugServer?.close();
+		await debugServer?.close();
 	});
 
 	// M5 新模型：主 Agent 读取 Project Map 的唯一通道（零持续 token 开销，按需主动调用）。

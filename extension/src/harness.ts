@@ -425,13 +425,29 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	async function scanDiskChanges(): Promise<AnchorNotice[]> {
 		const notices: AnchorNotice[] = [];
 		let mapDirty = false;
-		for (const absPath of pickScanBatch()) {
-			const id = pluginIdOf(absPath);
-			const plugin = store.get(id); // 可能 undefined（纯 map 条目文件）
-			const mapEntry = projectMap.get(id); // 可能 undefined（纯挂载文件）
-			if (!plugin && (!mapEntry || mapEntry.stale)) continue;
+		const scanTargets = pickScanBatch()
+			.map((absPath) => {
+				const id = pluginIdOf(absPath);
+				return {
+					absPath,
+					id,
+					plugin: store.get(id), // 可能 undefined（纯 map 条目文件）
+					mapEntry: projectMap.get(id), // 可能 undefined（纯挂载文件）
+				};
+			})
+			.filter(({ plugin, mapEntry }) => plugin || (mapEntry && !mapEntry.stale));
+
+		for (const { absPath, plugin } of scanTargets) {
 			if (plugin) fileCache.pin(absPath);
-			const r = await fileCache.get(absPath);
+		}
+		const scanResults = await Promise.all(
+			scanTargets.map(async (target) => ({
+				...target,
+				result: await fileCache.get(target.absPath),
+			})),
+		);
+
+		for (const { absPath, id, plugin, mapEntry, result: r } of scanResults) {
 			if (!r) {
 				// ④ 文件删除/不可读：挂载失效 + map 条目软删除（磁盘事实自证过期）
 				if (plugin && isSourceMeta(plugin)) {

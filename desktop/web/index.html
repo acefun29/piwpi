@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="./vendor/hljs-github.min.css">
 </head>
 <body>
+<div class="window-titlebar" aria-hidden="true"></div>
 <div id="app">
 
   <!-- ===== 左侧栏 ===== -->
@@ -20,6 +21,10 @@
     <button class="nav-row" id="navMap">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M2.5 6h11" stroke="currentColor" stroke-width="1.35"/></svg>
       <span>项目地图</span>
+    </button>
+    <button class="nav-row" id="navProviders">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 2.5h8v11H4v-11Z" stroke="currentColor" stroke-width="1.3"/><path d="M6 5h4M6 8h4M6 11h2.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      <span>模型供应商</span>
     </button>
     <div class="projects-head">
       <span>项目</span>
@@ -53,7 +58,13 @@
     <div class="input-area">
       <div class="input-card">
         <textarea id="inputBox" rows="1" placeholder="给 piwpi 发送消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <div class="model-menu" id="modelMenu" hidden>
+          <input id="modelSearch" type="search" placeholder="搜索模型…" autocomplete="off">
+          <div id="modelList" class="model-list"></div>
+          <button id="modelManage" class="model-manage" type="button">管理模型供应商</button>
+        </div>
         <div class="input-tools">
+          <button class="model-picker-btn" id="modelPickerBtn" type="button" title="选择模型">未选择模型</button>
           <label class="mode-picker" title="协作模式">
             <select id="modeSel" disabled>
               <option value="default">默认</option>
@@ -94,6 +105,19 @@
             </div>
           </div>
           <div class="detail-card map-detail" id="mapDetail"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="page page-providers" id="providersPage" hidden>
+      <div class="provider-page-pad">
+        <div class="provider-page-head">
+          <div><div class="page-title">模型供应商</div><div class="page-sub">配置内置供应商，或通过兼容接口接入其他服务。</div></div>
+          <button id="addCustomProvider" class="primary-btn" type="button">添加自定义供应商</button>
+        </div>
+        <div class="provider-layout">
+          <aside class="provider-list" id="providerList"></aside>
+          <section class="provider-detail" id="providerDetail"></section>
         </div>
       </div>
     </div>

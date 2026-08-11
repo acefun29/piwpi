@@ -22,8 +22,9 @@
  *   PIWPI_PI_ARGS     额外传给 pi 的参数（空格分隔）
  */
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createServer, get as httpGet, request as httpRequest } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
@@ -34,7 +35,13 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = resolve(__dirname, ".."); // desktop/
 const REPO = resolve(ROOT, ".."); // piwpi/
 const WEB_DIR = join(ROOT, "web");
-
+const CUSTOM_PROVIDER_PREFIX = "piwpi-custom-";
+const SUPPORTED_PROVIDER_APIS = new Set([
+	"openai-completions",
+	"openai-responses",
+	"anthropic-messages",
+	"google-generative-ai",
+]);
 const MIME = {
 	".html": "text/html; charset=utf-8",
 	".js": "text/javascript; charset=utf-8",
@@ -47,6 +54,160 @@ const MIME = {
 	".ico": "image/x-icon",
 	".woff2": "font/woff2",
 };
+
+function modelsFilePath() {
+	return join(homedir(), ".pi", "agent", "models.json");
+}
+
+async function readModelsConfig() {
+	try {
+		const value = JSON.parse(await readFile(modelsFilePath(), "utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("models.json 顶层必须是对象");
+		if (value.providers !== undefined && (!value.providers || typeof value.providers !== "object" || Array.isArray(value.providers))) {
+			throw new Error("models.json providers 必须是对象");
+		}
+		return { ...value, providers: value.providers ?? {} };
+	} catch (err) {
+		if (err?.code === "ENOENT") return { providers: {} };
+		throw err;
+	}
+}
+
+async function writeModelsConfig(config) {
+	await mkdir(dirname(modelsFilePath()), { recursive: true });
+	await writeFile(modelsFilePath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function validateBaseUrl(value) {
+	const url = new URL(String(value));
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Base URL 只支持 http 或 https");
+	return url.toString().replace(/\/$/, "");
+}
+
+function normalizeDiscoveredModel(raw, providerApi) {
+	const sourceId = typeof raw?.id === "string" ? raw.id : typeof raw?.name === "string" ? raw.name : "";
+	const id = providerApi === "google-generative-ai" ? sourceId.replace(/^models\//, "") : sourceId;
+	if (!id) return null;
+	const model = { id };
+	const name = raw.displayName ?? raw.display_name ?? raw.name;
+	if (typeof name === "string" && name && name !== sourceId) model.name = name;
+	const contextWindow = raw.context_length ?? raw.inputTokenLimit;
+	if (Number.isFinite(contextWindow)) model.contextWindow = contextWindow;
+	const maxTokens = raw.top_provider?.max_completion_tokens ?? raw.outputTokenLimit;
+	if (Number.isFinite(maxTokens)) model.maxTokens = maxTokens;
+	if (Array.isArray(raw.architecture?.input_modalities)) {
+		model.input = raw.architecture.input_modalities.filter((value) => value === "text" || value === "image");
+	}
+	if (Array.isArray(raw.supported_parameters) && raw.supported_parameters.includes("reasoning")) model.reasoning = true;
+	return model;
+}
+
+async function requestModelPage(url, headers) {
+	const response = await fetch(url, { headers });
+	if (!response.ok) throw new Error(`模型发现失败（HTTP ${response.status} ${response.statusText}）`);
+	return response.json();
+}
+
+async function discoverModels({ api, baseUrl, apiKey }) {
+	if (!SUPPORTED_PROVIDER_APIS.has(api)) throw new Error(`不支持的接口类型：${api}`);
+	if (typeof apiKey !== "string" || !apiKey.trim()) throw new Error("API key 不能为空");
+	const base = validateBaseUrl(baseUrl);
+	const models = [];
+	if (api === "anthropic-messages") {
+		let url = new URL(`${base}/v1/models`);
+		for (;;) {
+			const data = await requestModelPage(url, { "x-api-key": apiKey.trim(), "anthropic-version": "2023-06-01" });
+			models.push(...(Array.isArray(data.data) ? data.data : []));
+			if (!data.has_more || typeof data.last_id !== "string") break;
+			url = new URL(`${base}/v1/models`);
+			url.searchParams.set("after_id", data.last_id);
+		}
+	} else if (api === "google-generative-ai") {
+		let url = new URL(`${base}/models`);
+		for (;;) {
+			const data = await requestModelPage(url, { "x-goog-api-key": apiKey.trim() });
+			const page = Array.isArray(data.models)
+				? data.models.filter((model) => model.supportedGenerationMethods?.includes("generateContent"))
+				: [];
+			models.push(...page);
+			if (typeof data.nextPageToken !== "string" || !data.nextPageToken) break;
+			url = new URL(`${base}/models`);
+			url.searchParams.set("pageToken", data.nextPageToken);
+		}
+	} else {
+		const data = await requestModelPage(new URL(`${base}/models`), { authorization: `Bearer ${apiKey.trim()}` });
+		models.push(...(Array.isArray(data.data) ? data.data : []));
+	}
+	const normalized = models.map((model) => normalizeDiscoveredModel(model, api)).filter(Boolean);
+	const unique = [...new Map(normalized.map((model) => [model.id, model])).values()];
+	unique.sort((a, b) => a.id.localeCompare(b.id));
+	return unique;
+}
+
+function readJsonBody(req) {
+	return new Promise((resolveBody, rejectBody) => {
+		let body = "";
+		req.on("data", (chunk) => { body += chunk; });
+		req.on("end", () => {
+			try { resolveBody(JSON.parse(body)); } catch (err) { rejectBody(err); }
+		});
+		req.on("error", rejectBody);
+	});
+}
+
+function sendJson(res, status, value) {
+	res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+	res.end(JSON.stringify(value));
+}
+
+async function getProviderConfiguration() {
+	const config = await readModelsConfig();
+	const custom = Object.entries(config.providers)
+		.filter(([id]) => id.startsWith(CUSTOM_PROVIDER_PREFIX))
+		.map(([id, provider]) => ({
+			id,
+			name: provider.name ?? id,
+			api: provider.api,
+			baseUrl: provider.baseUrl,
+			models: Array.isArray(provider.models) ? provider.models : [],
+		}));
+	return { custom };
+}
+
+async function saveCustomProvider(input) {
+	const name = typeof input?.name === "string" ? input.name.trim() : "";
+	const api = input?.api;
+	if (!name) throw new Error("供应商名称不能为空");
+	if (!SUPPORTED_PROVIDER_APIS.has(api)) throw new Error(`不支持的接口类型：${api}`);
+	const baseUrl = validateBaseUrl(input?.baseUrl);
+	if (!Array.isArray(input?.models) || input.models.length === 0) throw new Error("至少选择或添加一个模型");
+	const models = input.models.map((model) => {
+		const id = typeof model?.id === "string" ? model.id.trim() : "";
+		if (!id) throw new Error("模型 ID 不能为空");
+		const result = { id };
+		if (typeof model.name === "string" && model.name.trim()) result.name = model.name.trim();
+		if (typeof model.reasoning === "boolean") result.reasoning = model.reasoning;
+		if (Array.isArray(model.input) && model.input.length) result.input = model.input;
+		if (Number.isFinite(model.contextWindow)) result.contextWindow = model.contextWindow;
+		if (Number.isFinite(model.maxTokens)) result.maxTokens = model.maxTokens;
+		return result;
+	});
+	const requestedId = typeof input.id === "string" ? input.id : "";
+	if (requestedId && !requestedId.startsWith(CUSTOM_PROVIDER_PREFIX)) throw new Error("只能编辑 piwpi 自定义供应商");
+	const id = requestedId || `${CUSTOM_PROVIDER_PREFIX}${randomUUID()}`;
+	const config = await readModelsConfig();
+	config.providers[id] = { name, baseUrl, api, models };
+	await writeModelsConfig(config);
+	return { id, ...config.providers[id] };
+}
+
+async function deleteCustomProvider(id) {
+	if (!id.startsWith(CUSTOM_PROVIDER_PREFIX)) throw new Error("只能删除 piwpi 自定义供应商");
+	const config = await readModelsConfig();
+	if (!Object.hasOwn(config.providers, id)) throw new Error("供应商不存在");
+	delete config.providers[id];
+	await writeModelsConfig(config);
+}
 
 /** 探测本地端口是否可用 */
 function isPortFree(port) {
@@ -72,7 +233,7 @@ export async function startBridge(opts = {}) {
 	const extPath = opts.extPath ?? process.env.PIWPI_EXT ?? join(REPO, "extension");
 	const extraArgs = (
 		process.env.PIWPI_PI_ARGS ??
-		"--model deepseek/deepseek-v4-flash --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document"
+		"--offline --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document"
 	).split(" ").filter(Boolean);
 	const onPiExit = opts.onPiExit ?? (() => {});
 
@@ -115,6 +276,7 @@ export async function startBridge(opts = {}) {
 			env: {
 				...process.env,
 				PIWPI_DEBUG_PORT: String(debugPort),
+				NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE ?? join(homedir(), ".pi", "agent", "piwpi", "node-compile-cache"),
 				// Electron 主进程里 process.execPath 是 electron.exe；必须让它以 Node 模式跑 cli.js
 				...(isElectron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
 			},
@@ -199,18 +361,50 @@ export async function startBridge(opts = {}) {
 	}
 
 	/* ================= 会话列表 / 项目切换 ================= */
+	const sessionSummaryCache = new Map();
+
+	async function readSessionLines(filePath) {
+		const handle = await open(filePath, "r");
+		const chunks = [];
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		const decoder = new StringDecoder("utf8");
+		let position = 0;
+		let newlineCount = 0;
+		try {
+			while (newlineCount < 2000) {
+				const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+				if (bytesRead === 0) break;
+				const chunk = decoder.write(buffer.subarray(0, bytesRead));
+				chunks.push(chunk);
+				newlineCount += chunk.split("\n").length - 1;
+				position += bytesRead;
+			}
+		} finally {
+			chunks.push(decoder.end());
+			await handle.close();
+		}
+		return chunks.join("").split("\n").slice(0, 2000);
+	}
+
 	/**
 	 * 读会话 JSONL 摘要（首行 header + session_info 名称 + message 计数，限量 2000 行防大文件拖垮列表）。
 	 * 语义参照 packages/coding-agent/src/core/session-manager.ts:688-760 的 list 实现，轻量零依赖。
 	 */
 	async function readSessionSummary(filePath) {
-		let text;
+		let fileStat;
 		try {
-			text = await readFile(filePath, "utf8");
+			fileStat = await stat(filePath);
 		} catch {
 			return null;
 		}
-		const lines = text.split("\n").slice(0, 2000);
+		const cached = sessionSummaryCache.get(filePath);
+		if (cached?.mtimeMs === fileStat.mtimeMs && cached.size === fileStat.size) return cached.summary;
+		let lines;
+		try {
+			lines = await readSessionLines(filePath);
+		} catch {
+			return null;
+		}
 		let header = null;
 		let name;
 		let messageCount = 0;
@@ -248,10 +442,13 @@ export async function startBridge(opts = {}) {
 				}
 			}
 		}
-		if (!header) return null;
+		if (!header) {
+			sessionSummaryCache.set(filePath, { mtimeMs: fileStat.mtimeMs, size: fileStat.size, summary: null });
+			return null;
+		}
 		const created = typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
 		const modified = lastActivity > 0 ? lastActivity : Number.isFinite(created) ? created : 0;
-		return {
+		const summary = {
 			sessionFile: filePath,
 			id: header.id,
 			name: name ?? null,
@@ -261,6 +458,8 @@ export async function startBridge(opts = {}) {
 			modified,
 			messageCount,
 		};
+		sessionSummaryCache.set(filePath, { mtimeMs: fileStat.mtimeMs, size: fileStat.size, summary });
+		return summary;
 	}
 
 	/** 列出当前项目全部会话（<cwd>/.piwpi/sessions 下递归 *.jsonl），按最近活动降序 */
@@ -294,6 +493,7 @@ export async function startBridge(opts = {}) {
 		if (!target.startsWith(root + "\\") && !target.startsWith(root + "/")) return false;
 		try {
 			rmSync(target, { force: true });
+			sessionSummaryCache.delete(target);
 			return true;
 		} catch {
 			return false;
@@ -421,6 +621,43 @@ export async function startBridge(opts = {}) {
 					res.end(JSON.stringify({ ok: false, error: String(err?.message ?? err) }));
 				}
 			});
+			return;
+		}
+
+		if (path === "/api/providers" && req.method === "GET") {
+			getProviderConfiguration().then(
+				(data) => sendJson(res, 200, { ok: true, ...data }),
+				(err) => sendJson(res, 500, { ok: false, error: String(err?.message ?? err) }),
+			);
+			return;
+		}
+
+		if (path === "/api/providers/discover" && req.method === "POST") {
+			readJsonBody(req).then(async (input) => {
+				const models = await discoverModels({
+					api: input.api,
+					baseUrl: input.baseUrl,
+					apiKey: input.apiKey,
+				});
+				sendJson(res, 200, { ok: true, models });
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		if (path === "/api/providers" && req.method === "PUT") {
+			readJsonBody(req).then(async (input) => {
+				const provider = await saveCustomProvider(input);
+				sendJson(res, 200, { ok: true, provider });
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		if (path === "/api/providers" && req.method === "DELETE") {
+			const id = url.searchParams.get("id") ?? "";
+			deleteCustomProvider(id).then(
+				() => sendJson(res, 200, { ok: true }),
+				(err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }),
+			);
 			return;
 		}
 

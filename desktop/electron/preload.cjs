@@ -4,6 +4,8 @@
  */
 const { contextBridge, ipcRenderer } = require("electron");
 
+contextBridge.exposeInMainWorld("desktopShell", true);
+
 contextBridge.exposeInMainWorld("openExternal", (url) => {
 	ipcRenderer.send("open-external", String(url));
 });

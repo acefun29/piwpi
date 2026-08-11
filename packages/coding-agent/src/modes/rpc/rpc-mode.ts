@@ -558,6 +558,47 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "get_available_models", { models });
 			}
 
+			case "get_provider_catalog": {
+				const providers = session.modelRuntime.getProviders().map((provider) => {
+					const auth = session.modelRuntime.getProviderAuthStatus(provider.id);
+					const models = [...session.modelRuntime.getModels(provider.id)];
+					return {
+						id: provider.id,
+						name: provider.name,
+						api: models[0]?.api,
+						baseUrl: provider.baseUrl,
+						apiKeyLogin: provider.auth.apiKey?.login !== undefined,
+						apiKeyName: provider.auth.apiKey?.name,
+						configured: auth.configured,
+						authSource: auth.source,
+						authLabel: auth.label,
+						models,
+					};
+				});
+				return success(id, "get_provider_catalog", { providers });
+			}
+
+			case "set_provider_api_key": {
+				const apiKey = command.apiKey.trim();
+				if (!apiKey) return error(id, "set_provider_api_key", "API key is required");
+				await session.modelRuntime.login(command.provider, "api_key", {
+					prompt: async () => apiKey,
+					notify: () => {},
+				});
+				return success(id, "set_provider_api_key");
+			}
+
+			case "remove_provider_api_key": {
+				await session.modelRuntime.logout(command.provider);
+				return success(id, "remove_provider_api_key");
+			}
+
+			case "reload_models": {
+				await session.modelRuntime.refresh({ allowNetwork: false });
+				const models = await session.modelRuntime.getAvailable();
+				return success(id, "reload_models", { models });
+			}
+
 			// =================================================================
 			// Thinking
 			// =================================================================

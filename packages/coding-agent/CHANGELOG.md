@@ -9,6 +9,7 @@
 
 ### Added
 
+- Added RPC commands for listing provider catalogs, saving or removing provider API keys, and reloading model configuration for the piwpi desktop provider manager.
 - Added persistent Default/Plan collaboration modes with stable tool schemas, execution-time tool permissions, RPC controls, and plan-aware context compaction.
 - Added built-in Baseten provider support with `BASETEN_API_KEY` authentication and `zai-org/GLM-5.2` as the default model.
 - Added chainable `pi.registerMarkdownTransformer()` hooks for display-only transformation of user and assistant Markdown.
@@ -21,6 +22,7 @@
 
 ### Fixed
 
+- Reused the model runtime across same-project RPC session switches and avoided redundant provider availability refreshes when extensions did not change providers.
 - Fixed plan approval rejecting the visible proposed plan because its Markdown differed from the private planning artifact; implementation now uses the plan the user actually approved without an artifact-alignment gate.
 - Fixed fullscreen shutdown leaking terminal capability-query replies into the parent shell prompt.
 - Fixed bare exact `--model` IDs shared by multiple providers choosing the first catalog entry instead of the sole authenticated provider or a clear ambiguity error ([#7327](https://github.com/earendil-works/pi/issues/7327)).

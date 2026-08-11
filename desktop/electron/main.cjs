@@ -50,6 +50,13 @@ async function createWindow() {
 		minHeight: 700,
 		autoHideMenuBar: true,
 		title: "piwpi",
+		backgroundColor: "#F5F4F1",
+		...(process.platform === "win32"
+			? {
+				titleBarStyle: "hidden",
+				titleBarOverlay: { color: "#F1F3F4", symbolColor: "#24252A", height: 40 },
+			}
+			: {}),
 		webPreferences: {
 			contextIsolation: true,
 			nodeIntegration: false,
