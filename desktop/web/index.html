@@ -19,7 +19,7 @@
     </button>
     <button class="nav-row" id="navMap">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M2.5 6h11" stroke="currentColor" stroke-width="1.35"/></svg>
-      <span>Project Map</span>
+      <span>项目地图</span>
     </button>
     <div class="projects-head">
       <span>项目</span>
@@ -37,7 +37,7 @@
     <div class="topbar">
       <div class="crumb" id="sessionTitle">piwpi / 新对话</div>
       <button class="ctx-btn" id="btnContext">
-        <span class="ctx-label">Context</span><span class="ctx-badge" id="ctxBadge">0</span>
+        <span class="ctx-label">上下文</span><span class="ctx-badge" id="ctxBadge">0</span>
       </button>
     </div>
 
@@ -45,7 +45,7 @@
       <div class="msg-col" id="msgCol">
         <div class="empty-hint" id="emptyHint">
           <div class="empty-title">开始一段对话</div>
-          <div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧 Context 可实时查看。</div>
+          <div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧上下文可实时查看。</div>
         </div>
       </div>
     </div>
@@ -56,32 +56,14 @@
         <div class="input-tools">
           <label class="mode-picker" title="协作模式">
             <select id="modeSel" disabled>
-              <option value="default">Default</option>
-              <option value="plan">Plan</option>
+              <option value="default">默认</option>
+              <option value="plan">计划</option>
             </select>
           </label>
           <label class="thinking-picker" title="思考强度">
             <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M7 1a4 4 0 0 1 4 4c0 1.5-.8 2.4-1.5 3.2-.5.6-.5 1.3-.5 1.8H5c0-.5 0-1.2-.5-1.8C3.8 7.4 3 6.5 3 5a4 4 0 0 1 4-4Z" stroke="#74767C" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.5 12h3M6 13.5h2" stroke="#74767C" stroke-width="1.2" stroke-linecap="round"/></svg>
             <select id="thinkingSel" disabled><option>…</option></select>
           </label>
-          <button class="ctx-ring-btn" id="btnCtxRing" title="上下文分布" aria-expanded="false">
-            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-              <circle class="ring-track" cx="9" cy="9" r="7"/>
-              <circle class="ring-progress" cx="9" cy="9" r="7" transform="rotate(-90 9 9)"/>
-            </svg>
-          </button>
-          <div class="ctx-popover" id="ctxPopover" hidden>
-            <div class="ctx-pop-head">
-              <span class="ctx-pop-title">上下文分布</span>
-              <span class="est-tag">估算值</span>
-              <button class="icon-btn" id="btnCtxClose" title="关闭">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="#74767C" stroke-width="1.5" stroke-linecap="round"/></svg>
-              </button>
-            </div>
-            <div id="ctxDonut"></div>
-            <div class="ctx-legend" id="ctxLegend"></div>
-            <div class="ctx-pop-foot" id="ctxFoot"></div>
-          </div>
           <button class="action-btn" id="btnAction" title="发送">
             <svg class="icon-send" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <svg class="icon-abort" width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="2" y="2" width="8" height="8" rx="1.5" fill="#FFFFFF"/></svg>
@@ -93,8 +75,8 @@
     <!-- ===== Project Map 页面（数据源：/debug/project-map + /debug/state.cwd） ===== -->
     <div class="page page-map" id="mapPage" hidden>
       <div class="page-pad-sm">
-        <div class="page-title">Project Map</div>
-        <div class="page-sub">记忆 Agent 逐步建立的项目理解</div>
+        <div class="page-title">项目地图</div>
+        <div class="page-sub">记忆模块逐步建立的项目理解</div>
         <div class="map-body" id="mapBody">
           <div class="map-picker collapsed" id="mapPicker">
             <div class="picker-head" id="pickerHead">
@@ -121,64 +103,82 @@
   <aside class="drawer" id="drawer" hidden>
     <div class="drawer-head">
       <div class="drawer-heading">
-        <span class="drawer-title">Current Context</span>
-        <span class="drawer-kicker">实时索引</span>
+        <span class="drawer-title">上下文</span>
+        <span class="drawer-kicker">上下文监控</span>
       </div>
+      <span class="drawer-live" id="ctxUsageState">等待数据</span>
     </div>
 
     <div class="drawer-scroll">
-      <section class="ctx-section ctx-files-section">
-        <div class="drawer-label">已挂载文件 <span class="drawer-count" id="fileCount">0</span></div>
+      <section class="ctx-usage-section">
+        <div class="ctx-section-head">
+          <div class="drawer-label">上下文占用</div>
+          <button class="ctx-section-link" id="ctxChartOpen" type="button">查看图表</button>
+        </div>
+        <button class="ctx-usage-summary" id="ctxUsageSummary" type="button" title="查看上下文占用详情">
+          <div class="ctx-gauge-wrap">
+            <svg id="ctxGauge" viewBox="0 0 120 120" aria-label="上下文占用率">
+              <circle class="ctx-gauge-track" cx="60" cy="60" r="48"/>
+              <circle class="ctx-gauge-progress" id="ctxGaugeProgress" cx="60" cy="60" r="48"/>
+              <text id="ctxGaugePct" class="ctx-gauge-pct" x="60" y="57">—</text>
+              <text class="ctx-gauge-caption" x="60" y="73">已用</text>
+            </svg>
+          </div>
+          <div class="ctx-stat-grid">
+            <div class="ctx-stat"><span class="ctx-stat-value" id="ctxUsedTokens">—</span><span class="ctx-stat-label">已使用</span></div>
+            <div class="ctx-stat"><span class="ctx-stat-value" id="ctxWindowTokens">—</span><span class="ctx-stat-label">窗口</span></div>
+            <div class="ctx-stat"><span class="ctx-stat-value" id="ctxMessageStat">0</span><span class="ctx-stat-label">消息</span></div>
+            <div class="ctx-stat"><span class="ctx-stat-value" id="ctxToolStat">0</span><span class="ctx-stat-label">工具输出</span></div>
+          </div>
+        </button>
+      </section>
+
+      <section class="ctx-entry-section">
+        <div class="ctx-section-head">
+          <div class="drawer-label">上下文消息 <span class="drawer-count" id="msgCount">0</span></div>
+          <span class="ctx-section-code">完整文本</span>
+        </div>
+        <button class="ctx-all-entry" id="ctxOpenAll" type="button">
+          <span class="ctx-entry-icon">{ }</span>
+          <span class="ctx-entry-copy"><strong>查看全部上下文</strong><small id="ctxMeta">等待首次请求…</small></span>
+          <span class="ctx-entry-arrow">↗</span>
+        </button>
+      </section>
+
+      <section class="ctx-files-section">
+        <div class="ctx-section-head">
+          <div class="drawer-label">已挂载文件 <span class="drawer-count" id="fileCount">0</span></div>
+          <span class="ctx-section-code">已挂载</span>
+        </div>
         <div id="fileList" class="drawer-group"><div class="drawer-empty">暂无挂载</div></div>
       </section>
 
-      <section class="ctx-section ctx-messages-section">
-        <div class="ctx-section-head">
-          <div class="drawer-label">上下文消息 <span class="drawer-count" id="msgCount">0</span></div>
-          <span class="ctx-match-count" id="ctxMatchCount"></span>
-        </div>
-        <div class="ctx-toolbar">
-          <label class="ctx-search" for="ctxSearch">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 10L13 13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-            <input id="ctxSearch" type="search" placeholder="搜索消息或工具 ID…" autocomplete="off">
-          </label>
-          <select id="ctxFilter" class="ctx-filter" aria-label="消息类型">
-            <option value="all">全部</option>
-            <option value="user">用户</option>
-            <option value="assistant">助手</option>
-            <option value="toolResult">工具</option>
-          </select>
-        </div>
-        <div class="ctx-meta-row">
-          <div class="drawer-meta" id="ctxMeta">等待第一次 LLM 请求…</div>
-          <div class="ctx-range" id="ctxRange"></div>
-        </div>
-        <div id="ctxList" class="drawer-group ctx-index"></div>
-        <div class="ctx-pager" aria-label="消息分页">
-          <button id="ctxPrev" class="ctx-page-btn" type="button" aria-label="上一页">上一页</button>
-          <label class="ctx-page-number"><input id="ctxPageInput" type="number" min="1" value="1" aria-label="页码"><span>/</span><span id="ctxPageTotal">1</span></label>
-          <button id="ctxNext" class="ctx-page-btn" type="button" aria-label="下一页">下一页</button>
-        </div>
-      </section>
-
-      <details class="ctx-events-section">
-        <summary class="drawer-label">实时事件 <span class="ctx-event-hint">默认收起</span></summary>
-        <div id="eventList" class="drawer-group event-log"></div>
-      </details>
     </div>
 
-    <div class="ctx-detail" id="ctxDetail" hidden>
-      <div class="ctx-detail-head">
-        <div class="ctx-detail-heading">
-          <span id="ctxDetailIndex" class="ctx-detail-index"></span>
-          <span id="ctxDetailRole" class="ctx-detail-role"></span>
-        </div>
-        <button id="ctxDetailClose" class="icon-btn" type="button" title="返回消息索引" aria-label="返回消息索引">
+    <div class="ctx-overlay ctx-chart-detail" id="ctxChartDetail" hidden>
+      <div class="ctx-overlay-head">
+        <div><span class="ctx-overlay-kicker">占用详情</span><h2 id="ctxChartTitle">上下文组成</h2><p id="ctxChartSubtitle"></p></div>
+        <button class="icon-btn" id="ctxChartClose" type="button" title="返回上下文" aria-label="返回上下文">
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 3.5L5.5 8L10 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
-      <div id="ctxDetailMeta" class="ctx-detail-meta"></div>
-      <pre id="ctxDetailText" class="ctx-detail-text"></pre>
+      <div class="ctx-focus-stat"><span id="ctxChartValue">—</span><small id="ctxChartPercent">—</small></div>
+      <div id="ctxChartDonut" class="ctx-chart-donut"></div>
+      <div id="ctxChartLegend" class="ctx-chart-legend"></div>
+      <div id="ctxChartFoot" class="ctx-chart-foot"></div>
+    </div>
+
+    <div class="ctx-overlay ctx-all-viewer" id="ctxAllViewer" hidden>
+      <div class="ctx-overlay-head">
+        <div><span class="ctx-overlay-kicker">完整上下文</span><h2>全部上下文</h2><p id="ctxViewerMeta">—</p></div>
+        <button class="icon-btn" id="ctxViewerClose" type="button" title="返回上下文" aria-label="返回上下文">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 3.5L5.5 8L10 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <label class="ctx-viewer-search" for="ctxViewerSearch">
+        <span>⌕</span><input id="ctxViewerSearch" type="search" placeholder="在上下文中查找…" autocomplete="off"><span id="ctxViewerMatch"></span>
+      </label>
+      <pre id="ctxAllText" class="ctx-all-text"></pre>
     </div>
   </aside>
 

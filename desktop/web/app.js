@@ -1,7 +1,7 @@
 /**
  * piwpi 桌面端前端逻辑
  * - 对话：POST /api/rpc 发命令，SSE /api/events 收 pi 事件流
- * - 实时 Context：/debug/* 代理到 piwpi 扩展 debug 服务（快照 + SSE）
+ * - 上下文占用：通过 /debug/* 获取快照，随会话事件主动刷新
  */
 
 /* ================= 工具函数 ================= */
@@ -164,7 +164,7 @@ function hideEmptyHint() {
 
 function addUserMsg(text, queued) {
 	hideEmptyHint();
-	msgCol.appendChild(el("div", "who", "User"));
+	msgCol.appendChild(el("div", "who", "用户"));
 	const m = el("div", "msg user", text);
 	if (queued) m.appendChild(el("span", "queued-tag", "已排队，将在本轮结束后发送"));
 	msgCol.appendChild(m);
@@ -173,7 +173,7 @@ function addUserMsg(text, queued) {
 
 function beginAssistant() {
 	hideEmptyHint();
-	msgCol.appendChild(el("div", "who", "Agent"));
+	msgCol.appendChild(el("div", "who", "助手"));
 	const root = el("div", "assistant-msg");
 	root.style.display = "flex";
 	root.style.flexDirection = "column";
@@ -347,7 +347,7 @@ function dispatch(evt) {
 			setStreaming(false);
 			if (currentAssistant) finalizeMd(currentAssistant); // 兜底：没收齐 message_end 时仍完成收尾
 			currentAssistant = null;
-			scheduleCtxRingRefresh(); // 一轮结束，上下文定稿
+			scheduleContextUsageRefresh(); // 一轮结束，上下文定稿
 			return;
 		case "agent_end":
 			if (!evt.willRetry) { /* 等 agent_settled 收尾 */ }
@@ -380,7 +380,7 @@ function dispatch(evt) {
 					}
 				}
 			}
-			scheduleCtxRingRefresh(); // assistant 消息提交
+			scheduleContextUsageRefresh(); // assistant 消息提交
 			return;
 		case "tool_execution_start": {
 			hideRunning();
@@ -414,7 +414,7 @@ function dispatch(evt) {
 				fillToolDetail(refs, refs.args, toolResultText(evt.result), evt.isError);
 			}
 			if (streaming) showRunning("执行完成，继续处理…");
-			scheduleCtxRingRefresh(); // toolResult 已入上下文
+			scheduleContextUsageRefresh(); // toolResult 已入上下文
 			return;
 		}
 		case "auto_retry_start":
@@ -427,8 +427,8 @@ function dispatch(evt) {
 			toast("上下文压缩中…");
 			return;
 		case "compaction_end":
-			if (evt.result) toast(`上下文已压缩：${evt.result.tokensBefore} → 约 ${evt.result.estimatedTokensAfter} tokens`);
-			scheduleCtxRingRefresh(); // 压缩后上下文骤变
+			if (evt.result) toast(`上下文已压缩：${evt.result.tokensBefore} → 约 ${evt.result.estimatedTokensAfter}`);
+			scheduleContextUsageRefresh(); // 压缩后上下文骤变
 			return;
 		case "extension_ui_request":
 			handleExtensionUI(evt);
@@ -460,7 +460,7 @@ function dispatch(evt) {
 				})
 				.catch(() => {});
 			refreshSessions();
-			scheduleCtxRingRefresh(); // 新会话/切换会话，重置圆环
+			scheduleContextUsageRefresh(); // 新会话/切换会话，重置占用
 			return;
 		default:
 			return;
@@ -668,6 +668,8 @@ async function initSession() {
 		// 恢复历史消息（刷新页面后）
 		await rebuildFromMessages();
 		refreshSessions();
+		refreshDebugState();
+		refreshContextUsage();
 	} catch (err) {
 		console.error(err);
 		toast(`初始化失败：${err.message}`, "error", 8000);
@@ -692,15 +694,19 @@ function resetChatView() {
 	setStreaming(false);
 	const hint = el("div", "empty-hint");
 	hint.id = "emptyHint";
-	hint.innerHTML = '<div class="empty-title">开始一段对话</div><div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧 Context 可实时查看。</div>';
+	hint.innerHTML = '<div class="empty-title">开始一段对话</div><div class="empty-sub">piwpi 会把工具读取的文件挂载进上下文，右侧上下文可实时查看。</div>';
 	msgCol.appendChild(hint);
+}
+
+function thinkingLevelLabel(level) {
+	return ({ off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" })[level] ?? "自定义";
 }
 
 function setupThinkingPicker(levels, current) {
 	const sel = $("#thinkingSel");
 	sel.innerHTML = "";
 	for (const lv of levels) {
-		const opt = el("option", null, lv);
+		const opt = el("option", null, thinkingLevelLabel(lv));
 		opt.value = lv;
 		sel.appendChild(opt);
 	}
@@ -709,7 +715,7 @@ function setupThinkingPicker(levels, current) {
 	sel.onchange = async () => {
 		try {
 			const res = await rpc({ type: "set_thinking_level", level: sel.value });
-			if (res.success) toast(`思考强度已切换为 ${sel.value}`);
+			if (res.success) toast(`思考强度已切换为${thinkingLevelLabel(sel.value)}`);
 			else toast(`切换失败：${res.error}`, "error");
 		} catch (err) {
 			toast(`切换失败：${err.message}`, "error");
@@ -961,10 +967,6 @@ function setupInput() {
 
 /* ================= Context 抽屉（debug API） ================= */
 const drawer = $("#drawer");
-let debugEvents = null;
-let refreshTimer = null;
-let lastDebugRefresh = 0; // 最近一次成功刷新快照的时间戳（兜底轮询基准）
-let drawerIdleTimer = null; // 抽屉打开时的 30s 兜底轮询（SSE 事件丢失时自行拉一次）
 
 function setupDrawer() {
 	const ctxBtn = $("#btnContext");
@@ -975,68 +977,14 @@ function setupDrawer() {
 			requestAnimationFrame(() => drawer.classList.add("open"));
 			ctxBtn.classList.add("open");
 			refreshDebugState();
-			// 兜底：事件驱动为主，仅当 30s 内无任何刷新（事件丢失/断线窗口）才自行拉一次
-			clearInterval(drawerIdleTimer);
-			drawerIdleTimer = setInterval(() => {
-				if (Date.now() - lastDebugRefresh > 30000) refreshDebugState();
-			}, 30000);
+			refreshContextUsage();
 		} else {
 			drawer.classList.remove("open");
 			ctxBtn.classList.remove("open");
-			clearInterval(drawerIdleTimer);
-			drawerIdleTimer = null;
 			setTimeout(() => (drawer.hidden = true), 220);
 		}
 	});
-	connectDebugEvents();
 	refreshDebugState(); // 页面加载即拉一次，更新徽标
-}
-
-let debugReconnectTimer = null;
-
-function connectDebugEvents() {
-	if (debugEvents) { try { debugEvents.close(); } catch {} debugEvents = null; }
-	clearTimeout(debugReconnectTimer);
-
-	debugEvents = new EventSource("/debug/events");
-	debugEvents.addEventListener("piwpi", (e) => {
-		let evt;
-		try { evt = JSON.parse(e.data); } catch { return; }
-		logDebugEvent(evt);
-		// 去抖刷新快照（抽屉打开时立即刷新，关闭时仅更新徽标）
-		clearTimeout(refreshTimer);
-		refreshTimer = setTimeout(refreshDebugState, 400);
-		// Project Map 页可见时同步刷新（memory_updated / memory_batch_done / map_stale 等事件）
-		if (mapVisible) {
-			clearTimeout(mapRefreshTimer);
-			mapRefreshTimer = setTimeout(refreshMap, 400);
-		}
-	});
-	debugEvents.onopen = () => {
-		// 重连成功一律补拉快照（抽屉开着也要：断线窗口内的 restore/context 事件已丢失，
-		// 不补拉就会一直停在旧状态，直到手动开关抽屉）
-		refreshDebugState();
-		// debug 服务晚启动：重连成功后补刷新 map 页（此前可能停在"未连接"错误态）
-		if (mapVisible) refreshMap();
-	};
-	debugEvents.onerror = () => {
-		try { debugEvents.close(); } catch {}
-		debugEvents = null;
-		if (!drawer.hidden) $("#ctxMeta").textContent = "debug 服务未连接（扩展未启动？），正在重连…";
-		debugReconnectTimer = setTimeout(connectDebugEvents, 3000);
-	};
-}
-
-function logDebugEvent(evt) {
-	const list = $("#eventList");
-	const item = el("div", "event-item");
-	const time = new Date(evt.ts ?? Date.now()).toLocaleTimeString("zh-CN", { hour12: false });
-	const type = el("span", "ev-type", evt.type);
-	item.append(`${time} `, type);
-	if (evt.pluginId) item.append(` ${shortenPluginId(evt.pluginId)}`);
-	if (evt.kind) item.append(` (${evt.kind})`);
-	list.prepend(item);
-	while (list.children.length > 30) list.lastChild.remove();
 }
 
 function shortenPluginId(id) {
@@ -1053,14 +1001,12 @@ async function refreshDebugState() {
 		if (state.cwd) debugCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
 		renderPlugins(state.plugins ?? []);
 		renderContext(state.context);
-		lastDebugRefresh = Date.now(); // 刷新成功即重置兜底计时
 	} catch {
 		$("#ctxBadge").textContent = "!";
 	}
 }
 
 function renderPlugins(plugins) {
-	$("#ctxBadge").textContent = String(plugins.length);
 	$("#fileCount").textContent = String(plugins.length);
 	const list = $("#fileList");
 	list.innerHTML = "";
@@ -1125,341 +1071,283 @@ async function showPluginDetail(id) {
 	} catch { /* ignore */ }
 }
 
-/* ================= 上下文分布圆环 ================= */
-// 分类顺序即圆环与图例的渲染顺序（与 pi 侧 estimateContextBreakdown 的 key 对应）
+/* ================= Context telemetry dashboard ================= */
 const CTX_CATS = [
-  { key: "system", label: "系统提示词", color: "#7167E8" },
-  { key: "tools", label: "工具定义", color: "#A78BFA" },
-  { key: "user", label: "用户消息", color: "#3F9E63" },
-  { key: "assistant", label: "助手回复", color: "#38A3A5" },
-  { key: "thinking", label: "思考过程", color: "#E0A82E" },
-  { key: "toolCalls", label: "工具调用参数", color: "#5B8DEF" },
-  { key: "toolResults", label: "工具输出", color: "#D96C6C" },
-  { key: "images", label: "图片", color: "#D96CA8" },
+	{ key: "system", label: "系统提示词", icon: "SYS", color: "#7167E8" },
+	{ key: "tools", label: "工具定义", icon: "DEF", color: "#A78BFA" },
+	{ key: "user", label: "用户消息", icon: "USR", color: "#3F9E63" },
+	{ key: "assistant", label: "助手回复", icon: "AST", color: "#38A3A5" },
+	{ key: "thinking", label: "思考过程", icon: "THK", color: "#E0A82E" },
+	{ key: "toolCalls", label: "工具调用", icon: "CALL", color: "#5B8DEF" },
+	{ key: "toolResults", label: "工具输出", icon: "OUT", color: "#D96C6C" },
+	{ key: "images", label: "图片", icon: "IMG", color: "#D96CA8" },
 ];
-let ctxBreakdown = null; // { breakdown, contextWindow, percent } | null，最新一次成功快照
-let ctxPopoverOpen = false;
-let ctxRingTimer = 0; // 去抖定时器
-let ctxFetchSeq = 0; // 递增序号：丢弃过期响应
+let ctxBreakdown = null;
+let ctxUsageTimer = 0;
+let ctxFetchSeq = 0;
+let ctxChartKey = null;
 
-/** k/M 缩写（对齐 pi footer 的 formatTokens 语义） */
 function formatTokens(n) {
-  if (n < 1000) return String(n);
-  if (n < 10000) return (n / 1000).toFixed(1) + "k";
-  if (n < 1e6) return Math.round(n / 1000) + "k";
-  if (n < 1e7) return (n / 1e6).toFixed(1) + "M";
-  return Math.round(n / 1e6) + "M";
+	if (n < 1000) return String(n);
+	if (n < 10000) return (n / 1000).toFixed(1) + "k";
+	if (n < 1e6) return Math.round(n / 1000) + "k";
+	if (n < 1e7) return (n / 1e6).toFixed(1) + "M";
+	return Math.round(n / 1e6) + "M";
 }
 
-/** 百分比显示：≥10 取整，<10 一位小数，>0 且 <0.1 显示 <0.1% */
 function fmtPct(p) {
-  if (!Number.isFinite(p) || p <= 0) return "0%";
-  if (p < 0.1) return "<0.1%";
-  if (p < 10) return p.toFixed(1) + "%";
-  return Math.round(p) + "%";
+	if (!Number.isFinite(p) || p <= 0) return "0%";
+	if (p < 0.1) return "<0.1%";
+	if (p < 10) return p.toFixed(1) + "%";
+	return Math.round(p) + "%";
 }
 
-/** 输入框旁的迷你单段进度环（r=7，C≈43.98） */
-function renderMiniRing(pct) {
-  const progress = document.querySelector("#btnCtxRing .ring-progress");
-  const C = 2 * Math.PI * 7;
-  if (pct === null || pct === undefined || Number.isNaN(pct)) {
-    progress.classList.add("none");
-    progress.classList.remove("warn", "high");
-    return;
-  }
-  progress.classList.remove("none", "warn", "high");
-  if (pct >= 85) progress.classList.add("high");
-  else if (pct >= 60) progress.classList.add("warn");
-  const clamped = Math.min(Math.max(pct, 0), 100);
-  progress.style.strokeDasharray = `${C.toFixed(2)} ${C.toFixed(2)}`;
-  progress.style.strokeDashoffset = (C * (1 - clamped / 100)).toFixed(2);
+function contextSegments(data) {
+	const breakdown = data?.breakdown ?? {};
+	return CTX_CATS.map((category) => ({ ...category, tokens: Number(breakdown[category.key]) || 0 }))
+		.filter((segment) => segment.tokens > 0);
 }
 
-/** 多段圆环 SVG（viewBox 120，R=48，C≈301.59，段间 gap=3，12 点起顺时针） */
 function donutHtml(segs, total, pct) {
-  const C = 2 * Math.PI * 48;
-  const GAP = 3;
-  const center =
-    `<text x="60" y="57" text-anchor="middle" dominant-baseline="middle" class="donut-pct">${fmtPct(pct)}</text>` +
-    `<text x="60" y="74" text-anchor="middle" class="donut-cap">已用</text>`;
-  if (total <= 0 || segs.length === 0) {
-    return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">` +
-      `<circle cx="60" cy="60" r="48" fill="none" stroke="var(--border)" stroke-width="16"/>${center}</svg>`;
-  }
-  let start = 0;
-  let circles = "";
-  for (const s of segs) {
-    const len = Math.max((s.tokens / total) * C - GAP, 0.75);
-    circles +=
-      `<circle class="donut-seg" data-key="${s.key}" cx="60" cy="60" r="48" stroke="${s.color}"` +
-      ` stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}"` +
-      ` stroke-dashoffset="${(-start).toFixed(2)}" transform="rotate(-90 60 60)"/>`;
-    start += (s.tokens / total) * C;
-  }
-  return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">${circles}${center}</svg>`;
+	const circumference = 2 * Math.PI * 48;
+	const gap = 3;
+	const center =
+		`<text x="60" y="57" text-anchor="middle" dominant-baseline="middle" class="donut-pct">${fmtPct(pct)}</text>` +
+		`<text x="60" y="74" text-anchor="middle" class="donut-cap">已用</text>`;
+	if (total <= 0 || segs.length === 0) {
+		return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg"><circle cx="60" cy="60" r="48" fill="none" stroke="var(--border)" stroke-width="16"/>${center}</svg>`;
+	}
+	let start = 0;
+	let circles = "";
+	for (const segment of segs) {
+		const sweep = (segment.tokens / total) * circumference;
+		const length = Math.max(sweep - gap, 0.75);
+		const middleAngle = ((start + sweep / 2) / circumference) * 360 - 90;
+		const radians = middleAngle * Math.PI / 180;
+		const lift = 5;
+		const liftX = Math.cos(radians) * lift;
+		const liftY = Math.sin(radians) * lift;
+		circles +=
+			`<g class="donut-seg-wrap" data-key="${segment.key}" style="--lift-x:${liftX.toFixed(2)}px;--lift-y:${liftY.toFixed(2)}px">` +
+			`<circle class="donut-seg" data-key="${segment.key}" cx="60" cy="60" r="48" stroke="${segment.color}"` +
+			` stroke-dasharray="${length.toFixed(2)} ${(circumference - length).toFixed(2)}"` +
+			` stroke-dashoffset="${(-start).toFixed(2)}" transform="rotate(-90 60 60)"/></g>`;
+		start += sweep;
+	}
+	return `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">${circles}${center}</svg>`;
+}
+
+function setContextChartHighlight(key) {
+	const hasKey = Boolean(key);
+	for (const node of document.querySelectorAll("#ctxChartDonut .donut-seg-wrap")) {
+		const active = hasKey && node.dataset.key === key;
+		node.classList.toggle("focus", active);
+		node.classList.remove("dim");
+	}
+	for (const node of document.querySelectorAll("#ctxChartLegend .ctx-lg-row")) {
+		const active = hasKey && node.dataset.key === key;
+		node.classList.toggle("focus", active);
+		node.classList.remove("dim");
+	}
+}
+
+function bindContextChartHover() {
+	const targets = [
+		...document.querySelectorAll("#ctxChartLegend .ctx-lg-row"),
+		...document.querySelectorAll("#ctxChartDonut .donut-seg-wrap"),
+	];
+	for (const target of targets) {
+		target.addEventListener("mouseenter", () => setContextChartHighlight(target.dataset.key));
+		target.addEventListener("mouseleave", () => setContextChartHighlight(null));
+		target.addEventListener("focus", () => setContextChartHighlight(target.dataset.key));
+		target.addEventListener("blur", () => setContextChartHighlight(null));
+	}
 }
 
 function legendHtml(segs, total) {
-  return segs.map((s) => {
-    const pct = (s.tokens / total) * 100;
-    return `<div class="ctx-lg-row" data-key="${s.key}">` +
-      `<span class="lg-swatch" style="background:${s.color}"></span>` +
-      `<span class="lg-name">${s.label}</span>` +
-      `<span class="lg-tokens">${formatTokens(s.tokens)}</span>` +
-      `<span class="lg-pct">${fmtPct(pct)}</span></div>`;
-  }).join("");
+	return segs.map((segment) => {
+		const pct = total > 0 ? (segment.tokens / total) * 100 : 0;
+		return `<div class="ctx-lg-row" data-key="${segment.key}">` +
+			`<span class="lg-swatch" style="background:${segment.color}"></span>` +
+			`<span class="lg-name">${segment.label}</span>` +
+			`<span class="lg-tokens">${formatTokens(segment.tokens)}</span>` +
+			`<span class="lg-pct">${fmtPct(pct)}</span></div>`;
+	}).join("");
 }
 
-function renderCtxPopover(data) {
-  const donut = $("#ctxDonut");
-  const legend = $("#ctxLegend");
-  const foot = $("#ctxFoot");
-  if (!data) {
-    donut.innerHTML = `<div class="ctx-empty">暂无上下文数据（模型未就绪）</div>`;
-    legend.innerHTML = "";
-    foot.innerHTML = "";
-    return;
-  }
-  const bd = data.breakdown;
-  const total = bd.total || 0;
-  const segs = CTX_CATS.map((c) => ({ ...c, tokens: bd[c.key] || 0 })).filter((s) => s.tokens > 0);
-  donut.innerHTML = total > 0
-    ? donutHtml(segs, total, data.percent ?? 0)
-    : `<div class="ctx-empty">暂无上下文内容<br>系统提示词与工具定义也会计入</div>`;
-  legend.innerHTML = legendHtml(segs, total);
-  foot.innerHTML = total > 0
-    ? `共 <b>${formatTokens(total)}</b> tokens · 上下文窗口 <b>${formatTokens(data.contextWindow)}</b> · 已用 <b>${fmtPct(data.percent)}</b>`
-    : `上下文窗口 <b>${formatTokens(data.contextWindow)}</b>`;
+function renderContextDashboard(data) {
+	const breakdown = data?.breakdown ?? {};
+	const total = Number(breakdown.total) || 0;
+	const pct = Number(data?.percent) || 0;
+	$("#ctxBadge").textContent = data ? fmtPct(pct) : "—";
+	const circumference = 2 * Math.PI * 48;
+	const progress = $("#ctxGaugeProgress");
+	const gaugePct = $("#ctxGaugePct");
+	const state = $("#ctxUsageState");
+	if (total > 0) {
+		progress.classList.remove("none", "warn", "high");
+		if (pct >= 85) progress.classList.add("high");
+		else if (pct >= 60) progress.classList.add("warn");
+		progress.style.strokeDasharray = `${circumference.toFixed(2)} ${circumference.toFixed(2)}`;
+		progress.style.strokeDashoffset = (circumference * (1 - Math.min(Math.max(pct, 0), 100) / 100)).toFixed(2);
+		gaugePct.textContent = fmtPct(pct);
+		state.textContent = "已更新";
+		state.classList.add("on");
+	} else {
+		progress.classList.remove("warn", "high");
+		progress.classList.add("none");
+		gaugePct.textContent = "—";
+		state.textContent = "等待数据";
+		state.classList.remove("on");
+	}
+	$("#ctxUsedTokens").textContent = total > 0 ? formatTokens(total) : "—";
+	$("#ctxWindowTokens").textContent = data?.contextWindow ? formatTokens(data.contextWindow) : "—";
+	$("#ctxMessageStat").textContent = String(contextMessages.length);
+	$("#ctxToolStat").textContent = String(contextToolResultCount);
+}
+function renderContextChart(key) {
+	const data = ctxBreakdown;
+	const breakdown = data?.breakdown ?? {};
+	const total = Number(breakdown.total) || 0;
+	const segments = contextSegments(data);
+	const focus = segments.find((segment) => segment.key === key);
+	const focusPct = focus && total > 0 ? (focus.tokens / total) * 100 : Number(data?.percent) || 0;
+	$("#ctxChartTitle").textContent = focus?.label ?? "上下文组成";
+	$("#ctxChartSubtitle").textContent = focus ? "该类别在当前上下文中的占用" : "系统提示词、消息与工具数据的实时估算";
+	$("#ctxChartValue").textContent = focus ? formatTokens(focus.tokens) : formatTokens(total);
+	$("#ctxChartPercent").textContent = focus ? `${fmtPct(focusPct)} · 占用` : `${fmtPct(Number(data?.percent) || 0)} · 已用`;
+	$("#ctxChartDonut").innerHTML = donutHtml(segments, total, Number(data?.percent) || 0);
+	$("#ctxChartLegend").innerHTML = legendHtml(segments, total);
+	$("#ctxChartFoot").textContent = data
+		? `上下文窗口 ${formatTokens(data.contextWindow)} · 总量 ${formatTokens(total)}`
+		: "模型就绪后显示占用数据";
+	bindContextChartHover();
 }
 
-/** 拉取最新上下文分布；用 ctxFetchSeq 丢弃过期响应，失败时保留上次状态 */
-async function refreshCtxRing() {
-  try { await esOpened; } catch { return; } // 等 SSE 就绪再发 rpc（同 initSession）
-  const seq = ++ctxFetchSeq;
-  try {
-    const res = await rpc({ type: "get_context_breakdown" }, 8000);
-    if (seq !== ctxFetchSeq || !res.success) return;
-    ctxBreakdown = res.data ?? null;
-    renderMiniRing(ctxBreakdown ? ctxBreakdown.percent : null);
-    if (ctxPopoverOpen) renderCtxPopover(ctxBreakdown);
-  } catch {
-    // 静默：保留上次成功状态
-  }
+function openContextChart(key = null) {
+	ctxChartKey = key;
+	renderContextChart(key);
+	$("#ctxAllViewer").hidden = true;
+	const detail = $("#ctxChartDetail");
+	detail.hidden = false;
+	detail.scrollTop = 0;
 }
 
-/** 事件驱动的去抖刷新（每轮最多收敛到一次请求） */
-function scheduleCtxRingRefresh() {
-  clearTimeout(ctxRingTimer);
-  ctxRingTimer = setTimeout(refreshCtxRing, 500);
+function closeContextChart() {
+	$("#ctxChartDetail").hidden = true;
+	ctxChartKey = null;
 }
 
-function openCtxPopover() {
-  ctxPopoverOpen = true;
-  $("#ctxPopover").hidden = false;
-  $("#btnCtxRing").setAttribute("aria-expanded", "true");
-  refreshCtxRing(); // 打开即强拉最新数据
-}
-function closeCtxPopover() {
-  ctxPopoverOpen = false;
-  $("#ctxPopover").hidden = true;
-  $("#btnCtxRing").setAttribute("aria-expanded", "false");
-}
-
-/** 图例行 ↔ 圆环段 hover 联动（事件委托，dim 非目标） */
-function bindCtxPopoverHover() {
-  const pop = $("#ctxPopover");
-  pop.addEventListener("mouseover", (e) => {
-    const row = e.target.closest(".ctx-lg-row");
-    const seg = e.target.closest(".donut-seg");
-    const key = row?.dataset.key ?? seg?.dataset.key;
-    if (!key) return;
-    document.querySelectorAll(".donut-seg").forEach((s) => s.classList.toggle("dim", s.dataset.key !== key));
-    document.querySelectorAll(".ctx-lg-row").forEach((r) => r.classList.toggle("dim", r.dataset.key !== key));
-  });
-  pop.addEventListener("mouseout", () => {
-    document.querySelectorAll(".donut-seg, .ctx-lg-row").forEach((n) => n.classList.remove("dim"));
-  });
+async function refreshContextUsage() {
+	try { await esOpened; } catch { return; }
+	const seq = ++ctxFetchSeq;
+	try {
+		const res = await rpc({ type: "get_context_breakdown" }, 8000);
+		if (seq !== ctxFetchSeq || !res.success) return;
+		ctxBreakdown = res.data ?? null;
+		renderContextDashboard(ctxBreakdown);
+		if (!$("#ctxChartDetail").hidden) renderContextChart(ctxChartKey);
+	} catch {
+		// 保留上次成功的数据，避免面板闪烁
+	}
 }
 
-function setupCtxRing() {
-  const btn = $("#btnCtxRing");
-  const pop = $("#ctxPopover");
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation(); // 避免触发 document 关闭
-    if (ctxPopoverOpen) closeCtxPopover();
-    else openCtxPopover();
-  });
-  $("#btnCtxClose").addEventListener("click", closeCtxPopover);
-  document.addEventListener("click", (e) => {
-    if (ctxPopoverOpen && !pop.contains(e.target) && !btn.contains(e.target)) closeCtxPopover();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && ctxPopoverOpen) closeCtxPopover();
-  });
-  bindCtxPopoverHover();
-  renderMiniRing(null); // 初始空态：仅 track + 顶部小点
-  scheduleCtxRingRefresh(); // 页面加载即拉一次
+function scheduleContextUsageRefresh() {
+	clearTimeout(ctxUsageTimer);
+	ctxUsageTimer = setTimeout(() => {
+		refreshDebugState();
+		refreshContextUsage();
+	}, 500);
 }
 
-const CTX_PAGE_SIZE = 18;
+function setupContextDashboard() {
+	$("#ctxUsageSummary").addEventListener("click", () => openContextChart());
+	$("#ctxChartOpen").addEventListener("click", () => openContextChart());
+	$("#ctxOpenAll").addEventListener("click", openContextViewer);
+	$("#ctxViewerSearch").addEventListener("input", (event) => {
+		contextViewerQuery = event.target.value.trim();
+		renderContextViewer();
+	});
+	$("#ctxChartClose").addEventListener("click", closeContextChart);
+	$("#ctxViewerClose").addEventListener("click", closeContextViewer);
+	document.addEventListener("keydown", (event) => {
+		if (event.key !== "Escape") return;
+		if (!$("#ctxAllViewer").hidden) closeContextViewer();
+		else if (!$("#ctxChartDetail").hidden) closeContextChart();
+	});
+	renderContextDashboard(null);
+	scheduleContextUsageRefresh();
+}
+
 let contextMessages = [];
-let contextQuery = "";
-let contextFilter = "all";
-let contextPage = 1;
-let contextFollowLatest = true;
-let contextDetailIndex = -1;
+let contextToolResultCount = 0;
+let contextViewerQuery = "";
 
 function contextRoleName(message) {
-	if (message.role === "toolResult") return "工具";
-	if (message.role === "user") return "用户";
-	if (message.role === "assistant") return "助手";
-	return message.role || "消息";
-}
-
-function contextRoleClass(message) {
-	if (message.role === "toolResult") return "tool";
-	if (message.role === "user") return "user";
-	if (message.role === "assistant") return "assistant";
-	return "other";
+	return ({ system: "系统", toolResult: "工具", user: "用户", assistant: "助手" })[message.role] ?? "消息";
 }
 
 function contextMessageText(message) {
 	return message.text || (message.hasImage ? "[图片]" : "");
 }
 
-function filteredContextMessages() {
-	const query = contextQuery.toLocaleLowerCase();
+function contextViewerRecords() {
+	const query = contextViewerQuery.toLocaleLowerCase();
 	return contextMessages
 		.map((message, index) => ({ message, index }))
 		.filter(({ message }) => {
-			if (contextFilter !== "all" && message.role !== contextFilter) return false;
 			if (!query) return true;
-			const haystack = `${message.role} ${message.toolCallId ?? ""} ${contextMessageText(message)}`.toLocaleLowerCase();
+			const haystack = `${contextRoleName(message)} ${message.role} ${message.toolCallId ?? ""} ${contextMessageText(message)}`.toLocaleLowerCase();
 			return haystack.includes(query);
 		});
 }
 
-function contextPageTotal(matches) {
-	return Math.max(1, Math.ceil(matches.length / CTX_PAGE_SIZE));
+function renderContextViewer() {
+	const records = contextViewerRecords();
+	const query = contextViewerQuery;
+	$("#ctxViewerMeta").textContent = query
+		? `${records.length} / ${contextMessages.length} 条消息`
+		: `${contextMessages.length} 条消息 · ${contextToolResultCount} 条工具输出`;
+	$("#ctxViewerMatch").textContent = query ? `${records.length} 条匹配` : "";
+	$("#ctxAllText").textContent = records.map(({ message, index }) => {
+		const role = contextRoleName(message);
+		const toolId = message.toolCallId ? `\n工具标识   ${message.toolCallId}` : "";
+		const text = contextMessageText(message) || "[无文本内容]";
+		return `[${String(index + 1).padStart(3, "0")}] ${role}${toolId}\n${text}`;
+	}).join("\n\n") || "没有匹配的上下文";
 }
 
-function renderContextDetail(index) {
-	const message = contextMessages[index];
-	if (!message) return;
-	$("#ctxDetailIndex").textContent = `消息 #${index + 1}`;
-	$("#ctxDetailRole").textContent = contextRoleName(message);
-	$("#ctxDetailMeta").textContent = message.toolCallId ? `工具 ID · ${message.toolCallId}` : "上下文原文摘要";
-	$("#ctxDetailText").textContent = contextMessageText(message) || "（无文本内容）";
+function openContextViewer() {
+	closeContextChart();
+	renderContextViewer();
+	$("#ctxAllViewer").hidden = false;
+	$("#ctxAllText").scrollTop = 0;
 }
 
-function openContextDetail(index) {
-	contextDetailIndex = index;
-	renderContextDetail(index);
-	$("#ctxDetail").hidden = false;
-	renderContextIndex();
-}
-
-function closeContextDetail() {
-	contextDetailIndex = -1;
-	$("#ctxDetail").hidden = true;
-}
-
-function renderContextIndex() {
-	const list = $("#ctxList");
-	const matches = filteredContextMessages();
-	const totalPages = contextPageTotal(matches);
-	if (contextFollowLatest) contextPage = totalPages;
-	contextPage = Math.min(Math.max(contextPage, 1), totalPages);
-
-	const start = (contextPage - 1) * CTX_PAGE_SIZE;
-	const pageMatches = matches.slice(start, start + CTX_PAGE_SIZE);
-	const end = start + pageMatches.length;
-	$("#ctxPageTotal").textContent = String(totalPages);
-	$("#ctxPageInput").value = String(contextPage);
-	$("#ctxPageInput").max = String(totalPages);
-	$("#ctxPrev").disabled = contextPage <= 1;
-	$("#ctxNext").disabled = contextPage >= totalPages;
-	$("#ctxRange").textContent = matches.length > 0 ? `${start + 1}–${end} / ${matches.length}` : "0 条结果";
-	$("#ctxMatchCount").textContent = contextQuery || contextFilter !== "all" ? `${matches.length} 条匹配` : "";
-
-	list.innerHTML = "";
-	if (pageMatches.length === 0) {
-		list.appendChild(el("div", "drawer-empty", contextMessages.length ? "没有匹配的消息" : "暂无上下文消息"));
-		return;
-	}
-
-	for (const { message, index } of pageMatches) {
-		const row = el("button", `ctx-index-row ctx-role-${contextRoleClass(message)}`);
-		row.type = "button";
-		row.classList.toggle("selected", index === contextDetailIndex);
-		row.title = contextMessageText(message) || "（无文本内容）";
-		row.appendChild(el("span", "ctx-index-no", `#${String(index + 1).padStart(3, "0")}`));
-		row.appendChild(el("span", "ctx-role-dot"));
-		row.appendChild(el("span", "ctx-index-role", contextRoleName(message)));
-		const preview = contextMessageText(message).replace(/\s+/g, " ").trim() || "（无文本内容）";
-		row.appendChild(el("span", "ctx-index-preview", preview));
-		if (message.toolCallId) {
-			row.appendChild(el("span", "ctx-index-id", String(message.toolCallId).replace(/^call_/, "").slice(0, 7)));
-		}
-		row.addEventListener("click", () => openContextDetail(index));
-		list.appendChild(row);
-	}
-}
-
-function moveContextPage(delta) {
-	const totalPages = contextPageTotal(filteredContextMessages());
-	contextPage = Math.min(Math.max(contextPage + delta, 1), totalPages);
-	contextFollowLatest = contextPage === totalPages;
-	renderContextIndex();
-}
-
-function setupContextNavigator() {
-	$("#ctxSearch").addEventListener("input", (event) => {
-		contextQuery = event.target.value.trim();
-		contextPage = 1;
-		contextFollowLatest = false;
-		renderContextIndex();
-	});
-	$("#ctxFilter").addEventListener("change", (event) => {
-		contextFilter = event.target.value;
-		contextPage = 1;
-		contextFollowLatest = false;
-		renderContextIndex();
-	});
-	$("#ctxPrev").addEventListener("click", () => moveContextPage(-1));
-	$("#ctxNext").addEventListener("click", () => moveContextPage(1));
-	$("#ctxPageInput").addEventListener("change", (event) => {
-		const totalPages = contextPageTotal(filteredContextMessages());
-		const requested = Number.parseInt(event.target.value, 10);
-		contextPage = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), totalPages) : 1;
-		contextFollowLatest = contextPage === totalPages;
-		renderContextIndex();
-	});
-	$("#ctxDetailClose").addEventListener("click", closeContextDetail);
+function closeContextViewer() {
+	$("#ctxAllViewer").hidden = true;
+	contextViewerQuery = "";
+	$("#ctxViewerSearch").value = "";
 }
 
 function renderContext(ctx) {
-	const hadMessages = contextMessages.length > 0;
 	if (!ctx) {
 		contextMessages = [];
-		contextPage = 1;
-		contextFollowLatest = true;
+		contextToolResultCount = 0;
+		ctxBreakdown = null;
+		$("#ctxBadge").textContent = "—";
 		$("#msgCount").textContent = "0";
-		$("#ctxMeta").textContent = "等待第一次 LLM 请求…";
-		closeContextDetail();
-		renderContextIndex();
+		$("#ctxMeta").textContent = "等待首次请求…";
+		renderContextDashboard(null);
+		renderContextViewer();
 		return;
 	}
 	contextMessages = Array.isArray(ctx.messages) ? ctx.messages : [];
-	if (!hadMessages && contextMessages.length > 0) contextFollowLatest = true;
+	contextToolResultCount = Number(ctx.toolResultCount) || 0;
 	$("#msgCount").textContent = String(ctx.messageCount ?? contextMessages.length);
-	$("#ctxMeta").textContent = `刷新 ${new Date(ctx.ts).toLocaleTimeString("zh-CN", { hour12: false })} · ${ctx.toolResultCount ?? 0} 条工具结果`;
-	renderContextIndex();
-	if (!$("#ctxDetail").hidden && contextDetailIndex >= 0) {
-		if (contextMessages[contextDetailIndex]) renderContextDetail(contextDetailIndex);
-		else closeContextDetail();
-	}
+	$("#ctxMeta").textContent = `刷新 ${new Date(ctx.ts).toLocaleTimeString("zh-CN", { hour12: false })} · ${contextToolResultCount} 条工具输出`;
+	if (ctxBreakdown) renderContextDashboard(ctxBreakdown);
+	if (!$("#ctxAllViewer").hidden) renderContextViewer();
 }
 
 /* ================= Project Map 页面（debug API） ================= */
@@ -1893,6 +1781,8 @@ async function resumeSession(s) {
 			rebuildHistory(messagesRes.data.messages);
 		}
 		refreshSessions();
+		refreshDebugState();
+		refreshContextUsage();
 	} catch (err) {
 		toast(`恢复失败：${err.message}`, "error", 8000);
 	}
@@ -1995,8 +1885,7 @@ chatFlow.addEventListener("click", async (e) => {
 connectEvents();
 setupInput();
 setupDrawer();
-setupContextNavigator();
-setupCtxRing();
+setupContextDashboard();
 setupMap();
 setupProject();
 initSession();
