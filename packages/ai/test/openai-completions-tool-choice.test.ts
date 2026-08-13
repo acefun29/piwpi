@@ -195,7 +195,7 @@ describe("openai-completions tool_choice", () => {
 		expect("strict" in (tool ?? {})).toBe(false);
 	});
 
-	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
+	it("maps unsupported groq qwen3 reasoning levels to none", async () => {
 		const model = getModel("groq", "qwen/qwen3.6-27b")!;
 		let payload: unknown;
 
@@ -220,7 +220,7 @@ describe("openai-completions tool_choice", () => {
 		).result();
 
 		const params = (payload ?? mockState.lastParams) as { reasoning_effort?: string };
-		expect(params.reasoning_effort).toBe("default");
+		expect(params.reasoning_effort).toBe("none");
 	});
 
 	it("keeps normal reasoning_effort for groq models without compat mapping", async () => {

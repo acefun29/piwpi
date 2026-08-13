@@ -369,6 +369,7 @@ export class AgentSession {
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
+	private readonly _piwpiTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
@@ -422,21 +423,19 @@ export class AgentSession {
 			this._piwpiRuntimeRef.harness = this._piwpi;
 			this._piwpiRuntimeRef.context = () => this._getPiwpiContext();
 		}
-		this._customTools.push(
-			...createPiwpiToolDefinitions({
-				harness: this._piwpi,
-				sessionManager: this.sessionManager,
-				getMode: () => this._collaborationMode,
-				select: async (title, options) => {
-					if (!this._extensionUIContext) throw new Error("User input UI is not available");
-					return await this._extensionUIContext.select(title, options);
-				},
-				input: async (title, placeholder) => {
-					if (!this._extensionUIContext) throw new Error("User input UI is not available");
-					return await this._extensionUIContext.input(title, placeholder);
-				},
-			}),
-		);
+		this._piwpiTools = createPiwpiToolDefinitions({
+			harness: this._piwpi,
+			sessionManager: this.sessionManager,
+			getMode: () => this._collaborationMode,
+			select: async (title, options) => {
+				if (!this._extensionUIContext) throw new Error("User input UI is not available");
+				return await this._extensionUIContext.select(title, options);
+			},
+			input: async (title, placeholder) => {
+				if (!this._extensionUIContext) throw new Error("User input UI is not available");
+				return await this._extensionUIContext.input(title, placeholder);
+			},
+		});
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -2751,9 +2750,10 @@ export class AgentSession {
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
 
-		this._baseToolDefinitions = new Map(
-			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
-		);
+		this._baseToolDefinitions = new Map([
+			...Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition] as const),
+			...this._piwpiTools.map((tool) => [tool.name, tool] as const),
+		]);
 
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
