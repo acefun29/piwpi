@@ -8,7 +8,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "start": "electron .",
-    "dev:web": "node server/bridge.mjs",
+    "dev:web": "node server/bridge.mjs --dev",
     "smoke": "node scripts/smoke-rpc.mjs",
     "smoke:layout": "electron electron/layout-smoke.cjs",
     "typecheck:web": "node --check web/app.js"

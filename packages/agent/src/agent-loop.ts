@@ -3,10 +3,12 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 
+import { createHash } from "node:crypto";
 import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type Message,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
@@ -28,6 +30,15 @@ export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
  */
+
+/** P9：per-request trace 门（PIWPI_TRACE=1 或 PI_TIMING=1） */
+const TRACE_ENABLED = process.env.PIWPI_TRACE === "1" || process.env.PI_TIMING === "1";
+
+/** P9：稳定前缀 hash（systemPrompt + 除最后一条外全部消息）——重复问题两次 → 前缀 hash 相同 */
+function stablePrefixHash(systemPrompt: string, llmMessages: Message[]): string {
+	const payload = systemPrompt + JSON.stringify(llmMessages.slice(0, -1));
+	return createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
 export function agentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -46,9 +57,15 @@ export function agentLoop(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch((err) => {
+			// P2-4：runAgentLoop 拒绝（如 convertToLlm 抛错）→ 流必须终止，result() 不挂死
+			console.error(`[agent-loop] agentLoop failed: ${err instanceof Error ? err.message : String(err)}`);
+			stream.end(undefined);
+		});
 
 	return stream;
 }
@@ -85,9 +102,15 @@ export function agentLoopContinue(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch((err) => {
+			// P2-4：runAgentLoopContinue 拒绝 → 流必须终止，result() 不挂死
+			console.error(`[agent-loop] agentLoopContinue failed: ${err instanceof Error ? err.message : String(err)}`);
+			stream.end(undefined);
+		});
 
 	return stream;
 }
@@ -294,6 +317,15 @@ async function streamAssistantResponse(
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
 
+	// P9：provider trace（PIWPI_TRACE=1）——字节数 + 稳定前缀 hash（systemPrompt + 除最后一条外全部消息）
+	const traceStart = Date.now();
+	let traceFirstTokenMs = -1;
+	if (TRACE_ENABLED) {
+		const bytes = JSON.stringify(llmMessages).length;
+		const prefix = await stablePrefixHash(context.systemPrompt, llmMessages);
+		console.debug(`[trace] provider bytes=${bytes} prefix=${prefix} firstTokenMs=pending`);
+	}
+
 	// Build LLM context
 	const llmContext: Context = {
 		systemPrompt: context.systemPrompt,
@@ -315,6 +347,7 @@ async function streamAssistantResponse(
 	let addedPartial = false;
 
 	for await (const event of response) {
+		if (traceFirstTokenMs < 0) traceFirstTokenMs = Date.now() - traceStart; // P9：首个事件到达
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
@@ -355,6 +388,9 @@ async function streamAssistantResponse(
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
 				await emit({ type: "message_end", message: finalMessage });
+				if (TRACE_ENABLED) {
+					console.debug(`[trace] provider firstTokenMs=${traceFirstTokenMs} totalMs=${Date.now() - traceStart}`);
+				}
 				return finalMessage;
 			}
 		}
@@ -368,6 +404,9 @@ async function streamAssistantResponse(
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
 	await emit({ type: "message_end", message: finalMessage });
+	if (TRACE_ENABLED) {
+		console.debug(`[trace] provider firstTokenMs=${traceFirstTokenMs} totalMs=${Date.now() - traceStart}`);
+	}
 	return finalMessage;
 }
 
@@ -496,6 +535,7 @@ async function executeToolCallsParallel(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
+	// P2-2：先按原顺序发 tool_execution_start（事件顺序保持），再并行 prepare
 	for (const toolCall of toolCalls) {
 		await emit({
 			type: "tool_execution_start",
@@ -503,8 +543,14 @@ async function executeToolCallsParallel(
 			toolName: toolCall.name,
 			args: toolCall.arguments,
 		});
+	}
+	const preparations = await Promise.all(
+		toolCalls.map((toolCall) => prepareToolCall(currentContext, assistantMessage, toolCall, config, signal)),
+	);
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+	for (let i = 0; i < toolCalls.length; i++) {
+		const toolCall = toolCalls[i]!;
+		const preparation = preparations[i]!;
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -668,7 +714,33 @@ async function executePreparedToolCall(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallOutcome> {
-	const updateEvents: Promise<void>[] = [];
+	// P2-3：有界更新——只保留最新未消费状态，微任务合并发一次（内存 O(1)，中间态丢弃）；
+	// 工具返回/抛错后若仍有未消费状态再 flush 一次（最终状态不丢）
+	let latestUpdate: unknown = null;
+	let flushScheduled = false;
+	let updateFlush = Promise.resolve();
+	const flushUpdate = async (): Promise<void> => {
+		flushScheduled = false;
+		if (latestUpdate === null) return;
+		const partialResult = latestUpdate;
+		latestUpdate = null;
+		await emit({
+			type: "tool_execution_update",
+			toolCallId: prepared.toolCall.id,
+			toolName: prepared.toolCall.name,
+			args: prepared.toolCall.arguments,
+			partialResult,
+		});
+	};
+	const scheduleUpdate = (partialResult: unknown): void => {
+		latestUpdate = partialResult;
+		if (!flushScheduled) {
+			flushScheduled = true;
+			queueMicrotask(() => {
+				updateFlush = updateFlush.then(flushUpdate);
+			});
+		}
+	};
 	let acceptingUpdates = true;
 
 	try {
@@ -678,25 +750,17 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(
-					Promise.resolve(
-						emit({
-							type: "tool_execution_update",
-							toolCallId: prepared.toolCall.id,
-							toolName: prepared.toolCall.name,
-							args: prepared.toolCall.arguments,
-							partialResult,
-						}),
-					),
-				);
+				scheduleUpdate(partialResult);
 			},
 		);
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await updateFlush;
+		await flushUpdate(); // 收尾：工具已返回，未消费的最终状态发出
 		return { result, isError: false };
 	} catch (error) {
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await updateFlush;
+		await flushUpdate();
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,

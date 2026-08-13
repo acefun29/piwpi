@@ -45,7 +45,7 @@ const LINES = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
 
 const JOB: MemoryJob = { pluginId: "source:file:a", localContext: "改一下认证", dialogueContext: "[user] 看看认证" };
 
-describe("MemoryQueue（计划 §6.1）", () => {
+describe("MemoryQueue（计划 §6.1 / P1-1 shutdown 语义）", () => {
 	it("同一 pluginId 去抖合并为一个 job（最后一次的负载生效）", async () => {
 		const jobs: MemoryJob[] = [];
 		const q = new MemoryQueue(0);
@@ -54,6 +54,7 @@ describe("MemoryQueue（计划 §6.1）", () => {
 		});
 		q.enqueue({ pluginId: "p1", localContext: "first" });
 		q.enqueue({ pluginId: "p1", localContext: "second" });
+		await new Promise((r) => setTimeout(r, 10)); // 等去抖 timer 触发 dispatch
 		await q.flush();
 		expect(jobs).toHaveLength(1);
 		expect(jobs[0]!.localContext).toBe("second");
@@ -69,6 +70,7 @@ describe("MemoryQueue（计划 §6.1）", () => {
 		});
 		q.enqueue({ pluginId: "a", localContext: "" });
 		q.enqueue({ pluginId: "b", localContext: "" });
+		await new Promise((r) => setTimeout(r, 10)); // 等去抖 timer 触发 dispatch
 		await q.flush();
 		expect(order).toEqual(["a", "a-done", "b", "b-done"]);
 	});
@@ -84,7 +86,22 @@ describe("MemoryQueue（计划 §6.1）", () => {
 		const q = new MemoryQueue(0);
 		q.setWorker(() => new Promise<void>(() => {})); // 永不 resolve
 		q.enqueue({ pluginId: "p1", localContext: "" });
+		await new Promise((r) => setTimeout(r, 10)); // 确保 job 已进入运行链
 		await expect(q.flush(50)).rejects.toThrow(/timed out/);
+	});
+
+	it("flush 不再派发 pending：未开始任务保持 pending，cancelPending 丢弃后不运行（P1-1）", async () => {
+		const jobs: MemoryJob[] = [];
+		const q = new MemoryQueue(10_000); // 长去抖：任务绝不会由 timer 自动 dispatch
+		q.setWorker(async (job) => {
+			jobs.push(job);
+		});
+		q.enqueue({ pluginId: "p1", localContext: "never" });
+		await q.flush(); // flush 只等待已运行链，不派发 pending
+		expect(jobs).toHaveLength(0);
+		q.cancelPending(); // 丢弃未开始任务
+		await new Promise((r) => setTimeout(r, 10));
+		expect(jobs).toHaveLength(0); // 从未运行
 	});
 
 	it("enqueueTask 串行执行并与 flush 同步等待", async () => {

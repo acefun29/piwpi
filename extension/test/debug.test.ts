@@ -199,8 +199,9 @@ describe("debug 服务（SSE 实时事件）", () => {
 			],
 		}));
 		let server: DebugServer | undefined;
+		const queue = new MemoryQueue(0);
 		const h = createHarness({
-			queue: new MemoryQueue(0),
+			queue,
 			memoryDeps: { complete, model: { provider: "faux" } },
 			memoryBatchFiles: 1, // 注入小阈值：1 个 pending 文件即触发批量整理
 			cwd: tmp,
@@ -231,10 +232,12 @@ describe("debug 服务（SSE 实时事件）", () => {
 		await new Promise((r) => setTimeout(r, 100)); // 等待 SSE 连接建立
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, text20_40), ctx());
+		// P0-4：批量整理在文件变化前完成（TOCTOU 校验下文件已变 → 结果会被丢弃）
+		await queue.flush();
 		appendFileSync(absFile, "\nline81"); // 尾部追加 1 行 → 变更量 0，重挂载不失效
 		await h.onToolCall(readCall("t2", { path: FILE, offset: 30, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t2", { path: FILE, offset: 30, limit: 21 }, text20_40), ctx());
-		await h.shutdown(); // flush 批量整理链 + shutdown 事件
+		await h.shutdown(); // shutdown 事件
 
 		await Promise.race([
 			frameArrived,

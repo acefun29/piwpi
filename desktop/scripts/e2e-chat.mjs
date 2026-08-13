@@ -9,7 +9,7 @@ import { StringDecoder } from "node:string_decoder";
 
 const prompt = process.argv[2] ?? "读一下 pi/extension/src/hash.ts 的前 20 行，然后告诉我这个文件是做什么的。";
 
-const { server, port, killPi } = await startBridge({ port: 0 });
+const { server, port, killPi } = await startBridge({ port: 0, dev: true });
 
 /** 从 /api/events 消费 pi 事件 */
 async function consumeEvents(onEvent, stopWhen) {

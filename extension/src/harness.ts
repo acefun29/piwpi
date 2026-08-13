@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
 	ContextEvent,
 	ExtensionContext,
@@ -49,6 +52,9 @@ import { render } from "./render.ts";
 import { PluginStore } from "./store.ts";
 import type { Segment, ToolContextPlugin } from "./types.ts";
 
+/** P9：per-request trace 日志门（PIWPI_TRACE=1 或 PI_TIMING=1；与 coding-agent timings.ts 同门） */
+const TRACE_ENABLED = process.env.PIWPI_TRACE === "1" || process.env.PI_TIMING === "1";
+
 /**
  * Harness：tool_call / tool_result / context / session_start / shutdown（计划 §4，M3+M4+M5）。
  *
@@ -57,10 +63,12 @@ import type { Segment, ToolContextPlugin } from "./types.ts";
  * - tool_call handler 异常**没有** runner 隔离（runner.ts:941），会阻断工具执行
  *   → onToolCall 内部必须自带 try/catch（计划 §4.5），本文件所有 handler 统一自带。
  *
- * context 事件语义（VERIFICATION.md #6，对计划 §4.4 的简化）：
- * runner 在分发前 structuredClone(messages)（runner.ts:986）并把该 clone 传给 handler，
- * 无论 handler 返回什么，runner 恒返回该 clone（runner.ts:1013）。
- * → onContext **原地修改 event.messages 即可生效**，返回 void；无变化时零改动（prompt 缓存前缀稳定）。
+ * context 事件语义（P0-1 历史不可变 + 尾部增量，替代旧的原地刷新）：
+ * runner 在分发前 structuredClone(messages)（runner.ts:984）并把该 clone 传给 handler；
+ * handler 返回 { messages } 时 runner 采用之（runner.ts:997-998），否则沿用 clone。
+ * → onContext 不再改写任何历史消息：磁盘变化经 buildMountDelta 计算增量文本，
+ *   追加到返回数组的最后一条消息 content 尾部（新对象，历史消息逐字节不变）；
+ *   delta 为空（无变化挂载）时不返回 messages（runner 沿用 clone，模型视图 = 纯历史）。
  *
  * read 语义事实（read.ts:238-315，M2 已核对）：
  * - offset = 1-based 起始行；limit = 最大行数；输出为 slice(start, end).join("\n") 无行号
@@ -76,10 +84,17 @@ export interface ToolResultEventResult {
 	isError?: boolean;
 }
 
+/** 本地结构类型：上游包根未 re-export ContextEventResult（types.ts:1068-1070 有定义）。
+ * runner 只读取 .messages 字段（runner.ts:997-998），用 ContextEvent["messages"] 保持结构一致。 */
+export interface ContextResult {
+	messages?: ContextEvent["messages"];
+}
+
 export interface Harness {
 	onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<void>;
 	onToolResult(event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined>;
-	onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void>;
+	/** 返回 { messages }（delta 追加到最后一条）时 runner 采用之；undefined 表示无改动（runner 沿用 clone）。 */
+	onContext(event: ContextEvent, ctx: ExtensionContext): Promise<ContextResult | undefined>;
 	onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void>;
 	/** M5.5：每轮结束阈值递减——未达阈值的小量 pending 在有限轮数内必然触发（触发后重置，攒批保持少调用） */
 	onAgentSettled(): void;
@@ -189,15 +204,17 @@ function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
 }
 
 /**
- * 锚点提示通知（onContext 用：把锚点消息替换/追加提示行）。
- * invalidated/deleted → 整体替换为提示；caught-up → 提示行前缀 + 最新渲染（下一轮无 notice 自动干净）。
+ * P0-1 历史不可变机制的状态（buildMountDelta 的确定性输入）：
+ * - anchorHashes：锚点消息在历史中显示内容对应的磁盘 hash。挂载（new）/增量（increment）时置为
+ *   当时磁盘 hash；scanDiskChanges 的重挂载**不更新**（历史锚点文本没变），store.metadata.hash
+ *   会更新 → delta 必须对比 anchorHashes 而非 store hash，否则小改重挂载后模型永远看不到最新内容。
+ * - retiredMounts：已失效/删除但锚点仍在历史中的挂载（插件已不在 store，store.all() 扫不到）；
+ *   同名插件重新挂载（new）时清除。两个 Map 都是纯状态，delta 是状态的纯函数 → 相同输入→相同字节。
  */
-interface AnchorNotice {
-	kind: "invalidated" | "deleted" | "caught-up";
-	anchorToolCallId: string;
-	changedLines?: number;
-	/** 提示行完整文本 */
-	text: string;
+interface RetiredMount {
+	absPath: string;
+	/** 增量条目文本（"挂载已失效…"/"文件已删除…"） */
+	reason: string;
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
@@ -206,9 +223,22 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	const projectMap = options.projectMap ?? new ProjectMap();
 	/** 引用式内容缓存：唯一读盘入口（磁盘是事实源） */
 	const fileCache = new FileContentCache();
-	/** 引用式：插件状态已变化、需要重新渲染锚点消息的插件（渲染后清除；无变化零 IO 零渲染） */
-	const dirtyPlugins = new Set<string>();
+	/** P0-1：锚点历史内容对应的磁盘 hash（见 RetiredMount 注释） */
+	const anchorHashes = new Map<string, string>();
+	/** P0-1：已失效/删除、锚点仍在历史中的挂载 */
+	const retiredMounts = new Map<string, RetiredMount>();
 	const pending = new Map<string, Pending>();
+	/** P0-4：会话代次——记忆整理等异步任务提交前校验（LLM 往返期间会话切换 → 结果丢弃） */
+	let sessionGeneration = 0;
+	/** P1-1：shutdown 已开始 → 不再启动任何新模型调用 */
+	let shuttingDown = false;
+	/** P1-2：记忆模型配置（null = 未配置；undefined = 尚未读取） */
+	let memoryModelConfig: { providerId: string; modelId: string } | null | undefined;
+	/** P1-2：记忆模型缺失/未配置只告警一次 */
+	let memoryModelWarned = false;
+	/** P9：记忆运行统计（debug 快照） */
+	let memoryRunCount = 0;
+	let memoryTokenTotal = 0;
 
 	let cwd = options.cwd ?? process.cwd();
 	/** piwpi 数据目录（惰性取：cwd 随会话变化，数据目录必须跟随当前项目） */
@@ -231,6 +261,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	const SCAN_BATCH = 32;
 	let scanQueue: string[] = [];
 	let scanCursor = 0;
+	/** P1-5：磁盘扫描移出请求关键路径——turn 边界（settled/session_start）置位，turn 内首个 provider 请求前扫描一次 */
+	let scanPending = true;
 
 	/** 调试事件（debug 服务用；无监听者时零开销）。ts 在此填充。 */
 	function emit(event: Omit<DebugEvent, "ts">): void {
@@ -277,7 +309,84 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 			return undefined;
 		}
+		// P1-2：配置了记忆模型 → 用指定低成本模型 + maxTokens 1024（限制输出）；未配置 → 主模型（手动触发路径）
+		const cfg = resolveMemoryModelConfig();
+		if (cfg) {
+			// find 可能缺失（宿主门面形状）→ 解析不到即视为未配置，跳过自动路径
+			const m = typeof modelRegistry.find === "function" ? modelRegistry.find(cfg.providerId, cfg.modelId) : undefined;
+			if (m) {
+				// P9：记忆调用独立 usage 日志（complete 契约不含 usage 时记提示）
+				const wrapped = async (
+					model: unknown,
+					context: Parameters<MemoryAgentDeps["complete"]>[1],
+					callOptions?: Record<string, unknown>,
+				) => {
+					memoryRunCount++;
+					const res = await complete(model, context, callOptions);
+					const usage = (res as { usage?: { input?: number; output?: number; totalTokens?: number } }).usage;
+					const mid = (model as { id?: string } | undefined)?.id ?? "?";
+					if (usage) {
+						memoryTokenTotal += usage.totalTokens ?? 0;
+						console.debug(`[memory] model=${mid} input=${usage.input ?? 0} output=${usage.output ?? 0}`);
+					} else {
+						console.debug(`[memory] model=${mid} input=? output=?（当前 complete 通道不返回 usage）`);
+					}
+					return res;
+				};
+				return { complete: wrapped, model: m, maxTokens: 1024 };
+			}
+			if (!memoryModelWarned) {
+				memoryModelWarned = true;
+				console.warn(`[piwpi] memory model ${cfg.providerId}/${cfg.modelId} 未在供应商配置中找到，自动记忆整理跳过（手动路径回退主模型）`);
+			}
+			return undefined;
+		}
 		return { complete, model: currentModel };
+	}
+
+	/**
+	 * P1-2：记忆模型配置读取（惰性一次）：
+	 * `~/.pi/agent/models.json` 的 memoryModel（与 bridge readModelsConfig 同一文件）→
+	 * 其次 `PIWPI_MEMORY_MODEL` env（`providerId/modelId`，命令行专用）→ 都没有 → null。
+	 */
+	function resolveMemoryModelConfig(): { providerId: string; modelId: string } | null {
+		if (memoryModelConfig !== undefined) return memoryModelConfig;
+		const env = process.env.PIWPI_MEMORY_MODEL;
+		if (env) {
+			const i = env.indexOf("/");
+			memoryModelConfig =
+				i > 0 && i < env.length - 1
+					? { providerId: env.slice(0, i), modelId: env.slice(i + 1) }
+					: null;
+			return memoryModelConfig;
+		}
+		try {
+			const modelsPath = join(homedir(), ".pi", "agent", "models.json");
+			const cfg = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+				memoryModel?: { providerId?: unknown; modelId?: unknown } | null;
+			};
+			memoryModelConfig =
+				cfg.memoryModel &&
+				typeof cfg.memoryModel.providerId === "string" &&
+				typeof cfg.memoryModel.modelId === "string"
+					? { providerId: cfg.memoryModel.providerId, modelId: cfg.memoryModel.modelId }
+					: null;
+		} catch {
+			memoryModelConfig = null; // 文件缺失/损坏 → 未配置
+		}
+		return memoryModelConfig;
+	}
+
+	/** P1-2：自动记忆整理入口（触发点先过此门）——未配置记忆模型 → 跳过并只提示一次。
+	 * options.memoryDeps 注入（测试/宿主显式提供）视为已配置，直接放行。 */
+	function memoryAutoAllowed(): boolean {
+		if (options.memoryDeps) return true;
+		if (resolveMemoryModelConfig() !== null) return true;
+		if (!memoryModelWarned) {
+			memoryModelWarned = true;
+			console.warn("[piwpi] 未配置记忆 Agent 模型（models.json memoryModel 或 PIWPI_MEMORY_MODEL），自动记忆整理已跳过");
+		}
+		return false;
 	}
 
 	function persistPlugin(plugin: ToolContextPlugin): void {
@@ -418,12 +527,14 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	 * 主动磁盘扫描（onContext 每轮调用）。文件被外部修改后**不依赖下一次 read**——
 	 * 引用式：经 file-cache 的 stat 快速通道，文件未变（hash 同）→ 完全跳过，零读盘零渲染。
 	 * 按渐进式队列迭代（挂载文件 + map 条目文件，一次 get 双重校验）：
-	 * 挂载插件：变化量判定（会话内 LCS / 跨会话行指纹）→ 达阈值挂载失效 / 未达主动重挂载并累积；
-	 * map 条目：磁盘驱动校验（hash/chunks 自证过期）→ 累计 → 达阈值软删除（stale），写回合并落盘。
-	 * 返回锚点提示列表（invalidated/deleted/caught-up），onContext 在刷新循环后处理。
+	 * 挂载插件：变化量判定（会话内 LCS / 跨会话行指纹）→ 达阈值挂载失效（记入 retiredMounts）/
+	 * 未达主动重挂载（anchorHashes 不动）；map 条目：磁盘驱动校验（hash/chunks 自证过期）→
+	 * 累计 → 达阈值软删除（stale），写回合并落盘。
+	 * P0-1：失效/删除信息不原地改写历史消息，由 buildMountDelta 产出增量条目。
 	 */
-	async function scanDiskChanges(): Promise<AnchorNotice[]> {
-		const notices: AnchorNotice[] = [];
+	async function scanDiskChanges(): Promise<void> {
+		const traceStart = Date.now();
+		let traceReads = 0;
 		let mapDirty = false;
 		const scanTargets = pickScanBatch()
 			.map((absPath) => {
@@ -453,11 +564,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				if (plugin && isSourceMeta(plugin)) {
 					fileCache.unpin(absPath);
 					store.remove(plugin.id);
-					notices.push({
-						kind: "deleted",
-						anchorToolCallId: plugin.metadata.anchorToolCallId,
-						text: "[piwpi: 文件已删除，挂载已失效]",
-					});
+					sessionGeneration++; // P0-4：挂载移除 → 在途记忆结果作废
+					// P0-1：锚点仍在历史中 → 记入 retired，delta 每轮提示，直到重新挂载
+					retiredMounts.set(plugin.id, { absPath, reason: "文件已删除，挂载失效" });
 				}
 				if (mapEntry && !mapEntry.stale) {
 					mapEntry.stale = true;
@@ -468,6 +577,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			const { entry, old } = r;
 			// —— 挂载插件校验（一次 get 双重校验的一半）——
 			if (plugin && isSourceMeta(plugin) && entry.hash !== plugin.metadata.hash) {
+				traceReads++; // P9：磁盘变更分支必然触发一次显式读
 				const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
 				const changed = changedLinesOf(plugin, old?.lines, diskLines);
 				// 跨会话量化：进程内无旧文本（resume 首轮/大文件/缓存被逐出）但有持久化行指纹
@@ -486,14 +596,14 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				if (accumulated >= changeThreshold(diskLines.length)) {
 					// 达阈值（会话内 LCS 累计 或 跨会话一次性判定）→ 挂载失效（与 updated 分支同语义）
 					// 磁盘驱动：不再 projectMap.delete（map 由条目校验自证过期，不归会话管理）
-					notices.push({
-						kind: "invalidated",
-						anchorToolCallId: plugin.metadata.anchorToolCallId,
-						changedLines: accumulated,
-						text: `[piwpi: 文件大改（${accumulated} 行），挂载已失效，请重新 read]`,
-					});
 					fileCache.unpin(absPath);
 					store.remove(plugin.id);
+					sessionGeneration++; // P0-4：挂载失效 → 在途记忆结果作废
+					// P0-1：锚点仍在历史中 → 记入 retired，delta 每轮提示，直到重新挂载
+					retiredMounts.set(plugin.id, {
+						absPath,
+						reason: `文件大改（${accumulated} 行），挂载已失效，请重新 read`,
+					});
 					emit({
 						type: "invalidated",
 						pluginId: plugin.id,
@@ -504,6 +614,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					continue;
 				}
 				// 未达阈值（含跨会话小改追平）：按旧段 clamp 重切重挂载 + 累积 + 行指纹基准追平
+				// P0-1：这里**不更新** anchorHashes——历史锚点文本未变（store hash 已更新到磁盘值，
+				// delta 必须对比 anchorHashes，否则模型下一轮看到的仍是旧锚点内容）
 				plugin.metadata = {
 					...plugin.metadata,
 					hash: entry.hash,
@@ -513,17 +625,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					lineHashes: encodeFingerprint(lineFingerprint(diskLines)),
 					updatedAtHashChange: false,
 				};
-				dirtyPlugins.add(plugin.id); // 重挂载：锚点需用最新磁盘内容重新渲染
 				store.upsert(plugin);
 				persistPlugin(plugin);
-				if (crossDelta !== undefined) {
-					notices.push({
-						kind: "caught-up",
-						anchorToolCallId: plugin.metadata.anchorToolCallId,
-						changedLines: crossDelta,
-						text: `[piwpi: 该文件自上次会话以来已变化（${crossDelta} 行），挂载已更新为最新内容]`,
-					});
-				}
 				emit({
 					type: "mounted",
 					pluginId: plugin.id,
@@ -555,7 +658,71 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (mapDirty) {
 			await writeProjectMapFileMerged(projectMapFilePath(dataDir()), projectMap.toJSON());
 		}
-		return notices;
+		// P9：scan trace（PIWPI_TRACE=1）
+		if (TRACE_ENABLED) {
+			console.debug(`[trace] scan ms=${Date.now() - traceStart} stat=${scanResults.length} read=${traceReads}`);
+		}
+	}
+
+	/**
+	 * P0-1：确定性增量计算（历史不可变）。对比 anchorHashes（锚点历史内容对应 hash）与
+	 * fileCache 当前磁盘 hash；不一致 → 产出增量条目；文件缺失 → "文件已删除"；失效/删除挂载
+	 * （retiredMounts）→ 失效提示。不变量：
+	 * - 不改写任何历史消息（调用方把返回文本追加到最后一条消息的副本尾部）；
+	 * - 文本不含时间戳等运行时变化字段，插件按 id 排序遍历 → 相同状态产出逐字节相同文本；
+	 * - 空串表示无变化挂载（模型视图 = 纯历史）。
+	 */
+	async function buildMountDelta(): Promise<string> {
+		const entries: string[] = [];
+		// 失效/删除的挂载（插件已不在 store，锚点仍在历史）——按 id 排序保证确定性
+		const retired = [...retiredMounts.entries()].sort(([a], [b]) => a.localeCompare(b));
+		for (const [, info] of retired) {
+			entries.push(`- ${info.absPath}：${info.reason}`);
+		}
+		const plugins = store
+			.all()
+			.filter(isSourceMeta)
+			.filter((p) => typeof p.metadata.absPath === "string")
+			.sort((a, b) => a.id.localeCompare(b.id)); // 确定顺序：相同状态 → 相同字节
+		for (const plugin of plugins) {
+			const absPath = plugin.metadata.absPath;
+			const anchorHash = anchorHashes.get(plugin.id);
+			if (anchorHash === undefined) continue; // 未跟踪锚点（restore 前不可能有挂载）
+			const r = await fileCache.get(absPath);
+			if (!r) {
+				// 兜底（scanDiskChanges 已先行处理删除，这里覆盖直接构造状态的测试路径）
+				entries.push(`- ${absPath}：文件已删除，挂载失效`);
+				continue;
+			}
+			if (r.entry.hash === anchorHash) continue; // 磁盘未变 → 不产出（纯历史视图，无重复注入）
+			const lines = r.entry.lines ?? (await fileCache.readLines(absPath));
+			const ranges = mountedRanges(plugin).map(formatRange).join(", ");
+			entries.push(
+				`- ${absPath}（${ranges}）：内容已变化，当前 hash ${r.entry.hash}；当前内容：\n${render(plugin, lines)}`,
+			);
+		}
+		if (entries.length === 0) return "";
+		return `[piwpi 挂载更新]\n${entries.join("\n")}`;
+	}
+
+	/** delta 追加到最后一条消息的副本尾部（历史消息对象不变；返回新数组）。 */
+	function appendDeltaToLast(
+		messages: ContextEvent["messages"],
+		delta: string,
+	): ContextEvent["messages"] {
+		if (messages.length === 0) return messages;
+		const lastMsg = messages[messages.length - 1] as unknown as { content?: unknown };
+		const content = lastMsg.content;
+		let nextContent: unknown;
+		if (typeof content === "string") {
+			nextContent = `${content}\n\n${delta}`;
+		} else if (Array.isArray(content)) {
+			nextContent = [...content, { type: "text", text: delta }];
+		} else {
+			return messages; // 最后一条 content 形态无法承载文本 → 不追加
+		}
+		const copy = { ...(lastMsg as Record<string, unknown>), content: nextContent };
+		return [...messages.slice(0, -1), copy] as unknown as ContextEvent["messages"];
 	}
 
 	/** 未整理（pending）插件统计：文件数与行数（M5 新模型批量触发判定） */
@@ -576,6 +743,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	 * 经 memoryQueue 串行链调度，不阻塞主流程；失败仅记日志，pending 保留下轮再试。
 	 */
 	async function runMemoryBatch(dialogueContext: string): Promise<void> {
+		// P0-4：捕获任务开始时的会话代次与 abort signal（提交前校验；LLM 往返期间状态变化 → 丢弃）
+		const gen = sessionGeneration;
+		const signal = memoryQueue.signal;
+		if (signal?.aborted) return; // shutdown 超时中止：不再发起新模型调用
 		const targets = store
 			.all()
 			.filter(isSourceMeta)
@@ -589,6 +760,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		}
 		const files: { plugin: ToolContextPlugin; lines: string[]; hash: string }[] = [];
 		for (const plugin of targets) {
+			if (signal?.aborted) return;
 			// 引用式：渲染时点统一为任务开始时取到的磁盘内容（LLM 往返期间的变化下轮 scan 自愈）
 			const r = await fileCache.get(plugin.metadata.absPath);
 			if (!r) continue;
@@ -603,13 +775,30 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			lastUserText,
 			dialogueContext,
 			mapBrief,
+			{ signal },
 		);
+		if (signal?.aborted) return; // 结果作废（flush 超时）
 		const entries = output?.entries;
 		let done = 0;
 		if (entries) {
 			for (const { plugin, lines, hash } of files) {
 				const entry = entries[plugin.id];
 				if (!entry) continue; // 模型漏掉该文件：保留 pending，下轮再试
+				// P0-4：提交前复核——任一项不满足 → 丢弃该插件结果（旧条目绝不写回）
+				if (gen !== sessionGeneration) {
+					console.debug("[piwpi] stale memory result dropped (session changed)");
+					continue;
+				}
+				if (signal?.aborted) return;
+				if (!store.get(plugin.id)) {
+					console.debug("[piwpi] stale memory result dropped (plugin removed)");
+					continue;
+				}
+				const now = await fileCache.get(plugin.metadata.absPath);
+				if (!now || now.entry.hash !== hash) {
+					console.debug("[piwpi] stale memory result dropped (disk changed)");
+					continue;
+				}
 				// 磁盘驱动：整理即记录基准（hash/chunks = 本时点磁盘状态；pendingLines 归零/stale 清除由 update 内部强制）
 				projectMap.update(plugin.id, {
 					role: entry.role,
@@ -653,6 +842,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			};
 			fileCache.pin(sourceMeta.absPath);
 			store.upsert(raw);
+			// P0-1：假定历史锚点文本反映持久化 hash；磁盘已变时 delta 会按 hash 差产出
+			if (typeof sourceMeta.hash === "string") anchorHashes.set(raw.id, sourceMeta.hash);
 		}
 		emit({ type: "restore", pluginCount: store.all().length });
 	}
@@ -793,7 +984,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 								mode: "increment",
 							});
 							fileCache.pin(existing.metadata.absPath);
-							dirtyPlugins.add(plugin.id);
+							anchorHashes.set(plugin.id, p.hash); // 增量扩展：锚点历史内容仍对应 p.hash
 							store.upsert(plugin);
 							emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
 							const all = mountedRanges(plugin).map(formatRange).join(", ");
@@ -826,7 +1017,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							lineHashes: encodeFingerprint(lineFingerprint(newLines)),
 						};
 						fileCache.pin(p.absPath);
-						dirtyPlugins.add(plugin.id);
+						// P0-1：锚点创建 → 记录其内容对应 hash；同名旧挂载的失效提示清除
+						anchorHashes.set(plugin.id, p.hash);
+						retiredMounts.delete(plugin.id);
 						store.upsert(plugin);
 						persistPlugin(plugin);
 						emit({ type: "mounted", pluginId: plugin.id, kind: "new", hash: p.hash, got });
@@ -841,7 +1034,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 						});
 						if (stats.files >= memoryBatchFilesLeft || stats.lines >= memoryBatchLines) {
 							memoryBatchFilesLeft = memoryBatchFiles; // 触发即新一轮攒批
-							memoryQueue.enqueueTask(() => runMemoryBatch(recentDialogue));
+							// P1-2/P1-1：未配置记忆模型或已 shutdown → 不排队（只提示一次）
+							if (!shuttingDown && memoryAutoAllowed()) {
+								memoryQueue.enqueueTask(() => runMemoryBatch(recentDialogue));
+							}
 						}
 						return undefined;
 					}
@@ -859,7 +1055,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							mode: "increment",
 						});
 						fileCache.pin(existing.metadata.absPath);
-						dirtyPlugins.add(plugin.id);
+						anchorHashes.set(plugin.id, p.hash); // 增量在相同 hash 上：锚点历史内容仍对应 p.hash
 						store.upsert(plugin);
 						emit({ type: "mounted", pluginId: plugin.id, kind: "increment", hash: p.hash, got });
 						const all = mountedRanges(plugin).map(formatRange).join(", ");
@@ -898,6 +1094,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							// 磁盘驱动：不再 projectMap.delete（map 由条目校验自证过期，不归会话管理）
 							fileCache.unpin(existing.metadata.absPath);
 							store.remove(plugin.id);
+							// P0-1：失效提示已在本 tool result（真实历史）中，锚点旧内容仍在 → 记 retired 持续提示
+							retiredMounts.set(plugin.id, {
+								absPath: existing.metadata.absPath,
+								reason: `文件大改（${accumulated} 行），挂载已失效，请重新 read`,
+							});
 							emit({
 								type: "invalidated",
 								pluginId: plugin.id,
@@ -922,7 +1123,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 							lineHashes: encodeFingerprint(lineFingerprint(lines)),
 						};
 						fileCache.pin(existing.metadata.absPath);
-						dirtyPlugins.add(plugin.id);
+						// P0-1：锚点（首次挂载消息）仍显示旧内容 → anchorHashes 不动，delta 携带当前全文；
+						// 若更新 anchorHashes，模型下一轮将看不到旧范围内已变化的行
 						store.upsert(plugin);
 						persistPlugin(plugin);
 						emit({
@@ -953,13 +1155,18 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 		},
 
-		/** 计划 §4.4：原地刷新锚点消息内容（无变化零改动）。 */
-		async onContext(event: ContextEvent, ctx: ExtensionContext): Promise<void> {
+		/** P0-1：历史不可变 + 尾部增量（不再原地改写任何历史消息）。 */
+		async onContext(event: ContextEvent, ctx: ExtensionContext): Promise<ContextResult | undefined> {
 			try {
 				rememberCtx(ctx);
-				// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载；
-				// 引用式：stat 快速通道，文件未变零读盘；返回提示列表 → 刷新循环后处理（见下）
-				const notices = await scanDiskChanges();
+				// P1-5：磁盘扫描移出请求关键路径——turn 内多次 provider 请求只扫一次
+				// （工具自写内容本就在 tool result 里，无信息损失；外部编辑延迟到 turn 结束可见）
+				if (scanPending) {
+					scanPending = false;
+					// M5 新模型：主动磁盘扫描——外部修改不依赖下一次 read 即可触发失效/重挂载；
+					// 引用式：stat 快速通道，文件未变零读盘；失效/删除记入 retiredMounts
+					await scanDiskChanges();
+				}
 				// 记录最近一条 user 消息（M5 记忆任务的 localContext 来源）。
 				// AgentMessage 联合类型含 BashExecutionMessage（content 为 string），用结构访问防御。
 				for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -1001,59 +1208,31 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					}
 				}
 				recentDialogue = dialogueParts.join("\n").slice(0, 4000);
-				for (const plugin of store.all()) {
-					if (!isSourceMeta(plugin)) continue;
-					if (!dirtyPlugins.has(plugin.id)) continue; // 引用式：状态未变 → 锚点文本已最新，零 IO 零渲染
-					let refreshed = false;
-					for (const m of event.messages) {
-						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
-						if (msg.role !== "toolResult" || msg.toolCallId !== plugin.metadata.anchorToolCallId) continue;
-						// 锚点找到：引用式渲染（内容从 file-cache 按需读磁盘），原地替换 content
-						// （引用同一对象，runner 返回的 clone 即被修改）
-						const r = await fileCache.get(plugin.metadata.absPath);
-						if (!r) break;
-						const lines = r.entry.lines ?? (await fileCache.readLines(plugin.metadata.absPath));
-						const fresh = render(plugin, lines);
-						const cur = msg.content?.[0] as { type?: string; text?: string } | undefined;
-						if (cur?.type === "text" && cur.text !== fresh) {
-							msg.content = [{ type: "text", text: fresh }];
-							refreshed = true;
-						}
-						break;
-					}
-					dirtyPlugins.delete(plugin.id);
-					if (!refreshed) continue; // 锚点被压缩/裁剪 → 本次跳过（计划 §8 已知限制）
+				// P0-1：确定性增量——磁盘/失效状态 → delta 文本（空 = 无变化挂载）。
+				// 历史消息原样透传；delta 追加到最后一条消息的副本尾部（不落历史）。
+				const delta = await buildMountDelta();
+				// P1-5：上下文摘要按需生成——仅 debug 监听者存在时映射（无监听者零开销）
+				if (options.onEvent) {
+					const summaries: DebugMessageSummary[] = event.messages.map((m) => toDebugSummary(m));
+					lastContext = {
+						ts: Date.now(),
+						messageCount: event.messages.length,
+						toolResultCount: event.messages.filter((m) => (m as { role?: string }).role === "toolResult").length,
+						messages: summaries,
+					};
+					emit({
+						type: "context",
+						messageCount: lastContext.messageCount,
+						toolResultCount: lastContext.toolResultCount,
+					});
+				} else {
+					lastContext = null;
 				}
-				// 锚点提示（必须在刷新循环之后：caught-up 需要锚点已被渲染为最新内容，提示只注入本轮，
-				// 下一轮无 notice 自动干净；invalidated/deleted 插件已移除，直接替换为提示行）
-				for (const n of notices) {
-					for (const m of event.messages) {
-						const msg = m as { role?: string; toolCallId?: unknown; content?: unknown[] };
-						if (msg.role !== "toolResult" || msg.toolCallId !== n.anchorToolCallId) continue;
-						const cur = msg.content?.[0] as { type?: string; text?: string } | undefined;
-						const text =
-							n.kind === "caught-up"
-								? `${n.text}\n\n${cur?.text ?? ""}`
-								: n.text;
-						msg.content = [{ type: "text", text }];
-						break;
-					}
-				}
-				// 上下文摘要（debug 服务用）：每条消息文本截断，防快照膨胀
-				const summaries: DebugMessageSummary[] = event.messages.map((m) => toDebugSummary(m));
-				lastContext = {
-					ts: Date.now(),
-					messageCount: event.messages.length,
-					toolResultCount: event.messages.filter((m) => (m as { role?: string }).role === "toolResult").length,
-					messages: summaries,
-				};
-				emit({
-					type: "context",
-					messageCount: lastContext.messageCount,
-					toolResultCount: lastContext.toolResultCount,
-				});
+				if (!delta) return undefined; // 无变化挂载：runner 沿用 clone，模型视图 = 纯历史
+				return { messages: appendDeltaToLast(event.messages, delta) };
 			} catch (err) {
 				console.error("[piwpi] onContext error:", err);
+				return undefined;
 			}
 		},
 
@@ -1061,6 +1240,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		async onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
+				sessionGeneration++; // P0-4：会话切换/启动 → 旧代次在途任务作废
+				scanPending = true; // P1-5：新会话首轮请求前必须扫描一次
 				console.log(`[piwpi] memory agent LLM channel: ${memoryChannelMode()}`);
 				if (!mapLoaded) {
 					mapLoaded = true;
@@ -1082,10 +1263,12 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 		},
 
-		/** 计划 §6.1/§6.4：flush 记忆队列（5s 超时兜底）+ 项目地图落盘。 */
+		/** P1-1：shutdown 语义——取消未开始任务、只等已运行链（5s 超时中止），不启动任何新模型调用。 */
 		async shutdown(): Promise<void> {
 			try {
-				await memoryQueue.flush(5000);
+				shuttingDown = true;
+				memoryQueue.cancelPending(); // 未开始任务直接丢弃（不派发）
+				await memoryQueue.flush(5000); // 只等待已运行链；超时 → abort 在途任务，结果作废
 			} catch (err) {
 				console.error("[piwpi] shutdown flush error:", err);
 			}
@@ -1117,6 +1300,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				queuePending: memoryQueue.size(),
 				lastUserText,
 				context: lastContext,
+				memoryRunCount,
+				memoryTokenTotal,
 			};
 		},
 
@@ -1140,6 +1325,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 
 		/** M5.5：每轮结束阈值递减——未达阈值的小量 pending 在有限轮数内必然触发（触发后重置，攒批保持少调用） */
 		onAgentSettled(): void {
+			scanPending = true; // P1-5：turn 边界置位 → 下一轮 provider 请求前扫描一次
+			// P1-2/P1-1：未配置记忆模型或已 shutdown → 自动路径整体跳过
+			if (shuttingDown || !memoryAutoAllowed()) return;
 			if (memoryBatchFilesLeft > 1) memoryBatchFilesLeft--;
 			const stats = pendingStats();
 			if (stats.files >= memoryBatchFilesLeft || stats.lines >= memoryBatchLines) {

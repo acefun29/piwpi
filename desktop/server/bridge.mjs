@@ -22,7 +22,7 @@
  *   PIWPI_PI_ARGS     额外传给 pi 的参数（空格分隔）
  */
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, get as httpGet, request as httpRequest } from "node:http";
 import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, rmSync } from "node:fs";
@@ -225,6 +225,9 @@ function isPortFree(port) {
  */
 export async function startBridge(opts = {}) {
 	const port = opts.port ?? Number.parseInt(process.env.PORT ?? "8901", 10);
+	// P0-3：控制端点鉴权 token（每次启动随机生成，只交给当前窗口；dev 模式放行）
+	const authToken = randomBytes(32).toString("hex");
+	const devMode = opts.dev ?? (process.argv.includes("--dev") || process.env.PIWPI_BRIDGE_DEV === "1");
 	let debugPort = opts.debugPort ?? Number.parseInt(process.env.PIWPI_DEBUG_PORT ?? "8787", 10);
 	// 当前项目目录（可变：POST /api/project 切换时更新并重启 pi）
 	let workspace = opts.workspace ?? process.env.PIWPI_WORKSPACE ?? REPO;
@@ -255,13 +258,23 @@ export async function startBridge(opts = {}) {
 	/* ================= pi RPC 子进程 ================= */
 	let pi = null;
 	let piAlive = false;
-	const sseClients = new Set();
+	// P2-7：按 clientId 索引的 SSE 客户端（同 id 重连替换，异 id 冲突 409）
+	const sseClients = new Map(); // clientId -> res
 
 	function broadcast(line) {
 		const frame = `data: ${line}\n\n`;
-		for (const res of sseClients) {
-			try { res.write(frame); } catch { sseClients.delete(res); }
+		for (const [clientId, res] of sseClients) {
+			try { res.write(frame); } catch { sseClients.delete(clientId); }
 		}
+	}
+
+	/** P0-3：控制端点鉴权（静态文件与 / 除外）。devMode 放行；否则要求 Bearer token。 */
+	function authorized(req, res) {
+		if (devMode) return true;
+		if (req.headers.authorization === `Bearer ${authToken}`) return true;
+		res.writeHead(401, { "content-type": "application/json; charset=utf-8" });
+		res.end(JSON.stringify({ error: "unauthorized" }));
+		return false;
 	}
 
 	function startPi() {
@@ -595,6 +608,31 @@ export async function startBridge(opts = {}) {
 		const path = url.pathname;
 
 		if (path === "/api/events" && req.method === "GET") {
+			// EventSource 无法携带 header → token 走查询参数（渲染进程不落地日志）
+			if (!devMode && url.searchParams.get("token") !== authToken) {
+				res.writeHead(401, { "content-type": "application/json; charset=utf-8" });
+				res.end(JSON.stringify({ error: "unauthorized" }));
+				return;
+			}
+			const clientId = url.searchParams.get("clientId") ?? "";
+			// P2-7：SSE 独占——同 clientId（页面重连）替换旧连接；异 clientId 且已有存活客户端 → 409
+			if (clientId && sseClients.has(clientId)) {
+				const old = sseClients.get(clientId);
+				sseClients.delete(clientId);
+				try { old.end(); } catch { /* 旧连接已死 */ }
+			}
+			if (clientId) {
+				if (sseClients.size > 0 && !sseClients.has(clientId)) {
+					res.writeHead(409, { "content-type": "application/json; charset=utf-8" });
+					res.end(JSON.stringify({ error: "another client already connected" }));
+					return;
+				}
+			} else if (sseClients.size > 0) {
+				// 无 clientId（如 curl 探测）：仅在无其他客户端时允许
+				res.writeHead(409, { "content-type": "application/json; charset=utf-8" });
+				res.end(JSON.stringify({ error: "another client already connected" }));
+				return;
+			}
 			res.writeHead(200, {
 				"content-type": "text/event-stream; charset=utf-8",
 				"cache-control": "no-cache",
@@ -602,9 +640,16 @@ export async function startBridge(opts = {}) {
 			});
 			res.write("retry: 1000\n\n");
 			res.write(`data: ${JSON.stringify({ type: "bridge_hello", piAlive, ts: Date.now() })}\n\n`);
-			sseClients.add(res);
-			req.on("close", () => sseClients.delete(res));
+			sseClients.set(clientId, res);
+			req.on("close", () => {
+				if (sseClients.get(clientId) === res) sseClients.delete(clientId);
+			});
 			return;
+		}
+
+		// P0-3：其余控制端点统一鉴权（/api/* 与 /debug/* 反代；静态文件与 / 开放）
+		if (path.startsWith("/api/") || path.startsWith("/debug/")) {
+			if (!authorized(req, res)) return;
 		}
 
 		if (path === "/api/rpc" && req.method === "POST") {
@@ -729,7 +774,7 @@ export async function startBridge(opts = {}) {
 	console.log(`[bridge] piwpi desktop ready: http://127.0.0.1:${actualPort}`);
 	console.log(`[bridge] debug proxy: /debug/* -> 127.0.0.1:${debugPort}/api/*`);
 
-	return { server, port: actualPort, workspace, killPi, get piAlive() { return piAlive; } };
+	return { server, port: actualPort, workspace, killPi, authToken, get piAlive() { return piAlive; } };
 }
 
 /* ================= 直接运行自启 ================= */

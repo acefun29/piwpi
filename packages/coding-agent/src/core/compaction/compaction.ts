@@ -199,13 +199,13 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
  * Estimate context tokens from messages, using the last assistant usage when available.
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
  */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+export function estimateContextTokens(messages: AgentMessage[], opts?: TokenEstimateOptions): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
 		let estimated = 0;
 		for (const message of messages) {
-			estimated += estimateTokens(message);
+			estimated += estimateTokens(message, opts);
 		}
 		return {
 			tokens: estimated,
@@ -218,7 +218,7 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	const usageTokens = calculateContextTokens(usageInfo.usage);
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
-		trailingTokens += estimateTokens(messages[i]);
+		trailingTokens += estimateTokens(messages[i], opts);
 	}
 
 	return {
@@ -243,7 +243,21 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 
 const ESTIMATED_IMAGE_CHARS = 4800;
 
-function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
+/** P2-5：估算与真实 payload 对齐的可选参数。
+ * - blockImages：图片被替换为 27 字符占位符（sdk.ts convertToLlmWithBlockImages："Image reading is disabled."）
+ * - visionModel：模型是否支持图片（model.input.includes("image") 同判据 transform-messages.ts:36）；
+ *   false → 46/50 字符占位符（transform-messages.ts NON_VISION_USER/TOOL_IMAGE_PLACEHOLDER）
+ *   不传 → 图片原样进 payload（视觉模型/未知），维持 4800。 */
+export interface TokenEstimateOptions {
+	blockImages?: boolean;
+	visionModel?: boolean;
+}
+
+function estimateTextAndImageContentChars(
+	content: string | Array<{ type: string; text?: string }>,
+	opts?: TokenEstimateOptions,
+	toolContent = false,
+): number {
 	if (typeof content === "string") {
 		return content.length;
 	}
@@ -253,7 +267,13 @@ function estimateTextAndImageContentChars(content: string | Array<{ type: string
 		if (block.type === "text" && block.text) {
 			chars += block.text.length;
 		} else if (block.type === "image") {
-			chars += ESTIMATED_IMAGE_CHARS;
+			chars += opts?.blockImages
+				? 27
+				: opts?.visionModel === false
+					? toolContent
+						? 50
+						: 46
+					: ESTIMATED_IMAGE_CHARS;
 		}
 	}
 	return chars;
@@ -262,14 +282,17 @@ function estimateTextAndImageContentChars(content: string | Array<{ type: string
 /**
  * Estimate token count for a message using chars/4 heuristic.
  * This is conservative (overestimates tokens).
+ * P2-5：opts 透传给图片占位符估算（与真实 payload 对齐）。
  */
-export function estimateTokens(message: AgentMessage): number {
+export function estimateTokens(message: AgentMessage, opts?: TokenEstimateOptions): number {
 	let chars = 0;
 
 	switch (message.role) {
 		case "user": {
 			chars = estimateTextAndImageContentChars(
 				(message as { content: string | Array<{ type: string; text?: string }> }).content,
+				opts,
+				false,
 			);
 			return Math.ceil(chars / 4);
 		}
@@ -288,7 +311,7 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "custom":
 		case "toolResult": {
-			chars = estimateTextAndImageContentChars(message.content);
+			chars = estimateTextAndImageContentChars(message.content, opts, true); // tool 块占位符 50 字符
 			return Math.ceil(chars / 4);
 		}
 		case "bashExecution": {

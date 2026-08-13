@@ -57,6 +57,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
+	/** P0-2：初始 prompt（无 streamingBehavior）串行化——preflight 期间第二条被拒绝而非静默丢失 */
+	let initialPromptInFlight = false;
+	/** P9：per-request trace 门（PIWPI_TRACE=1 或 PI_TIMING=1） */
+	const TRACE_ENABLED = process.env.PIWPI_TRACE === "1" || process.env.PI_TIMING === "1";
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeRawStdout(serializeJsonLine(obj));
@@ -393,6 +397,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "prompt": {
+				// P2-2：初始 prompt 串行化（前端 promptPending 锁的第二道防线）。
+				// 第二条初始 prompt 在 preflight 期间到达 → 明确拒绝（error 响应），不静默丢失
+				if (!command.streamingBehavior && initialPromptInFlight) {
+					output(error(id, "prompt", "另一条初始消息正在处理中"));
+					return undefined;
+				}
+				if (!command.streamingBehavior) initialPromptInFlight = true;
+				// P9：preflight 耗时 trace（PIWPI_TRACE=1）
+				const preflightStart = Date.now();
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
 				let preflightSucceeded = false;
@@ -402,6 +415,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
 						preflightResult: (didSucceed) => {
+							if (TRACE_ENABLED) {
+								console.debug(`[trace] preflightMs=${Date.now() - preflightStart} accepted=${didSucceed}`);
+							}
+							if (!command.streamingBehavior) initialPromptInFlight = false; // 成功与失败都清
 							if (didSucceed) {
 								preflightSucceeded = true;
 								output(success(id, "prompt"));

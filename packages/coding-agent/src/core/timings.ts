@@ -1,15 +1,20 @@
 /**
  * Central timing instrumentation for startup profiling.
  * Enable with PI_TIMING=1 environment variable.
+ * P9：per-request trace 日志门 PIWPI_TRACE=1（与 PI_TIMING 同一日志门；trace 行格式 [trace] ...）。
  */
 
 const ENABLED = process.env.PI_TIMING === "1";
+/** P9：per-request trace 门（PIWPI_TRACE=1 或 PI_TIMING=1） */
+export const TRACE_ENABLED = ENABLED || process.env.PIWPI_TRACE === "1";
+
 interface TimingNamespace {
 	timings: Array<{ label: string; ms: number }>;
 	lastTime: number;
 }
 
-type TimingLabel = "main" | "extensions";
+/** P9：扩展 namespace（transform/scan/memory/provider 供按模块归类耗时） */
+type TimingLabel = "main" | "extensions" | "transform" | "scan" | "memory" | "provider";
 
 const timingNamespaces = new Map<TimingLabel, TimingNamespace>();
 

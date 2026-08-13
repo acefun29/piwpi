@@ -64,6 +64,7 @@ import {
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
+	type TokenEstimateOptions,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
@@ -111,6 +112,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { TRACE_ENABLED } from "./timings.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -294,6 +296,14 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+/** P2-5：估算与真实 payload 对齐（blockImages → 27 字符；非视觉模型 → 46/50 占位符；视觉模型 → 4800） */
+function tokenEstimateOptionsFor(model: Model<any> | undefined, blockImages: boolean): TokenEstimateOptions {
+	return {
+		blockImages,
+		visionModel: model?.input.includes("image") ?? false,
+	};
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -377,6 +387,8 @@ export class AgentSession {
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
 	private _collaborationMode: CollaborationMode = "default";
+	/** P1-6：全量 active 工具名（agent.state.tools 为按当前模式过滤后的实际执行集；切回 default 恢复全量） */
+	private _activeToolNames: string[] = [];
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -770,6 +782,17 @@ export class AgentSession {
 				type: "message_end",
 				message: event.message,
 			};
+			// P9：usage trace（PIWPI_TRACE=1）——按消息来源打标：compactionSummary = 压缩，其余 = 主 Agent
+			if (TRACE_ENABLED) {
+				const msg = event.message as { role?: string; usage?: Usage; content?: unknown };
+				const source = (msg as { summary?: string }).summary !== undefined ? "compaction" : "main";
+				if (msg.usage) {
+					console.debug(
+						`[trace] usage source=${source} input=${msg.usage.input} output=${msg.usage.output} ` +
+							`cacheRead=${msg.usage.cacheRead} cacheWrite=${msg.usage.cacheWrite}`,
+					);
+				}
+			}
 			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
 			if (replacement) {
 				// Untyped extension handlers can return messages with null/missing content;
@@ -902,10 +925,34 @@ export class AgentSession {
 
 	/**
 	 * Get the names of currently active tools.
-	 * Returns the names of tools currently set on the agent.
+	 * 全量 active（含当前模式下不可执行的；agent.state.tools 可能已按模式过滤，_activeToolNames 未初始化时回退）。
 	 */
 	getActiveToolNames(): string[] {
-		return this.agent.state.tools.map((t) => t.name);
+		return this._activeToolNames.length > 0
+			? this._activeToolNames
+			: this.agent.state.tools.map((t) => t.name);
+	}
+
+	/** P1-6：当前模式下可执行工具名（与执行期 _toolCanExecuteInCurrentMode 谓词完全一致）。 */
+	getEffectiveToolNames(): string[] {
+		return this.getActiveToolNames().filter((n) => this._toolCanExecuteInCurrentMode(n));
+	}
+
+	/**
+	 * P1-6：按当前模式重建 agent.state.tools——schema（system prompt/工具列表）与执行期拦截
+	 * 使用同一谓词，不再分叉。注册表外工具（测试/外部注入）保留原对象。
+	 */
+	private reapplyModeToolFilter(): void {
+		const effective = new Set(this.getEffectiveToolNames());
+		const current = this.agent.state.tools;
+		const tools: AgentTool[] = [];
+		for (const name of this.getActiveToolNames()) {
+			if (!effective.has(name)) continue;
+			const fromRegistry = this._toolRegistry.get(name);
+			const tool = fromRegistry ?? current.find((c) => c.name === name);
+			if (tool) tools.push(tool);
+		}
+		this.agent.state.tools = tools;
 	}
 
 	/**
@@ -944,7 +991,8 @@ export class AgentSession {
 
 		this._collaborationMode = mode;
 		this.sessionManager.appendCollaborationModeChange(mode);
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.reapplyModeToolFilter(); // P1-6：按新模式重建工具集（切回 default 自动恢复全量）
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getEffectiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 		this._emit({ type: "collaboration_mode_changed", mode });
 	}
@@ -965,10 +1013,12 @@ export class AgentSession {
 				validToolNames.push(name);
 			}
 		}
-		this.agent.state.tools = tools;
+		// P1-6：记录全量 active 名；agent.state.tools 按当前模式过滤（schema 与执行行为一致）
+		this._activeToolNames = validToolNames;
+		this.reapplyModeToolFilter();
 
-		// Rebuild base system prompt with new tool set
-		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		// Rebuild base system prompt with effective tool set
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getEffectiveToolNames());
 		this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
 	}
 
@@ -2058,7 +2108,11 @@ export class AgentSession {
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
-			const estimate = estimateContextTokens(messages);
+			// P2-5：估算与真实 payload 对齐（图片占位符字符数）
+			const estimate = estimateContextTokens(
+				messages,
+				tokenEstimateOptionsFor(this.model, this.settingsManager.getBlockImages()),
+			);
 			if (estimate.lastUsageIndex === null) return false; // No usage data at all
 			// Verify the usage source is post-compaction. Kept pre-compaction messages
 			// have stale usage reflecting the old (larger) context and would falsely
@@ -2316,7 +2370,7 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getEffectiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
@@ -3244,7 +3298,10 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
+		const estimate = estimateContextTokens(
+			this.messages,
+			tokenEstimateOptionsFor(this.model, this.settingsManager.getBlockImages()),
+		);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {

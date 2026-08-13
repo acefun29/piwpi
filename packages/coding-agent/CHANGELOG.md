@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fixed RPC prompt completion, compaction abort handling, collaboration-mode tool filtering, and runtime timing cleanup under concurrent session activity.
 - Reused the model runtime across same-project RPC session switches and avoided redundant provider availability refreshes when extensions did not change providers.
 - Fixed plan approval rejecting the visible proposed plan because its Markdown differed from the private planning artifact; implementation now uses the plan the user actually approved without an artifact-alignment gate.
 - Fixed fullscreen shutdown leaking terminal capability-query replies into the parent shell prompt.

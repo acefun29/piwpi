@@ -12,6 +12,7 @@ import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import { TRACE_ENABLED } from "../timings.ts";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -983,11 +984,22 @@ export class ExtensionRunner {
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
-		let currentMessages = structuredClone(messages);
+		// 惰性 clone（P1-5）：无 context handler 时原样返回，零拷贝；有 handler 才在首个 handler 前 clone
+		let currentMessages = messages;
+		let cloned = false;
+		// P9：transform trace（PIWPI_TRACE=1）
+		const traceStart = Date.now();
+		let cloneCount = 0;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("context");
 			if (!handlers || handlers.length === 0) continue;
+
+			if (!cloned) {
+				currentMessages = structuredClone(messages);
+				cloned = true;
+				cloneCount++;
+			}
 
 			for (const handler of handlers) {
 				try {
@@ -1010,6 +1022,9 @@ export class ExtensionRunner {
 			}
 		}
 
+		if (TRACE_ENABLED) {
+			console.debug(`[trace] transform ms=${Date.now() - traceStart} clones=${cloneCount} messages=${messages.length}`);
+		}
 		return currentMessages;
 	}
 

@@ -37,14 +37,19 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 	end(result?: R): void {
 		this.done = true;
-		if (result !== undefined) {
-			this.resolveFinalResult(result);
-		}
+		// P1-7：result 未提供（EOF 无终止事件）→ 也必须 resolve final result，
+		// 否则 result() 永久 pending（agent-loop L363 兜底 await 挂死）
+		this.resolveFinalResult(result !== undefined ? result : this.createIncompleteEndResult());
 		// Notify all waiting consumers that we're done
 		while (this.waiting.length > 0) {
 			const waiter = this.waiting.shift()!;
-			waiter({ value: undefined as any, done: true });
+			waiter({ value: undefined, done: true } as unknown as IteratorResult<T>); // done 终止：value 无意义
 		}
+	}
+
+	/** P1-7：end() 无 result 时的终止结果（默认 undefined；子类覆写为显式终止消息）。 */
+	protected createIncompleteEndResult(): R {
+		return undefined as R;
 	}
 
 	async *[Symbol.asyncIterator](): AsyncIterator<T> {
@@ -79,6 +84,32 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+	}
+
+	/**
+	 * P1-7：end() 无 result（EOF 无终止事件）→ 显式 aborted 终止消息，
+	 * 与 proxy.ts / 中止路径的 stopReason "aborted" 语义一致（agent-loop 按 aborted 处理，不挂死）。
+	 * api/provider/model 用占位值：流终止时无 provider 上下文，调用方只消费 stopReason/errorMessage。
+	 */
+	protected createIncompleteEndResult(): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [],
+			api: "unknown",
+			provider: "unknown",
+			model: "unknown",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "aborted",
+			errorMessage: "Stream ended without a terminal event",
+			timestamp: Date.now(),
+		};
 	}
 }
 

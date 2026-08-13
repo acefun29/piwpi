@@ -217,32 +217,80 @@ describe("M3 §4.2/§4.3：拦截与增量读取", () => {
 	});
 });
 
-describe("M3 §4.4：固定上下文区域（锚点刷新）", () => {
-	it("锚点消息内容被原地替换为 render；无变化时字节不变", async () => {
+describe("M3 §4.4 / P0-1：历史不可变 + 尾部增量", () => {
+	it("磁盘变化后：历史锚点消息逐字节不变，delta 追加到最后一条消息（含当前内容、无时间戳）", async () => {
 		write80Lines();
 		const store = new PluginStore();
 		const h = createHarness({ store });
 		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
-		const p = store.get(fileId(absFile))!;
-		const fresh = render(p, readFileSync(absFile, "utf8").split("\n"));
 
-		// 第一次：锚点是原生全文 → 被替换为渲染
+		// 磁盘变为 100 行（hash 变化；已挂载段 L20-40 内容未变 → 走小改重挂载路径，锚点历史文本不变）
+		writeFileSync(absFile, lines(100));
+
 		const messages = [
 			{ role: "user", content: [{ type: "text", text: "继续" }] },
 			{ role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "ORIGINAL" }] },
 		] as unknown as ContextEvent["messages"];
 		const ev = { type: "context", messages } as unknown as ContextEvent;
-		await h.onContext(ev, ctx());
-		expect((messages[1] as unknown as { content: { text: string }[] }).content[0]!.text).toBe(fresh);
+		const r = await h.onContext(ev, ctx());
+		expect(r).toBeDefined();
+		expect(r!.messages).toHaveLength(2);
+		// 历史消息原样透传：同一对象引用（不可变断言）
+		expect(r!.messages![0]).toBe(messages[0]);
+		// 最后一条是副本：原对象未被改写
+		expect(r!.messages![1]).not.toBe(messages[1]);
+		expect((messages[1] as unknown as { content: { type: string; text?: string }[] }).content[0]!.text).toBe(
+			"ORIGINAL",
+		);
+		const last = r!.messages![1] as unknown as { content: { type: string; text?: string }[] };
+		expect(last.content[0]!.text).toBe("ORIGINAL");
+		const deltaText = last.content[1]!.text!;
+		expect(deltaText).toContain("[piwpi 挂载更新]");
+		expect(deltaText).toContain("内容已变化");
+		expect(deltaText).toContain(hashBuffer(readFileSync(absFile))); // 当前完整 hash
+		expect(deltaText).toContain("line20"); // 当前内容（新正文）
+		expect(deltaText).not.toMatch(/\d{4}-\d{2}-\d{2}/); // 无时间戳（确定性）
 
-		// 第二次：内容已一致 → 零改动
-		const messages2 = [
-			{ role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: fresh }] },
+		// 确定性：相同状态第二次调用 → delta 逐字节相同
+		const r2 = await h.onContext({ type: "context", messages } as unknown as ContextEvent, ctx());
+		const last2 = r2!.messages![1] as unknown as { content: { type: string; text?: string }[] };
+		expect(last2.content[1]!.text).toBe(deltaText);
+	});
+
+	it("磁盘未变化 → delta 为空，不返回 messages（模型视图 = 纯历史）", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const h = createHarness({ store });
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+
+		const messages = [
+			{ role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "ORIGINAL" }] },
 		] as unknown as ContextEvent["messages"];
-		const ev2 = { type: "context", messages: messages2 } as unknown as ContextEvent;
-		await h.onContext(ev2, ctx());
-		expect((messages2[0] as unknown as { content: { text: string }[] }).content[0]!.text).toBe(fresh);
+		const r = await h.onContext({ type: "context", messages } as unknown as ContextEvent, ctx());
+		expect(r).toBeUndefined(); // 无变化挂载 → 不追加任何内容
+		expect(messages).toHaveLength(1); // 输入未被改动
+	});
+
+	it("文件删除 → delta 含「文件已删除，挂载失效」，挂载从 store 移除", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const h = createHarness({ store });
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+		expect(store.get(fileId(absFile))).toBeDefined();
+
+		rmSync(absFile); // 外部删除
+		const messages = [
+			{ role: "user", content: [{ type: "text", text: "继续" }] },
+		] as unknown as ContextEvent["messages"];
+		const r = await h.onContext({ type: "context", messages } as unknown as ContextEvent, ctx());
+		expect(r).toBeDefined();
+		expect(store.get(fileId(absFile))).toBeUndefined(); // 挂载已失效
+		const last = r!.messages![0] as unknown as { content: { type: string; text?: string }[] };
+		const deltaText = last.content[1]!.text!;
+		expect(deltaText).toContain("文件已删除，挂载失效");
 	});
 
 	it("锚点缺失（被压缩）→ 跳过，不抛错", async () => {
@@ -624,15 +672,22 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		write80Lines();
 		const store = new PluginStore();
 		const events: string[] = [];
-		const h = createHarness({
-			store,
-			queue: new MemoryQueue(0),
-			memoryBatchFiles: 1,
-			onEvent: (e) => events.push(e.type),
-		});
-		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
-		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
-		await h.shutdown();
+		const prevEnv = process.env.PIWPI_MEMORY_MODEL;
+		process.env.PIWPI_MEMORY_MODEL = "faux/faux-1"; // P1-2：配置记忆模型 → 自动路径放行，缺 complete 通道 → memory_skipped
+		try {
+			const h = createHarness({
+				store,
+				queue: new MemoryQueue(0),
+				memoryBatchFiles: 1,
+				onEvent: (e) => events.push(e.type),
+			});
+			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+			await h.shutdown();
+		} finally {
+			if (prevEnv === undefined) delete process.env.PIWPI_MEMORY_MODEL;
+			else process.env.PIWPI_MEMORY_MODEL = prevEnv;
+		}
 		expect(events).toContain("memory_skipped");
 		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
 	});
@@ -664,27 +719,182 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 				return this.stream().result(); // 真实实现同款：this 依赖
 			},
 		};
-		const h = createHarness({
-			store,
-			queue: new MemoryQueue(0),
-			memoryBatchFiles: 1,
-			onEvent: (e) => events.push(e.type),
-		});
-		await h.onSessionStart(
-			{ type: "session_start", reason: "startup" } as never,
-			{
-				cwd: tmp,
-				model: { provider: "faux", id: "faux-1" },
-				modelRegistry: { runtime },
-				sessionManager: { getEntries: () => [] },
-			} as unknown as ExtensionContext,
-		);
-		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
-		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
-		await h.shutdown();
+		const fakeRegistry = {
+			runtime,
+			find: () => ({ provider: "faux", id: "faux-1" }), // 记忆模型解析通道（真实 ModelRegistry 同签名）
+		};
+		const prevEnv = process.env.PIWPI_MEMORY_MODEL;
+		process.env.PIWPI_MEMORY_MODEL = "faux/faux-1"; // P1-2：配置记忆模型 → 自动路径放行（经 env 通道）
+		try {
+			const h = createHarness({
+				store,
+				queue: new MemoryQueue(0),
+				memoryBatchFiles: 1,
+				onEvent: (e) => events.push(e.type),
+			});
+			await h.onSessionStart(
+				{ type: "session_start", reason: "startup" } as never,
+				{
+					cwd: tmp,
+					model: { provider: "faux", id: "faux-1" },
+					modelRegistry: fakeRegistry,
+					sessionManager: { getEntries: () => [] },
+				} as unknown as ExtensionContext,
+			);
+			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+			await h.shutdown();
+		} finally {
+			if (prevEnv === undefined) delete process.env.PIWPI_MEMORY_MODEL;
+			else process.env.PIWPI_MEMORY_MODEL = prevEnv;
+		}
 		expect(stream).toHaveBeenCalledTimes(1);
 		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("done");
 		expect(events).toContain("memory_updated");
+	});
+
+	it("P0-4 TOCTOU：LLM 返回前文件已变 → 提交被丢弃，store 与 project-map 不出现旧条目", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const dataDir = join(tmp, "agent-toctou");
+		const projectMap = new ProjectMap();
+		const queue = new MemoryQueue(0);
+		let releaseGate: (() => void) | undefined;
+		const gate = new Promise<void>((r) => {
+			releaseGate = r;
+		});
+		const complete = vi.fn(async () => {
+			await gate; // 挂起 LLM：期间外部修改文件
+			return {
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							entries: {
+								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
+							},
+						}),
+					},
+				],
+			};
+		});
+		const h = createHarness({
+			store,
+			projectMap,
+			queue,
+			dataDir,
+			cwd: tmp,
+			memoryDeps: { complete, model: { provider: "faux" } },
+			memoryBatchFiles: 1,
+		});
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+		// 等批量整理任务进入 LLM 调用（捕获 hash 已完成）
+		await vi.waitFor(() => expect(complete).toHaveBeenCalled());
+
+		// LLM 往返期间文件被外部修改（hash 变化）
+		const disk = readFileSync(absFile, "utf8").split("\n");
+		disk[24] = "changed";
+		writeFileSync(absFile, disk.join("\n"));
+
+		releaseGate!();
+		await queue.flush();
+
+		// 提交被丢弃：memoryState 保持 pending、map 无条目、落盘文件无旧条目
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
+		expect(projectMap.get(fileId(absFile))).toBeUndefined();
+		const mapFile = projectMapFilePath(dataDir);
+		if (existsSync(mapFile)) {
+			const mapData = JSON.parse(readFileSync(mapFile, "utf8")) as Record<string, unknown>;
+			expect(mapData[fileId(absFile)]).toBeUndefined();
+		}
+	});
+
+	it("P1-1 shutdown 后不启动新模型调用（自动触发被门禁拦截）", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const complete = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
+		const h = createHarness({
+			store,
+			queue: new MemoryQueue(0),
+			memoryDeps: { complete, model: { provider: "faux" } },
+			memoryBatchFiles: 1,
+		});
+		await h.shutdown(); // teardown 先行
+		await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+		await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+		await new Promise((r) => setTimeout(r, 10));
+		expect(complete).not.toHaveBeenCalled(); // shutdown 后自动整理不排队
+		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
+	});
+
+	it("P1-2 未配置记忆模型：自动触发被跳过且仅告警一次", async () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const prevEnv = process.env.PIWPI_MEMORY_MODEL;
+		delete process.env.PIWPI_MEMORY_MODEL;
+		const prevHome = process.env.HOME;
+		// 指向不存在的 HOME → models.json 读不到 → 未配置
+		process.env.HOME = join(tmp, "nonexistent-home");
+		const store = new PluginStore();
+		try {
+			const h = createHarness({
+				store,
+				queue: new MemoryQueue(0),
+				memoryBatchFiles: 1, // 1 个文件即达阈值
+			});
+			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+			await new Promise((r) => setTimeout(r, 10));
+			h.onAgentSettled();
+			await new Promise((r) => setTimeout(r, 10));
+			const warns = warnSpy.mock.calls.filter((c) => String(c[0]).includes("未配置记忆 Agent 模型"));
+			expect(warns).toHaveLength(1); // 多触发点只提示一次
+			expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending"); // 未整理
+		} finally {
+			warnSpy.mockRestore();
+			if (prevEnv === undefined) delete process.env.PIWPI_MEMORY_MODEL;
+			else process.env.PIWPI_MEMORY_MODEL = prevEnv;
+			if (prevHome === undefined) delete process.env.HOME;
+			else process.env.HOME = prevHome;
+		}
+	});
+
+	it("P1-2 配置记忆模型：使用指定模型与 maxTokens=1024", async () => {
+		write80Lines();
+		const store = new PluginStore();
+		const complete = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
+		const found = { provider: "cheap", id: "cheap-1" };
+		const registry = {
+			complete,
+			find: (p: string, id: string) => (p === "cheap" && id === "cheap-1" ? found : undefined),
+		};
+		const prevEnv = process.env.PIWPI_MEMORY_MODEL;
+		process.env.PIWPI_MEMORY_MODEL = "cheap/cheap-1";
+		try {
+			const h = createHarness({
+				store,
+				queue: new MemoryQueue(0),
+				memoryBatchFiles: 1,
+			});
+			await h.onSessionStart(
+				{ type: "session_start", reason: "startup" } as never,
+				{
+					cwd: tmp,
+					model: { provider: "main", id: "main-1" },
+					modelRegistry: registry,
+					sessionManager: { getEntries: () => [] },
+				} as unknown as ExtensionContext,
+			);
+			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
+			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
+			await new Promise((r) => setTimeout(r, 10));
+			expect(complete).toHaveBeenCalledTimes(1);
+			expect(complete.mock.calls[0]![0]).toBe(found); // 用记忆模型而非主模型
+			expect(complete.mock.calls[0]![2]).toMatchObject({ maxTokens: 1024 }); // 限制输出
+		} finally {
+			if (prevEnv === undefined) delete process.env.PIWPI_MEMORY_MODEL;
+			else process.env.PIWPI_MEMORY_MODEL = prevEnv;
+		}
 	});
 
 	it("批量整理输出非法 JSON → 保留 pending、project map 不变、主流程不受影响", async () => {

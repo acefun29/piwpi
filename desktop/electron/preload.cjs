@@ -13,3 +13,8 @@ contextBridge.exposeInMainWorld("openExternal", (url) => {
 contextBridge.exposeInMainWorld("openSourceFile", (filePath, workspace) => {
 	return ipcRenderer.invoke("open-source-file", String(filePath), String(workspace));
 });
+
+// P0-3：bridge 鉴权 token（只暴露给本窗口渲染进程）
+contextBridge.exposeInMainWorld("getBridgeToken", () => {
+	return ipcRenderer.invoke("get-bridge-token");
+});

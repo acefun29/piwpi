@@ -27,6 +27,9 @@ ipcMain.handle("open-source-file", async (_event, filePath, workspace) => {
 	return error ? { ok: false, error } : { ok: true };
 });
 
+// P0-3：bridge 鉴权 token 只交给当前窗口（每次启动随机生成）
+ipcMain.handle("get-bridge-token", () => bridge?.authToken ?? null);
+
 // 单实例：防止两个窗口各自 spawn pi 抢占 debug 端口/会话锁
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {

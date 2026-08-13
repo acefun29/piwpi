@@ -285,4 +285,86 @@ describe("RPC prompt response semantics", () => {
 			await cleanup();
 		}
 	});
+
+	it("rejects a second initial prompt while the first is in preflight (P0-2)", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: false,
+			responseDelayMs: 0,
+			model: {
+				id: "fake-model",
+				name: "Fake Model",
+				api: "openai-completions",
+				provider: "fake-provider",
+				baseUrl: "https://example.invalid",
+				reasoning: false,
+				input: [],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 0,
+				maxTokens: 0,
+			},
+		});
+
+		try {
+			// 同步连发两条初始 prompt：第二条在第一条 preflight 完成前到达 → 被串行化拒绝
+			lineHandler(JSON.stringify({ id: "c1", type: "prompt", message: "Hello" }));
+			lineHandler(JSON.stringify({ id: "c2", type: "prompt", message: "Hello again" }));
+
+			await vi.waitFor(() => {
+				const responses = getPromptResponses(rpcIo.outputLines, "c2");
+				expect(responses).toHaveLength(1);
+				expect(responses[0]).toMatchObject({
+					id: "c2",
+					type: "response",
+					command: "prompt",
+					success: false,
+					error: expect.stringContaining("另一条初始消息正在处理中"),
+				});
+			});
+
+			// 第一条仍走正常 preflight 失败路径（无 API key），恰好 1 条 error
+			await vi.waitFor(() => {
+				const responses = getPromptResponses(rpcIo.outputLines, "c1");
+				expect(responses).toHaveLength(1);
+				expect(responses[0]!.success).toBe(false);
+			});
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("accepts a followUp after the initial prompt succeeded (P0-2)", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 100 });
+
+		try {
+			lineHandler(JSON.stringify({ id: "d1", type: "prompt", message: "Start" }));
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "d1")).toHaveLength(1);
+			});
+
+			rpcIo.outputLines = [];
+			lineHandler(
+				JSON.stringify({
+					id: "d2",
+					type: "prompt",
+					message: "Follow up",
+					streamingBehavior: "followUp",
+				}),
+			);
+
+			await vi.waitFor(() => {
+				const responses = getPromptResponses(rpcIo.outputLines, "d2");
+				expect(responses).toHaveLength(1);
+				expect(responses[0]).toMatchObject({
+					id: "d2",
+					type: "response",
+					command: "prompt",
+					success: true,
+				});
+			});
+
+			await sleep(150);
+		} finally {
+			await cleanup();
+		}
+	});
 });

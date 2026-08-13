@@ -210,6 +210,15 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				throw new Error("Request aborted by user");
 			}
 
+			// P1-7：EOF 无终止事件 → 显式 error 事件（isComplete 命中即 resolve），
+			// 否则消费者 for-await 在 done 分支后 await result() 永久 pending
+			partial.stopReason = "error";
+			partial.errorMessage = "Connection closed without a terminal event";
+			stream.push({
+				type: "error",
+				reason: "error",
+				error: partial,
+			});
 			stream.end();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);

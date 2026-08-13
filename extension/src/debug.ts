@@ -70,6 +70,9 @@ export interface DebugSnapshot {
 	queuePending: number;
 	lastUserText: string;
 	context: DebugContextSnapshot | null;
+	/** P9：记忆运行统计 */
+	memoryRunCount: number;
+	memoryTokenTotal: number;
 }
 
 /** 每条上下文消息的文本截断长度 */

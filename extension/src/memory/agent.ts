@@ -19,8 +19,19 @@ export interface MemoryAgentDeps {
 			messages: { role: "user"; content: { type: "text"; text: string }[] }[];
 		},
 		options?: Record<string, unknown>,
-	) => Promise<{ content: { type: string; text?: string }[] }>;
+	) => Promise<{ content: { type: string; text?: string }[]; usage?: MemoryUsage }>;
 	model: unknown;
+	/** P1-2：输出上限（配置记忆模型时 1024，限制输出成本） */
+	maxTokens?: number;
+}
+
+/** 记忆调用 usage（complete 结果可选字段；缺失时调用方记提示） */
+export interface MemoryUsage {
+	input?: number;
+	output?: number;
+	totalTokens?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
 }
 
 /** 模型要求输出的严格 JSON 形状（M5 新模型：整理产物只进 Project Map，整批一次调用） */
@@ -128,6 +139,7 @@ export function parseMemoryJson(text: string): MemoryOutput | null {
 /**
  * 执行一次批量记忆整理：调 LLM → 解析。不修改任何状态（写回由调用方负责）。
  * 返回 null 表示无可用结果（无模型 / LLM 调用失败 / JSON 解析失败）。
+ * P1-1：options.signal 已 abort 时不再发起新调用（shutdown 超时中止语义）。
  */
 export async function summarize(
 	deps: MemoryAgentDeps,
@@ -135,14 +147,19 @@ export async function summarize(
 	localContext: string,
 	dialogueContext: string,
 	mapBrief: string,
+	options?: { signal?: AbortSignal },
 ): Promise<MemoryOutput | null> {
 	if (!deps.model) return null;
+	if (options?.signal?.aborted) return null; // 已中止：不发起新模型调用
 	const prompt = buildMemoryPrompt(files, localContext, dialogueContext, mapBrief);
 	try {
+		const completeOptions: Record<string, unknown> = {};
+		if (deps.maxTokens !== undefined) completeOptions.maxTokens = deps.maxTokens;
+		if (options?.signal) completeOptions.signal = options.signal;
 		const response = await deps.complete(deps.model, {
 			systemPrompt: MEMORY_SYSTEM_PROMPT,
 			messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
-		});
+		}, completeOptions);
 		const text = (response.content ?? [])
 			.filter((c) => c.type === "text")
 			.map((c) => c.text ?? "")

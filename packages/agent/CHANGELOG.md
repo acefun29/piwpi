@@ -11,6 +11,10 @@
 
 - Added bounded `Session.findEntriesOnBranch()` and `findEntryOnBranch()` queries with explicit traversal, filtering, ordering, and limit options.
 
+### Fixed
+
+- Fixed rejected model streams and terminal proxy failures to end the agent loop cleanly, including ordered delivery of the last tool update before its final result.
+
 ## [0.83.0] - 2026-07-29
 
 ## [0.82.1] - 2026-07-25

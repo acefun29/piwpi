@@ -10,6 +10,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -268,6 +269,63 @@ describe("estimateContextTokens", () => {
 		expect(estimate.lastUsageIndex).toBe(1);
 		expect(estimate.trailingTokens).toBeGreaterThan(0);
 		expect(estimate.tokens).toBe(150 + estimate.trailingTokens);
+	});
+
+	it("P2-5：blockImages=true → 含图消息估算 ≈ 无图文本 + 27 字符级（真实占位符）", () => {
+		const userMsg: AgentMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "abc" },
+				{ type: "image", data: "x", mimeType: "image/png" },
+			],
+			timestamp: Date.now(),
+		};
+		const toolMsg: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "t1",
+			toolName: "read",
+			content: [
+				{ type: "text", text: "abc" },
+				{ type: "image", data: "x", mimeType: "image/png" },
+			],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const baseUser = estimateTokens({ ...userMsg, content: [{ type: "text", text: "abc" }] });
+		const baseTool = estimateTokens({ ...toolMsg, content: [{ type: "text", text: "abc" }] });
+		const blockedUser = estimateTokens(userMsg, { blockImages: true });
+		const blockedTool = estimateTokens(toolMsg, { blockImages: true });
+
+		expect(blockedUser).toBe(baseUser + Math.ceil(27 / 4));
+		expect(blockedTool).toBe(baseTool + Math.ceil(27 / 4));
+	});
+
+	it("P2-5：非视觉模型（visionModel=false）→ user 46 / tool 50 字符占位符；视觉模型维持 4800", () => {
+		const userMsg: AgentMessage = {
+			role: "user",
+			content: [{ type: "image", data: "x", mimeType: "image/png" }],
+			timestamp: Date.now(),
+		};
+		const toolMsg: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "t1",
+			toolName: "read",
+			content: [{ type: "image", data: "x", mimeType: "image/png" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const nonVisionUser = estimateTokens(userMsg, { visionModel: false });
+		const nonVisionTool = estimateTokens(toolMsg, { visionModel: false });
+		expect(nonVisionUser).toBe(Math.ceil(46 / 4));
+		expect(nonVisionTool).toBe(Math.ceil(50 / 4));
+
+		// 视觉模型（或未传 opts）：维持 4800 字符级估算
+		const visionUser = estimateTokens(userMsg, { visionModel: true });
+		expect(visionUser).toBe(Math.ceil(4800 / 4));
+		const defaultUser = estimateTokens(userMsg);
+		expect(defaultUser).toBe(Math.ceil(4800 / 4)); // 默认不回退
 	});
 });
 

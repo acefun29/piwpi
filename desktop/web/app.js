@@ -119,8 +119,28 @@ const pending = new Map(); // id -> {resolve, timer}
 let piConnected = false;
 let currentModel = null;
 
+// P0-3：bridge 鉴权 token（Electron 下经 preload 获取；web 调试模式 null，bridge dev 模式放行）
+let bridgeToken = null;
+/** 启动时先取 token 再发首个 rpc（initSession 开头 await） */
+const bridgeAuthReady = (async () => {
+	try {
+		bridgeToken = (await window.getBridgeToken?.()) ?? null;
+	} catch {
+		bridgeToken = null;
+	}
+})();
+/** P2-7：SSE 客户端身份（每页面加载一个新身份，重连复用；第二标签页被 bridge 拒 409） */
+const clientId = (window.crypto?.randomUUID?.() ?? `c${Math.random().toString(36).slice(2)}`);
+
+/** 带 token 的 fetch（/api/* 与 /debug/* 控制端点统一走这里） */
+function authFetch(url, options = {}) {
+	const headers = new Headers(options.headers);
+	if (bridgeToken) headers.set("authorization", `Bearer ${bridgeToken}`);
+	return fetch(url, { ...options, headers });
+}
+
 async function rpcRaw(cmd) {
-	const res = await fetch("/api/rpc", {
+	const res = await authFetch("/api/rpc", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(cmd),
@@ -150,6 +170,8 @@ function rpc(cmd, timeoutMs = 15000) {
 const msgCol = $("#msgCol");
 const chatFlow = $("#chatFlow");
 let streaming = false;
+/** P0-2：初始 prompt 提交锁（先确认后提交：rpc 响应前二次 Enter 被拦截，避免 preflight 期间双发） */
+let promptPending = false;
 let collaborationMode = "default";
 let currentAssistant = null; // { root, blocks: Map<contentIndex, block>, order: [] }
 const toolCards = new Map(); // toolCallId -> card refs
@@ -333,6 +355,7 @@ function hideRunning() {
 
 function setStreaming(on) {
 	streaming = on;
+	if (on) promptPending = false; // 本轮已开始处理：后续输入走 followUp，解锁
 	updateActionBtn();
 }
 
@@ -379,6 +402,7 @@ function dispatch(evt) {
 			return;
 		case "agent_settled":
 			setStreaming(false);
+			promptPending = false;
 			if (currentAssistant) finalizeMd(currentAssistant); // 兜底：没收齐 message_end 时仍完成收尾
 			currentAssistant = null;
 			scheduleContextUsageRefresh(); // 一轮结束，上下文定稿
@@ -482,10 +506,16 @@ function dispatch(evt) {
 			refreshProjectInfo();
 			refreshSessions();
 			return;
-		case "session_start":
+		case "session_start": {
 			// 启动 / resume / 切换会话都会触发：更新当前会话高亮 + 刷新会话树
+			// P2-1：单一权威刷新（get_state → refreshSessions 一条路径；single-flight 合并并发）
+			const gen = sessionGeneration;
 			rpc({ type: "get_state" }, 30000)
 				.then((r) => {
+					if (gen !== sessionGeneration) {
+						traceUiDiscarded();
+						return; // 切换窗口期晚到 → 丢弃（initSession/resumeSession 是权威源）
+					}
 					if (r.success) {
 						if (typeof r.data?.sessionFile === "string") currentSessionFile = r.data.sessionFile;
 						if (typeof r.data?.collaborationMode === "string") setModePicker(r.data.collaborationMode);
@@ -493,9 +523,9 @@ function dispatch(evt) {
 					}
 				})
 				.catch(() => {});
-			refreshSessions();
 			scheduleContextUsageRefresh(); // 新会话/切换会话，重置占用
 			return;
+		}
 		default:
 			return;
 	}
@@ -649,11 +679,28 @@ let esOpenResolve = null;
 const esOpened = new Promise((r) => { esOpenResolve = r; });
 
 function connectEvents() {
-	const es = new EventSource("/api/events");
+	const es = new EventSource(`/api/events?token=${encodeURIComponent(bridgeToken ?? "")}&clientId=${encodeURIComponent(clientId)}`);
 	es.onopen = () => {
-		esOpenResolve?.();
-		esOpenResolve = null;
+		// 首次打开：initSession 负责初始化（esOpenResolve 非空即首次）
+		if (esOpenResolve) {
+			esOpenResolve();
+			esOpenResolve = null;
+			showBanner(null);
+			return;
+		}
+		// P1-4：重连后状态未知 → 使所有 pending 失效（明确告知，不暗示请求未执行）、
+		// 暂停发送、get_state/get_messages 权威同步后恢复输入
+		const gen = ++esGeneration;
+		for (const [id, p] of pending) {
+			pending.delete(id);
+			clearTimeout(p.timer);
+			p.reject(new Error("连接已重连，请求状态未知"));
+		}
+		sendPaused = true;
 		showBanner(null);
+		resyncAfterReconnect(gen).finally(() => {
+			if (gen === esGeneration) sendPaused = false;
+		});
 	};
 	es.onmessage = (e) => {
 		try { dispatch(JSON.parse(e.data)); } catch (err) { console.error("bad event", err); }
@@ -662,6 +709,37 @@ function connectEvents() {
 		setPiStatus(false);
 		showBanner("与 bridge 的连接断开，正在重连…");
 	};
+}
+
+/** P1-4：重连后的权威同步——断线期间 pi 已接受的 prompt 经 get_messages 自然呈现 */
+async function resyncAfterReconnect(gen) {
+	try {
+		const state = await rpc({ type: "get_state" }, 30000);
+		if (gen !== esGeneration) {
+			traceUiDiscarded();
+			return;
+		}
+		if (state.success) {
+			const d = state.data;
+			setCurrentModel(d.model);
+			if (typeof d.sessionFile === "string") currentSessionFile = d.sessionFile;
+			setupModePicker(d.collaborationMode ?? "default");
+			setStreaming(!!d.isStreaming);
+		}
+		const msgs = await rpc({ type: "get_messages" }, 30000);
+		if (gen !== esGeneration) {
+			traceUiDiscarded();
+			return;
+		}
+		if (msgs.success && msgs.data.messages.length > 0) {
+			await rebuildHistory(msgs.data.messages);
+		}
+		refreshSessions();
+		refreshDebugState();
+		refreshContextUsage();
+	} catch {
+		// 同步失败：状态以重连后的下次事件为准（finally 恢复输入）
+	}
 }
 
 function setPiStatus(alive) {
@@ -673,23 +751,33 @@ function setPiStatus(alive) {
 
 /* ================= 会话初始化 ================= */
 async function initSession() {
+	const gen = ++sessionGeneration; // 本次初始化成为最新代次
 	try {
+		// P0-3：先取 bridge token（首个 rpc 必须带鉴权头）
+		await bridgeAuthReady;
 		// 等 SSE 打开后再发 rpc，避免响应丢失导致超时
 		await esOpened;
+		if (gen !== sessionGeneration) return;
 		// 恢复上次选择的项目（localStorage；switch_project 为运行中切换，pi 不重启）
 		const saved = localStorage.getItem("piwpi.project");
 		if (saved) {
-			const st = await (await fetch("/api/bridge/status")).json();
+			const st = await (await authFetch("/api/bridge/status")).json();
+			if (gen !== sessionGeneration) return;
 			if (st.workspace && normPath(st.workspace) !== normPath(saved)) {
 				await rpc({ type: "switch_project", path: saved }, 30000);
 			}
 		}
+		if (gen !== sessionGeneration) return;
 		await refreshProjectInfo();
 		// 首次 initSession 时 pi 还在加载扩展（jiti TS），get_state/get_messages 可能需要 30s+
 		const [stateRes, levelsRes] = await Promise.all([
 			rpc({ type: "get_state" }, 90000),
 			rpc({ type: "get_available_thinking_levels" }, 90000),
 		]);
+		if (gen !== sessionGeneration) {
+			traceUiDiscarded();
+			return; // 切换窗口期晚到 → 丢弃，不写 UI
+		}
 		if (stateRes.success) {
 			const d = stateRes.data;
 			setCurrentModel(d.model);
@@ -697,9 +785,11 @@ async function initSession() {
 			setupModePicker(d.collaborationMode ?? "default");
 			setupThinkingPicker(levelsRes.success ? levelsRes.data.levels : ["off"], d.thinkingLevel);
 			setStreaming(!!d.isStreaming);
+			promptPending = false; // 会话恢复：清锁，避免旧提交残留
 		}
 		// 恢复历史消息（刷新页面后）
 		await rebuildFromMessages();
+		if (gen !== sessionGeneration) return;
 		refreshSessions();
 		refreshDebugState();
 		refreshContextUsage();
@@ -714,7 +804,7 @@ async function rebuildFromMessages() {
 	try {
 		const msgsRes = await rpc({ type: "get_messages" }, 60000);
 		if (msgsRes.success && msgsRes.data.messages.length > 0) {
-			rebuildHistory(msgsRes.data.messages);
+			await rebuildHistory(msgsRes.data.messages);
 		}
 	} catch { /* ignore */ }
 }
@@ -724,6 +814,7 @@ function resetChatView() {
 	msgCol.innerHTML = "";
 	toolCards.clear();
 	currentAssistant = null;
+	promptPending = false; // 视图重建：清锁（旧提交已随会话切换作废）
 	setStreaming(false);
 	const hint = el("div", "empty-hint");
 	hint.id = "emptyHint";
@@ -871,12 +962,22 @@ function renderPlanArtifact(blk) {
 	return card;
 }
 
-/** 从历史消息重建对话（role: user / assistant / toolResult / bashExecution） */
-function rebuildHistory(messages) {
+/** 从历史消息重建对话（role: user / assistant / toolResult / bashExecution）
+ *  P2-6：可取消——会话/项目切换（sessionGeneration 变化）时放弃剩余构建、不提交；
+ *  每 ~20 条让出事件循环，长历史不阻塞 UI。 */
+async function rebuildHistory(messages) {
+	const gen = sessionGeneration; // 取消代次
+	const domStart = Date.now(); // P9：DOM 重建耗时
 	toolCards.clear();
 	historyRebuilding = true;
 	msgCol.hidden = true;
+	let rebuilt = 0;
 	for (const m of messages) {
+		if (gen !== sessionGeneration) {
+			if (TRACE_UI) console.debug(`[trace] dom ms=${Date.now() - domStart} nodes=${msgCol.querySelectorAll(".msg").length} (aborted)`);
+			return; // 旧代次：放弃剩余构建，不提交
+		}
+		if (++rebuilt % 20 === 0) await new Promise((r) => setTimeout(r, 0)); // 让出事件循环
 		if (m.role === "user") {
 			const texts = [];
 			if (typeof m.content === "string") {
@@ -951,6 +1052,7 @@ function rebuildHistory(messages) {
 	historyRebuilding = false;
 	scrollBottom(true);
 	scheduleHistoryHighlight();
+	if (TRACE_UI) console.debug(`[trace] dom ms=${Date.now() - domStart} nodes=${msgCol.querySelectorAll(".msg").length}`);
 }
 
 /* ================= 发送 / 中断 / 新建 ================= */
@@ -958,9 +1060,17 @@ async function sendMessage() {
 	const box = $("#inputBox");
 	const text = box.value.trim();
 	if (!text) return;
+	if (sendPaused) {
+		toast("正在同步会话状态…", "info");
+		return;
+	}
 	if (!currentModel) {
 		setView("providers");
 		toast("请先配置并选择模型", "warn");
+		return;
+	}
+	if (promptPending) {
+		toast("上一条消息仍在处理中", "error");
 		return;
 	}
 	box.value = "";
@@ -968,11 +1078,17 @@ async function sendMessage() {
 	const cmd = streaming
 		? { type: "prompt", message: text, streamingBehavior: "followUp" }
 		: { type: "prompt", message: text };
-	addUserMsg(text, streaming);
+	// P0-2：先确认后提交——带 id 的 rpc 等待 preflight 结果，成功才落用户消息；
+	// 失败（preflight 拒绝/超时/HTTP 错）→ 消息不出现（无幽灵消息）
+	promptPending = true;
 	try {
-		await rpcRaw(cmd);
+		const evt = await rpc(cmd);
+		if (evt.success === false) return; // 拒绝 toast 由 SSE response 分支输出；不落消息
+		addUserMsg(text, streaming);
 	} catch (err) {
 		toast(`发送失败：${err.message}`, "error");
+	} finally {
+		promptPending = false;
 	}
 }
 
@@ -1048,7 +1164,7 @@ function shortenPluginId(id) {
 
 async function refreshDebugState() {
 	try {
-		const res = await fetch("/debug/state");
+		const res = await authFetch("/debug/state");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const state = await res.json();
 		if (state.cwd) debugCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
@@ -1097,7 +1213,7 @@ function renderPlugins(plugins) {
 async function showPluginDetail(id) {
 	try {
 		// 实时读盘查看：live 端点返回挂载范围在磁盘上的当前内容（引用式，磁盘是事实源）
-		const res = await fetch(`/debug/plugins/${encodeURIComponent(id)}/live`);
+		const res = await authFetch(`/debug/plugins/${encodeURIComponent(id)}/live`);
 		if (!res.ok) return;
 		const p = await res.json();
 		const segs = (p.segments ?? []).map((s) => `--- L${s.start}-${s.end} ---\n${s.text}`).join("\n\n");
@@ -1291,8 +1407,17 @@ function closeContextChart() {
 	ctxChartKey = null;
 }
 
+// P2-1：get_context_breakdown single-flight + 重跑标记（同一时刻最多一个请求进入 pi）
+let breakdownInFlight = false;
+let breakdownRerun = false;
+
 async function refreshContextUsage() {
 	try { await esOpened; } catch { return; }
+	if (breakdownInFlight) {
+		breakdownRerun = true; // 请求在途：记重跑标记，完成后补一次
+		return;
+	}
+	breakdownInFlight = true;
 	const seq = ++ctxFetchSeq;
 	try {
 		const res = await rpc({ type: "get_context_breakdown" }, 8000);
@@ -1302,6 +1427,12 @@ async function refreshContextUsage() {
 		if (!$("#ctxChartDetail").hidden) renderContextChart(ctxChartKey);
 	} catch {
 		// 保留上次成功的数据，避免面板闪烁
+	} finally {
+		breakdownInFlight = false;
+		if (breakdownRerun) {
+			breakdownRerun = false;
+			void refreshContextUsage();
+		}
 	}
 }
 
@@ -2004,12 +2135,12 @@ async function refreshMap() {
 	try {
 		// 树构建依赖 cwd 做相对路径；页面加载时 debug 服务可能尚未就绪导致缓存为空，先补拉一次
 		if (!debugCwd) {
-			const r = await fetch("/debug/state");
+			const r = await authFetch("/debug/state");
 			if (!r.ok) throw new Error(`HTTP ${r.status}`); // 502（服务未就绪）不静默落空 cwd
 			const s = await r.json();
 			debugCwd = s.cwd ?? "";
 		}
-		const res = await fetch("/debug/project-map");
+		const res = await authFetch("/debug/project-map");
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const data = await res.json();
 		renderMapPage(data.entries ?? {});
@@ -2037,6 +2168,21 @@ function setupMap() {
 let currentWorkspace = "";
 let currentSessionFile = ""; // 当前活动会话（侧边栏高亮）
 let sessionSwitching = false;
+/** P1-3：项目切换互斥锁（并发 switchProjectPath 只放行第一个，其余 toast 拦截） */
+let projectSwitching = false;
+/** P1-3：会话/项目代次——切换窗口期晚到的 get_state/get_messages 等响应按代次丢弃，不写 UI */
+let sessionGeneration = 0;
+/** P1-4：SSE 连接代次 + 发送暂停（重连后先权威同步再放行输入） */
+let esGeneration = 0;
+let sendPaused = false;
+/** P9：UI trace（?trace=1 开启）——代次丢弃计数 + DOM 重建耗时 */
+const TRACE_UI = new URLSearchParams(location.search).get("trace") === "1";
+let uiDiscarded = 0;
+function traceUiDiscarded() {
+	if (!TRACE_UI) return;
+	uiDiscarded++;
+	console.debug(`[trace] ui gen=${sessionGeneration}/${esGeneration} discarded=${uiDiscarded}`);
+}
 
 /** 路径归一化（比较用）：反斜杠转正 + 小写 */
 function normPath(p) {
@@ -2048,7 +2194,7 @@ async function waitDebugCwd(target, timeoutMs) {
 	const start = Date.now();
 	for (;;) {
 		try {
-			const state = await (await fetch("/debug/state")).json();
+			const state = await (await authFetch("/debug/state")).json();
 			if (typeof state.cwd === "string" && normPath(state.cwd) === normPath(target)) return;
 		} catch { /* retry */ }
 		if (Date.now() - start > timeoutMs) throw new Error("项目切换确认超时");
@@ -2061,11 +2207,11 @@ async function refreshProjectInfo() {
 	try {
 		let cwd = "";
 		try {
-			const state = await (await fetch("/debug/state")).json();
+			const state = await (await authFetch("/debug/state")).json();
 			if (typeof state.cwd === "string" && state.cwd) cwd = state.cwd;
 		} catch { /* fallthrough */ }
 		if (!cwd) {
-			const st = await (await fetch("/api/bridge/status")).json();
+			const st = await (await authFetch("/api/bridge/status")).json();
 			if (typeof st.workspace === "string") cwd = st.workspace;
 		}
 		if (cwd) {
@@ -2075,13 +2221,22 @@ async function refreshProjectInfo() {
 	} catch { /* ignore */ }
 }
 
-/** 拉取并渲染当前项目会话列表 */
+/** 拉取并渲染当前项目会话列表（P2-1：single-flight——并发调用共享同一次请求） */
+let sessionsRefreshing = null;
 async function refreshSessions() {
+	if (sessionsRefreshing) return sessionsRefreshing;
+	sessionsRefreshing = (async () => {
+		try {
+			const res = await authFetch("/api/sessions");
+			const data = await res.json();
+			renderSessions(data.sessions ?? []);
+		} catch { /* ignore */ }
+	})();
 	try {
-		const res = await fetch("/api/sessions");
-		const data = await res.json();
-		renderSessions(data.sessions ?? []);
-	} catch { /* ignore */ }
+		return await sessionsRefreshing;
+	} finally {
+		sessionsRefreshing = null;
+	}
 }
 
 /** 项目组折叠状态（跨刷新保留）：path -> collapsed */
@@ -2161,7 +2316,7 @@ function renderSessions(sessions) {
 				}
 				if (!confirm(`删除会话「${s.name || s.firstMessage || s.id}」？文件将从磁盘移除，不可恢复。`)) return;
 				try {
-					const res = await fetch(`/api/sessions?file=${encodeURIComponent(s.sessionFile)}`, { method: "DELETE" });
+					const res = await authFetch(`/api/sessions?file=${encodeURIComponent(s.sessionFile)}`, { method: "DELETE" });
 					if (res.ok) {
 						toast("会话已删除");
 						refreshSessions();
@@ -2204,6 +2359,7 @@ function renderSessions(sessions) {
 async function resumeSession(s) {
 	if (sessionSwitching) return;
 	sessionSwitching = true;
+	const gen = ++sessionGeneration; // 本次恢复成为最新代次
 	setView("chat");
 	showBanner("正在切换会话…");
 	try {
@@ -2213,6 +2369,10 @@ async function resumeSession(s) {
 			return;
 		}
 		if (res.data?.cancelled) return;
+		if (gen !== sessionGeneration) {
+			traceUiDiscarded();
+			return; // 已被更新的会话/切换取代
+		}
 		currentSessionFile = s.sessionFile;
 		if (s.cwd) {
 			currentWorkspace = s.cwd;
@@ -2227,6 +2387,10 @@ async function resumeSession(s) {
 			rpc({ type: "get_messages" }, 60000),
 			refreshProjectInfo(),
 		]);
+		if (gen !== sessionGeneration) {
+			traceUiDiscarded();
+			return; // 旧代次响应不得写 UI
+		}
 		if (stateRes.success) {
 			const state = stateRes.data;
 			if (typeof state.sessionFile === "string") currentSessionFile = state.sessionFile;
@@ -2237,7 +2401,7 @@ async function resumeSession(s) {
 		}
 		resetChatView();
 		if (messagesRes.success && messagesRes.data.messages.length > 0) {
-			rebuildHistory(messagesRes.data.messages);
+			await rebuildHistory(messagesRes.data.messages);
 		}
 		refreshSessions();
 		refreshDebugState();
@@ -2246,21 +2410,34 @@ async function resumeSession(s) {
 		toast(`恢复失败：${err.message}`, "error", 8000);
 	} finally {
 		sessionSwitching = false;
+		promptPending = false; // 会话恢复：清锁
 		showBanner("");
 	}
 }
 
 /** 切换项目（运行中切换，pi 不重启）：switch_project RPC → 等扩展 cwd 跟随 → 重建视图 */
 async function switchProjectPath(path) {
+	if (projectSwitching) {
+		toast("正在切换项目", "error");
+		return;
+	}
+	projectSwitching = true;
+	const gen = ++sessionGeneration; // 本次切换成为最新代次：旧代次响应一律丢弃
 	try {
 		const res = await rpc({ type: "switch_project", path }, 30000);
 		if (!res.success) {
 			toast(`切换失败：${res.error ?? "未知原因"}`, "error", 8000);
 			return;
 		}
+		if (gen !== sessionGeneration) {
+			traceUiDiscarded();
+			return; // 已被更新的会话/切换取代
+		}
 		localStorage.setItem("piwpi.project", res.data?.cwd ?? path);
 		await waitDebugCwd(path, 15000);
+		if (gen !== sessionGeneration) return;
 		await refreshProjectInfo();
+		if (gen !== sessionGeneration) return;
 		setView("chat");
 		resetChatView();
 		$("#sessionTitle").textContent = "piwpi / 新对话";
@@ -2268,12 +2445,14 @@ async function switchProjectPath(path) {
 		toast(`已切换到项目：${res.data?.cwd ?? path}`);
 	} catch (err) {
 		toast(`切换失败：${err.message}`, "error", 8000);
+	} finally {
+		projectSwitching = false;
 	}
 }
 
 /** 项目切换：优先原生目录选择对话框（Electron）；web 调试模式降级文本输入 overlay */
 function openProjectPicker() {
-	fetch("/api/project/picker", { method: "POST" })
+	authFetch("/api/project/picker", { method: "POST" })
 		.then((r) => r.json())
 		.then((data) => {
 			if (data.ok && data.path) {
@@ -2344,11 +2523,13 @@ chatFlow.addEventListener("click", async (e) => {
 });
 
 /* ================= 启动 ================= */
-connectEvents();
 setupInput();
 setupDrawer();
 setupContextDashboard();
 setupMap();
 setupProject();
 setupProviders();
-initSession();
+void bridgeAuthReady.then(() => {
+	connectEvents();
+	return initSession();
+});
