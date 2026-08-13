@@ -1,16 +1,9 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type {
-	ContextEvent,
-	ExtensionContext,
-	ModelRegistry,
-	SessionEntry,
-	SessionStartEvent,
-	ToolCallEvent,
-	ToolResultEvent,
-	TruncationResult,
-} from "@earendil-works/pi-coding-agent";
+import type { ContextEvent, SessionStartEvent, ToolCallEvent, ToolResultEvent } from "../extensions/types.ts";
+import type { SessionEntry, SessionManager } from "../session-manager.ts";
+import type { TruncationResult } from "../tools/truncate.ts";
 import { registry } from "./adapters/registry.ts";
 import {
 	isSourceMeta,
@@ -21,8 +14,8 @@ import {
 	sliceText,
 	sourceAdapter,
 } from "./adapters/source.ts";
-import type { DebugContextSnapshot, DebugEvent, DebugMessageSummary, DebugSnapshot } from "./debug.ts";
-import { MAX_CONTEXT_TEXT } from "./debug.ts";
+import { FileContentCache } from "./file-cache.ts";
+import { chunkFingerprint, countDelta, decodeFingerprint, encodeFingerprint, lineFingerprint } from "./fingerprint.ts";
 import { type MemoryAgentDeps, summarize } from "./memory/agent.ts";
 import { countChangedLines } from "./memory/diff.ts";
 import {
@@ -30,7 +23,6 @@ import {
 	CUSTOM_ENTRY_TYPE,
 	type CustomEntryWriter,
 	dataDirFor,
-	migrateLegacyProjectMap,
 	projectMapFilePath,
 	readProjectMapFile,
 	restoreFromEntries,
@@ -39,18 +31,12 @@ import {
 } from "./memory/persist.ts";
 import { ProjectMap } from "./memory/project-map.ts";
 import { MemoryQueue } from "./memory/queue.ts";
-import { FileContentCache } from "./file-cache.ts";
-import {
-	chunkFingerprint,
-	countDelta,
-	decodeFingerprint,
-	encodeFingerprint,
-	lineFingerprint,
-} from "./fingerprint.ts";
 import { clamp, type LineRange, subtract } from "./ranges.ts";
 import { render } from "./render.ts";
+import type { PiwpiContextSnapshot, PiwpiEvent, PiwpiMessageSummary, PiwpiState } from "./state.ts";
+import { MAX_CONTEXT_TEXT } from "./state.ts";
 import { PluginStore } from "./store.ts";
-import type { Segment, ToolContextPlugin } from "./types.ts";
+import type { Segment, SourcePluginMeta, ToolContextPlugin } from "./types.ts";
 
 /** P9：per-request trace 日志门（PIWPI_TRACE=1 或 PI_TIMING=1；与 coding-agent timings.ts 同门） */
 const TRACE_ENABLED = process.env.PIWPI_TRACE === "1" || process.env.PI_TIMING === "1";
@@ -91,20 +77,32 @@ export interface ContextResult {
 }
 
 export interface Harness {
-	onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<void>;
-	onToolResult(event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined>;
+	onToolCall(event: ToolCallEvent, ctx: PiwpiHostContext): Promise<void>;
+	onToolResult(event: ToolResultEvent, ctx: PiwpiHostContext): Promise<ToolResultEventResult | undefined>;
 	/** 返回 { messages }（delta 追加到最后一条）时 runner 采用之；undefined 表示无改动（runner 沿用 clone）。 */
-	onContext(event: ContextEvent, ctx: ExtensionContext): Promise<ContextResult | undefined>;
-	onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void>;
+	onContext(event: ContextEvent, ctx: PiwpiHostContext): Promise<ContextResult | undefined>;
+	onSessionStart(event: SessionStartEvent, ctx: PiwpiHostContext): Promise<void>;
 	/** M5.5：每轮结束阈值递减——未达阈值的小量 pending 在有限轮数内必然触发（触发后重置，攒批保持少调用） */
 	onAgentSettled(): void;
 	shutdown(): Promise<void>;
 	/** 调试/观测快照（debug HTTP 服务用，见 src/debug.ts） */
-	snapshot(): DebugSnapshot;
+	snapshot(): PiwpiState;
 	/** 观测面板"点击实时查看"：从磁盘读取挂载范围当前内容（引用式，磁盘是事实源） */
 	liveContent(id: string): Promise<LiveContent | null>;
 	/** M5 新模型：Project Map 目录树渲染（read_project_map 工具用） */
 	projectMapTree(): string;
+}
+
+export interface PiwpiHostContext {
+	cwd: string;
+	modelRegistry: unknown;
+	model?: unknown;
+	sessionManager: Pick<SessionManager, "getEntries"> & Partial<Pick<SessionManager, "appendCustomEntry">>;
+}
+
+export interface PiwpiRuntimeRef {
+	harness?: Harness;
+	context?: () => PiwpiHostContext;
 }
 
 /** 观测面板"点击实时查看"的返回（debug /api/plugins/:id/live 用） */
@@ -136,7 +134,7 @@ export interface HarnessOptions {
 	/** 记忆批量整理阈值：累计未整理行数（默认 1000，M5 新模型） */
 	memoryBatchLines?: number;
 	/** 调试事件监听（debug 服务用；不设置则事件静默丢弃） */
-	onEvent?: (event: DebugEvent) => void;
+	onEvent?: (event: PiwpiEvent) => void;
 }
 
 /**
@@ -153,54 +151,20 @@ function formatRange(r: LineRange): string {
 	return r.start === r.end ? `L${r.start}` : `L${r.start}-${r.end}`;
 }
 
-/**
- * 从 ModelRegistry 上安全取 complete（结构访问）。
- * 仓库源码 model-registry.ts:99-107 的 complete 是 runtime.complete 的透传（custom-compaction 即用此通道）；
- * 而 npm 发布版 0.83.0 的 ModelRegistry 是同步兼容门面（无 complete），但 runtime 属性在运行时存在
- * （TS private 不参与运行时），其 ModelRuntime.complete(model, context, options) 形状兼容
- * （auth 由 runtime.prepareRequest 内部解析，返回 AssistantMessage.content 与下方消费形状一致）。
- * 两者都拿不到就返回 undefined → 记忆 Agent 禁用（session_start 自检日志会指出原因，不静默）。
- */
+/** ModelRegistry 的模型补全通道。 */
 type RegistryComplete = (
 	model: unknown,
 	context: { systemPrompt?: string; messages: { role: "user"; content: { type: "text"; text: string }[] }[] },
 	options?: Record<string, unknown>,
 ) => Promise<{ content: { type: string; text?: string }[] }>;
 
-/**
- * complete 通道探测：返回来源模式 + 包装函数（供 asCompleteFn 与启动自检共用，逻辑单一）。
- * 必须经对象属性调用（complete 是类方法，内部依赖 this——如 runtime.complete 内部调 this.stream，
- * 门面场景即此形状）；提取成裸函数会丢 this 而崩在调用链深处。
- * 非空断言说明：外层 typeof 守卫保证存在；闭包内 TS 收窄不穿透，且 mr 参数从不重赋值。
- */
-function resolveCompleteFn(
-	modelRegistry: unknown,
-): { mode: "registry" | "runtime"; complete: RegistryComplete } | undefined {
-	const mr = modelRegistry as
-		| {
-				complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown>;
-				runtime?: { complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> };
-		  }
-		| undefined;
-	if (typeof mr?.complete === "function") {
-		return {
-			mode: "registry",
-			complete: (model, context, options) =>
-				mr!.complete!(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>,
-		};
-	}
-	if (typeof mr?.runtime?.complete === "function") {
-		return {
-			mode: "runtime",
-			complete: (model, context, options) =>
-				mr!.runtime!.complete!(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>,
-		};
-	}
-	return undefined;
-}
-
 function asCompleteFn(modelRegistry: unknown): RegistryComplete | undefined {
-	return resolveCompleteFn(modelRegistry)?.complete;
+	const registry = modelRegistry as
+		| { complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> }
+		| undefined;
+	if (typeof registry?.complete !== "function") return undefined;
+	return (model, context, options) =>
+		registry.complete!(model, context, options) as Promise<{ content: { type: string; text?: string }[] }>;
 }
 
 /**
@@ -245,13 +209,13 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	const dataDir = () => options.dataDir ?? dataDirFor(cwd);
 	let customEntryWriter: CustomEntryWriter | undefined = options.customEntryWriter;
 	let entriesProvider: (() => SessionEntry[]) | undefined = options.entriesProvider;
-	let modelRegistry: ModelRegistry | undefined;
+	let modelRegistry: unknown;
 	let currentModel: unknown;
 	let lastUserText = "";
 	/** M5 新模型：主 Agent 对话尾部摘要（去重后，记忆整理输入二） */
 	let recentDialogue = "";
 	let mapLoaded = false;
-	let lastContext: DebugContextSnapshot | null = null;
+	let lastContext: PiwpiContextSnapshot | null = null;
 	const memoryBatchFiles = options.memoryBatchFiles ?? 5;
 	const memoryBatchLines = options.memoryBatchLines ?? 1000;
 	/** 当前生效的文件数阈值（M5.5：每轮 settled 递减，下限 1；触发整理后重置为初始值——攒批保持少调用） */
@@ -265,11 +229,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	let scanPending = true;
 
 	/** 调试事件（debug 服务用；无监听者时零开销）。ts 在此填充。 */
-	function emit(event: Omit<DebugEvent, "ts">): void {
-		options.onEvent?.({ ...event, ts: Date.now() } as DebugEvent);
+	function emit(event: Omit<PiwpiEvent, "ts">): void {
+		options.onEvent?.({ ...event, ts: Date.now() } as PiwpiEvent);
 	}
 
-	function rememberCtx(ctx: ExtensionContext): void {
+	function rememberCtx(ctx: PiwpiHostContext): void {
 		cwd = ctx.cwd;
 		modelRegistry ??= ctx.modelRegistry;
 		// 只在有值时更新：后续事件（onToolCall/onContext）的 ctx 可能缺 model，无条件覆盖会冲掉已提取的模型
@@ -286,9 +250,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (!modelRegistry || !currentModel) {
 			return `unavailable (modelRegistry=${!!modelRegistry}, currentModel=${!!currentModel})`;
 		}
-		const resolved = resolveCompleteFn(modelRegistry);
-		if (!resolved) return "unavailable (ModelRegistry 无 complete 通道)";
-		return resolved.mode === "registry" ? "registry.complete" : "runtime.complete (fallback)";
+		return asCompleteFn(modelRegistry) ? "registry.complete" : "unavailable (ModelRegistry 无 complete 通道)";
 	}
 
 	let warnedNoDeps = false; // 记忆 Agent 依赖缺失只警告一次，避免每轮批量刷屏
@@ -297,7 +259,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (!modelRegistry || !currentModel) {
 			if (!warnedNoDeps) {
 				warnedNoDeps = true;
-				console.error(`[piwpi] memory deps unavailable: modelRegistry=${!!modelRegistry} currentModel=${!!currentModel}`);
+				console.error(
+					`[piwpi] memory deps unavailable: modelRegistry=${!!modelRegistry} currentModel=${!!currentModel}`,
+				);
 			}
 			return undefined;
 		}
@@ -305,7 +269,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (!complete) {
 			if (!warnedNoDeps) {
 				warnedNoDeps = true;
-				console.error("[piwpi] memory deps unavailable: ModelRegistry 无 complete 通道（发布版门面缺 runtime.complete？）");
+				console.error("[piwpi] memory deps unavailable: ModelRegistry 无 complete 通道");
 			}
 			return undefined;
 		}
@@ -313,7 +277,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		const cfg = resolveMemoryModelConfig();
 		if (cfg) {
 			// find 可能缺失（宿主门面形状）→ 解析不到即视为未配置，跳过自动路径
-			const m = typeof modelRegistry.find === "function" ? modelRegistry.find(cfg.providerId, cfg.modelId) : undefined;
+			const registryWithFind = modelRegistry as { find?: (providerId: string, modelId: string) => unknown };
+			const m = registryWithFind.find?.(cfg.providerId, cfg.modelId);
 			if (m) {
 				// P9：记忆调用独立 usage 日志（complete 契约不含 usage 时记提示）
 				const wrapped = async (
@@ -337,7 +302,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			}
 			if (!memoryModelWarned) {
 				memoryModelWarned = true;
-				console.warn(`[piwpi] memory model ${cfg.providerId}/${cfg.modelId} 未在供应商配置中找到，自动记忆整理跳过（手动路径回退主模型）`);
+				console.warn(
+					`[piwpi] memory model ${cfg.providerId}/${cfg.modelId} 未在供应商配置中找到，自动记忆整理跳过（手动路径回退主模型）`,
+				);
 			}
 			return undefined;
 		}
@@ -355,9 +322,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (env) {
 			const i = env.indexOf("/");
 			memoryModelConfig =
-				i > 0 && i < env.length - 1
-					? { providerId: env.slice(0, i), modelId: env.slice(i + 1) }
-					: null;
+				i > 0 && i < env.length - 1 ? { providerId: env.slice(0, i), modelId: env.slice(i + 1) } : null;
 			return memoryModelConfig;
 		}
 		try {
@@ -384,7 +349,9 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		if (resolveMemoryModelConfig() !== null) return true;
 		if (!memoryModelWarned) {
 			memoryModelWarned = true;
-			console.warn("[piwpi] 未配置记忆 Agent 模型（models.json memoryModel 或 PIWPI_MEMORY_MODEL），自动记忆整理已跳过");
+			console.warn(
+				"[piwpi] 未配置记忆 Agent 模型（models.json memoryModel 或 PIWPI_MEMORY_MODEL），自动记忆整理已跳过",
+			);
 		}
 		return false;
 	}
@@ -479,7 +446,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	 * 单条消息 → debug 摘要（文本截断，防快照膨胀）。
 	 * onContext（实时快照）与恢复（历史消息）共用，保证结构一致。
 	 */
-	function toDebugSummary(m: unknown): DebugMessageSummary {
+	function toDebugSummary(m: unknown): PiwpiMessageSummary {
 		const mm = m as { role?: string; toolCallId?: unknown; content?: unknown };
 		const content = Array.isArray(mm.content) ? mm.content : [];
 		const text = content
@@ -511,7 +478,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 			console.error("[piwpi] restore context error:", err);
 			return;
 		}
-		const messages: DebugMessageSummary[] = [];
+		const messages: PiwpiMessageSummary[] = [];
 		let toolResultCount = 0;
 		for (const e of entries) {
 			if (e.type !== "message") continue;
@@ -642,8 +609,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				if (entry.hash !== mapEntry.hash) {
 					const diskLines = entry.lines ?? (await fileCache.readLines(absPath));
 					const base = decodeFingerprint(mapEntry.chunks ?? "");
-					const delta =
-						base === undefined ? diskLines.length : countDelta(base, chunkFingerprint(diskLines));
+					const delta = base === undefined ? diskLines.length : countDelta(base, chunkFingerprint(diskLines));
 					const pending = (mapEntry.pendingLines ?? 0) + delta;
 					if (pending >= changeThreshold(diskLines.length)) {
 						mapEntry.stale = true;
@@ -706,10 +672,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 	}
 
 	/** delta 追加到最后一条消息的副本尾部（历史消息对象不变；返回新数组）。 */
-	function appendDeltaToLast(
-		messages: ContextEvent["messages"],
-		delta: string,
-	): ContextEvent["messages"] {
+	function appendDeltaToLast(messages: ContextEvent["messages"], delta: string): ContextEvent["messages"] {
 		if (messages.length === 0) return messages;
 		const lastMsg = messages[messages.length - 1] as unknown as { content?: unknown };
 		const content = lastMsg.content;
@@ -794,7 +757,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 					console.debug("[piwpi] stale memory result dropped (plugin removed)");
 					continue;
 				}
-				const now = await fileCache.get(plugin.metadata.absPath);
+				const pluginMeta = plugin.metadata as unknown as SourcePluginMeta;
+				const now = await fileCache.get(pluginMeta.absPath);
 				if (!now || now.entry.hash !== hash) {
 					console.debug("[piwpi] stale memory result dropped (disk changed)");
 					continue;
@@ -853,7 +817,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 
 	return {
 		/** 计划 §4.2：read 拦截 → 哈希比对 → noop/increment/updated/new 登记（必须自带 try/catch）。 */
-		async onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<void> {
+		async onToolCall(event: ToolCallEvent, ctx: PiwpiHostContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
 				if (event.toolName !== "read") return;
@@ -909,7 +873,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		},
 
 		/** 计划 §4.3：按 pending.kind 分支（new/increment/noop/updated）。 */
-		async onToolResult(event: ToolResultEvent, _ctx: ExtensionContext): Promise<ToolResultEventResult | undefined> {
+		async onToolResult(event: ToolResultEvent, _ctx: PiwpiHostContext): Promise<ToolResultEventResult | undefined> {
 			try {
 				if (event.toolName !== "read") return undefined;
 				const p = pending.get(event.toolCallId);
@@ -944,7 +908,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				// 引用式：总行数从 file-cache 取（tool_call 后文件被改的 TOCTOU 由各分支 hash 比对兜底）
 				const existing0 = p.kind === "new" ? undefined : store.get(p.pluginId);
 				const absPath0 =
-					p.kind === "new" ? p.absPath : existing0 && isSourceMeta(existing0) ? existing0.metadata.absPath : undefined;
+					p.kind === "new"
+						? p.absPath
+						: existing0 && isSourceMeta(existing0)
+							? existing0.metadata.absPath
+							: undefined;
 				if (!absPath0) return undefined;
 				const r0 = await fileCache.get(absPath0);
 				if (!r0) return undefined;
@@ -1156,7 +1124,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		},
 
 		/** P0-1：历史不可变 + 尾部增量（不再原地改写任何历史消息）。 */
-		async onContext(event: ContextEvent, ctx: ExtensionContext): Promise<ContextResult | undefined> {
+		async onContext(event: ContextEvent, ctx: PiwpiHostContext): Promise<ContextResult | undefined> {
 			try {
 				rememberCtx(ctx);
 				// P1-5：磁盘扫描移出请求关键路径——turn 内多次 provider 请求只扫一次
@@ -1213,7 +1181,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				const delta = await buildMountDelta();
 				// P1-5：上下文摘要按需生成——仅 debug 监听者存在时映射（无监听者零开销）
 				if (options.onEvent) {
-					const summaries: DebugMessageSummary[] = event.messages.map((m) => toDebugSummary(m));
+					const summaries: PiwpiMessageSummary[] = event.messages.map((m) => toDebugSummary(m));
 					lastContext = {
 						ts: Date.now(),
 						messageCount: event.messages.length,
@@ -1237,7 +1205,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		},
 
 		/** 计划 §6.4：resume 时从 custom entries 恢复 store；项目地图懒加载。 */
-		async onSessionStart(event: SessionStartEvent, ctx: ExtensionContext): Promise<void> {
+		async onSessionStart(event: SessionStartEvent, ctx: PiwpiHostContext): Promise<void> {
 			try {
 				rememberCtx(ctx);
 				sessionGeneration++; // P0-4：会话切换/启动 → 旧代次在途任务作废
@@ -1246,8 +1214,6 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 				if (!mapLoaded) {
 					mapLoaded = true;
 					try {
-						// 旧位置（~/.pi/agent/piwpi/<safeCwd>/）→ 项目内 .piwpi/ 一次性迁移（新位置已有则跳过）
-						await migrateLegacyProjectMap(cwd, dataDir());
 						projectMap.load(await readProjectMapFile(projectMapFilePath(dataDir())));
 					} catch (err) {
 						console.error("[piwpi] project map load error:", err);
@@ -1284,12 +1250,12 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		},
 
 		/** 调试/观测快照（debug HTTP 服务用）。引用式：快照只含元数据，不含内容文本。 */
-		snapshot(): DebugSnapshot {
-			const plugins: DebugSnapshot["plugins"] = store.all().map((p) => ({
+		snapshot(): PiwpiState {
+			const plugins: PiwpiState["plugins"] = store.all().map((p) => ({
 				id: p.id,
 				category: p.category,
 				source: p.source,
-				metadata: p.metadata as unknown as DebugSnapshot["plugins"][number]["metadata"],
+				metadata: p.metadata as unknown as PiwpiState["plugins"][number]["metadata"],
 			}));
 			return {
 				cwd,

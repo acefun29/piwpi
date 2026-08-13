@@ -14,6 +14,8 @@
 ### Fixed
 
 - Fixed rejected model streams and terminal proxy failures to end the agent loop cleanly, including ordered delivery of the last tool update before its final result.
+- Fixed Windows execution-environment paths for file metadata, prompt templates, skill discovery, and Git Bash selection.
+- Kept browser builds free of Node-only crypto imports and allowed agent stream functions to return the shared event-stream abstraction.
 
 ## [0.83.0] - 2026-07-29
 

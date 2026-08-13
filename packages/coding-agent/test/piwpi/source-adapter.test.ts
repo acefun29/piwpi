@@ -10,8 +10,8 @@ import {
 	type SourceIngestFacts,
 	sliceText,
 	sourceAdapter,
-} from "../src/adapters/source.ts";
-import type { Segment, ToolContextPlugin } from "../src/types.ts";
+} from "../../src/core/piwpi/adapters/source.ts";
+import type { Segment } from "../../src/core/piwpi/types.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "piwpi-adapter-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));

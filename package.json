@@ -46,6 +46,7 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
+		"release:desktop:win": "npm run build && npm --prefix desktop run pack:win",
 		"prepare": "husky"
 	},
 	"devDependencies": {

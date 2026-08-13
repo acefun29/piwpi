@@ -30,7 +30,7 @@ ipcMain.handle("open-source-file", async (_event, filePath, workspace) => {
 // P0-3：bridge 鉴权 token 只交给当前窗口（每次启动随机生成）
 ipcMain.handle("get-bridge-token", () => bridge?.authToken ?? null);
 
-// 单实例：防止两个窗口各自 spawn pi 抢占 debug 端口/会话锁
+	// 单实例：防止两个窗口各自启动 agent runtime 抢占会话锁
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
 	app.quit();
@@ -54,6 +54,7 @@ async function createWindow() {
 		autoHideMenuBar: true,
 		title: "piwpi",
 		backgroundColor: "#F5F4F1",
+		icon: path.join(__dirname, "..", "build", "icon.png"),
 		...(process.platform === "win32"
 			? {
 				titleBarStyle: "hidden",

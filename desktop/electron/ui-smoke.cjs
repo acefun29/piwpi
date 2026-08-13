@@ -11,7 +11,7 @@ const SHOT_DIR = join(__dirname, "..", "screenshots");
 const SHOT_PATH = join(SHOT_DIR, "ui-smoke.png");
 mkdirSync(SHOT_DIR, { recursive: true });
 
-const prompt = "读一下 pi/extension/src/hash.ts 的前 10 行，简单说下它做什么，不用修改任何文件。";
+const prompt = "读一下 packages/coding-agent/src/core/piwpi/hash.ts 的前 10 行，简单说下它做什么，不用修改任何文件。";
 let bridge = null;
 let win = null;
 

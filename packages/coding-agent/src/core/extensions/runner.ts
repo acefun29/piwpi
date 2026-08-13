@@ -1023,7 +1023,9 @@ export class ExtensionRunner {
 		}
 
 		if (TRACE_ENABLED) {
-			console.debug(`[trace] transform ms=${Date.now() - traceStart} clones=${cloneCount} messages=${messages.length}`);
+			console.debug(
+				`[trace] transform ms=${Date.now() - traceStart} clones=${cloneCount} messages=${messages.length}`,
+			);
 		}
 		return currentMessages;
 	}

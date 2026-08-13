@@ -1,118 +1,62 @@
-> **piwpi** — a fork of [Pi](https://github.com/earendil-works/pi) by [@mariozechner](https://github.com/mariozechner) ([MIT](LICENSE)), extended with a tool-context plugin system (`extension/`).
-
 <p align="center">
   <img alt="piwpi logo" src="logo.svg" width="300">
 </p>
 
 # piwpi
 
-**piwpi** is a coding-agent extension for [Pi](https://github.com/earendil-works/pi): when the model re-reads a file, already-mounted line ranges are not returned again — only the missing parts are read incrementally, and the plugin content stays pinned at its anchor position in the conversation, byte-identical when unchanged (preserving prompt-cache prefixes). File changes trigger an async memory pass (summary / understanding / relations) that persists with the session.
+piwpi is an independent desktop Agent harness based on a modified [Pi](https://github.com/earendil-works/pi) runtime. It combines a Windows desktop client, multi-provider model runtime, coding tools, durable sessions, Default/Plan collaboration modes, file-context mounting, and a persistent Project Map in one product.
 
-**Status**: Phase 1 (M0–M6) complete — incremental mounting, pinned anchors, file-change remount, memory pass, persistence, and the token-comparison red line all implemented and tested (82 unit + 5 e2e tests green; a real-`pi` process demo drives the extension via `-e extension` against a mock LLM and verifies the full interception chain, see `extension/scripts/pi-demo/run-demo.mjs`). Acceptance #7 verified against a pristine baseline: the full coding-agent suite shows zero new failures from piwpi (remaining failures are pre-existing Windows platform incompatibilities, classified in [`extension/VERIFICATION.md`](extension/VERIFICATION.md)). All piwpi code lives in [`extension/`](extension); e2e tests live in `packages/coding-agent/test/piwpi-e2e.test.ts`.
+The piwpi capabilities are built into `packages/coding-agent`; there is no extension to install or `-e` startup path. Desktop communication is `Electron → authenticated local bridge → JSONL RPC → CodingAgentHarness`, with one prompt queue, model execution state, abort path, and session owner.
 
-**Usage**: load the extension with Pi:
+## Install
 
-```sh
-pi -e extension
-```
+The first prerelease targets Windows x64:
 
-**Debug API** (optional): set `PIWPI_DEBUG_PORT=8787` to start a read-only HTTP + SSE observability server on `127.0.0.1` (mounted plugins, segments, hashes, anchors, memory, context snapshots, real-time events) for external frontends:
+- NSIS installer: `piwpi-0.1.0-windows-x64-setup.exe`
+- Portable executable: `piwpi-0.1.0-windows-x64-portable.exe`
 
-```sh
-PIWPI_DEBUG_PORT=8787 pi -e extension   # then fetch http://127.0.0.1:8787/api/state
-```
-
-Full API reference and frontend integration guide: [`extension/docs/debug-api.md`](extension/docs/debug-api.md).
-
----
-
-The sections below are Pi's original README, describing the inherited code base (`packages/`).
-
-## All Packages
-
-| Package | Description |
-|---------|-------------|
-| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
-
-## Permissions & Containerization
-
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
-
-If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
-
-- **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
-- **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
+The beta is unsigned, so Windows SmartScreen may display an unknown-publisher warning. Verify the download with `SHA256SUMS.txt` from the same GitHub Release before running it.
 
 ## Development
 
-```bash
-npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build         # Refresh model data, then build all packages
-npm run build:offline # Rebuild using existing model data without network access
-npm run check         # Lint, format, and type check
-./test.sh            # Run tests (skips LLM-dependent tests without API keys)
-./pi-test.sh         # Run pi from sources (can be run from any directory)
-```
-
-## Building standalone binaries from release source
-
-GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:
+Requirements: Node.js 22.19 or newer.
 
 ```bash
-VERSION="<release-version>"
-tar -xzf "pi-${VERSION}-source.tar.gz"
-cd "pi-${VERSION}"
-./scripts/build-binaries.sh --offline-model-data --platform linux-x64 --out "$PWD/out"
+npm install --ignore-scripts
+npm run build
+npm run check
+./test.sh
+
+cd desktop
+npm install
+npm start
 ```
 
-The source archive includes the generated provider model data used for the release. `--offline-model-data` builds with that snapshot instead of refreshing it from live provider catalogs. The script still installs dependencies, builds the monorepo, compiles the Bun executable, and stages its runtime assets. Package maintainers who provide dependencies separately can pass `--skip-install --skip-deps`.
+Build the Windows installer and portable executable:
 
-## Supply-chain hardening
+```bash
+npm run build
+npm --prefix desktop run pack:win
+```
 
-We treat npm dependency changes as reviewed code changes.
+Release artifacts are written to `desktop/dist/`. The tag workflow publishes only those Windows artifacts and their SHA-256 checksums; it does not publish npm packages.
 
-- Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
-- `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
-- `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
-- Release smoke tests use `npm run release:local` to build, pack, and create isolated npm and Bun installs outside the repo before tagging a release.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
-- Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
+## Data and configuration
 
-## Share your OSS coding agent sessions
+- Sessions, plans, and Project Map: `<project>/.piwpi/`
+- Model credentials and provider configuration: `~/.pi/agent/`
+- Model credentials are handled by the inherited Pi model runtime and are not stored in project data.
 
-If you use Pi or other coding agents for open source work, please share your sessions.
+## Repository layout
 
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
+| Path | Purpose |
+|---|---|
+| `desktop/` | Electron shell, local bridge, and web UI |
+| `packages/coding-agent/src/core/piwpi/` | Built-in context mounting, memory, and Project Map |
+| `packages/coding-agent/` | CodingAgentHarness, tools, sessions, RPC, and model runtime |
+| `packages/agent/` | Generic Agent harness and agent loop |
+| `packages/ai/` | Provider and model APIs |
 
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
+## Upstream and license
 
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## License
-
-MIT
-
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+piwpi is based on [Pi](https://github.com/earendil-works/pi) and retains inherited `@earendil-works/*` package names and Pi configuration paths. The project is distributed under the [MIT License](LICENSE).

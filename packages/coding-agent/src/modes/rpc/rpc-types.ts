@@ -11,6 +11,8 @@ import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CollaborationMode } from "../../core/collaboration-mode.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { LiveContent } from "../../core/piwpi/harness.ts";
+import type { PiwpiState } from "../../core/piwpi/state.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -78,6 +80,9 @@ export type RpcCommand =
 	// Messages
 	| { id?: string; type: "get_messages" }
 	| { id?: string; type: "get_context_breakdown" }
+	| { id?: string; type: "get_piwpi_state" }
+	| { id?: string; type: "get_piwpi_plugin_live"; pluginId: string }
+	| { id?: string; type: "get_project_map" }
 
 	// Commands (available for invocation via prompt)
 	| { id?: string; type: "get_commands" };
@@ -156,6 +161,21 @@ export type RpcResponse =
 			command: "set_model";
 			success: true;
 			data: Model<any>;
+	  }
+	| { id?: string; type: "response"; command: "get_piwpi_state"; success: true; data: PiwpiState }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_piwpi_plugin_live";
+			success: true;
+			data: LiveContent | null;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_project_map";
+			success: true;
+			data: { entries: PiwpiState["projectMap"]; tree: string };
 	  }
 	| {
 			id?: string;

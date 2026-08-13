@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clamp, normalize, subtract } from "../src/ranges.ts";
+import { clamp, normalize, subtract } from "../../src/core/piwpi/ranges.ts";
 
 const r = (start: number, end: number) => ({ start, end });
 

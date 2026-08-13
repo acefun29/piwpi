@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { hashBuffer } from "../src/hash.ts";
+import { hashBuffer } from "../../src/core/piwpi/hash.ts";
 
 describe("hashBuffer（计划 §3.3）", () => {
 	it("对原始字节哈希（sha256 hex），与 node:crypto 一致", () => {

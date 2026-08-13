@@ -2,23 +2,27 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { buildMemoryPrompt, MEMORY_SYSTEM_PROMPT, parseMemoryJson, summarize } from "../src/memory/agent.ts";
-import { countChangedLines } from "../src/memory/diff.ts";
+import {
+	buildMemoryPrompt,
+	MEMORY_SYSTEM_PROMPT,
+	parseMemoryJson,
+	summarize,
+} from "../../src/core/piwpi/memory/agent.ts";
+import { countChangedLines } from "../../src/core/piwpi/memory/diff.ts";
 import {
 	asCustomEntryWriter,
 	CUSTOM_ENTRY_TYPE,
 	dataDirFor,
-	migrateLegacyProjectMap,
 	projectMapFilePath,
 	readProjectMapFile,
 	restoreFromEntries,
 	safeCwd,
 	serializePlugin,
 	writeProjectMapFile,
-} from "../src/memory/persist.ts";
-import { ProjectMap } from "../src/memory/project-map.ts";
-import { MemoryQueue } from "../src/memory/queue.ts";
-import type { MemoryJob, ToolContextPlugin } from "../src/types.ts";
+} from "../../src/core/piwpi/memory/persist.ts";
+import { ProjectMap } from "../../src/core/piwpi/memory/project-map.ts";
+import { MemoryQueue } from "../../src/core/piwpi/memory/queue.ts";
+import type { MemoryJob, ToolContextPlugin } from "../../src/core/piwpi/types.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "piwpi-memory-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -42,8 +46,6 @@ function plugin(over?: Partial<ToolContextPlugin>): ToolContextPlugin {
 
 /** 引用式：渲染输入的行数组（与 plugin 的 segments 范围 1-2 对应） */
 const LINES = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
-
-const JOB: MemoryJob = { pluginId: "source:file:a", localContext: "改一下认证", dialogueContext: "[user] 看看认证" };
 
 describe("MemoryQueue（计划 §6.1 / P1-1 shutdown 语义）", () => {
 	it("同一 pluginId 去抖合并为一个 job（最后一次的负载生效）", async () => {
@@ -421,29 +423,6 @@ describe("persist（计划 §6.4）", () => {
 		await writeProjectMapFile(file, { p1: { role: "auth" } });
 		const data = await readProjectMapFile(file);
 		expect(data).toEqual({ p1: { role: "auth" } });
-	});
-
-	it("migrateLegacyProjectMap：旧位置无数据 → false；有数据且新位置空 → 复制并返回 true；新位置已有 → 不覆盖", async () => {
-		const cwd = join(tmp, "proj");
-		const dataDir = join(tmp, "proj", ".piwpi");
-		// 旧位置 = defaultAgentDir()/piwpi/<safeCwd>/project-map.json（临时隔离：注入 PI_CODING_AGENT_DIR）
-		const legacyAgent = join(tmp, "legacy-agent");
-		process.env.PI_CODING_AGENT_DIR = legacyAgent;
-		try {
-			// 旧位置无数据
-			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(false);
-			// 旧位置有数据 → 迁移
-			const legacy = join(legacyAgent, "piwpi", safeCwd(cwd), "project-map.json");
-			await writeProjectMapFile(legacy, { p1: { role: "legacy" } });
-			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(true);
-			expect(await readProjectMapFile(projectMapFilePath(dataDir))).toEqual({ p1: { role: "legacy" } });
-			// 新位置已有数据 → 不覆盖
-			await writeProjectMapFile(projectMapFilePath(dataDir), { p2: { role: "new" } });
-			expect(await migrateLegacyProjectMap(cwd, dataDir)).toBe(false);
-			expect(await readProjectMapFile(projectMapFilePath(dataDir))).toEqual({ p2: { role: "new" } });
-		} finally {
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
 	});
 
 	it("serializePlugin 原样序列化（引用式：插件本身不携带文本）", () => {

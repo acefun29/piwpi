@@ -1,7 +1,6 @@
-import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "../../session-manager.ts";
 import type { MapEntry, ToolContextPlugin } from "../types.ts";
 
 /**
@@ -51,39 +50,6 @@ export function projectMapFilePath(dataDir: string): string {
 	return join(dataDir, "project-map.json");
 }
 
-/** 默认 agent 目录：$PI_CODING_AGENT_DIR 或 ~/.pi/agent（与 pi config.ts ENV_AGENT_DIR 一致；仅旧数据迁移用） */
-export function defaultAgentDir(): string {
-	if (process.env.PI_CODING_AGENT_DIR) return process.env.PI_CODING_AGENT_DIR;
-	return join(homedir(), ".pi", "agent");
-}
-
-/**
- * 旧位置 → 新位置一次性迁移：~/.pi/agent/piwpi/<safeCwd>/project-map.json → <dataDir>/project-map.json。
- * 旧位置无文件或新位置已有文件（不覆盖新数据）则跳过；返回是否执行了迁移。
- */
-export async function migrateLegacyProjectMap(cwd: string, dataDir: string): Promise<boolean> {
-	const legacy = join(defaultAgentDir(), "piwpi", safeCwd(cwd), "project-map.json");
-	const target = projectMapFilePath(dataDir);
-	try {
-		await access(legacy);
-	} catch {
-		return false;
-	}
-	try {
-		await access(target);
-		return false;
-	} catch {
-		// target 不存在 → 执行迁移
-	}
-	try {
-		await mkdir(dirname(target), { recursive: true });
-		await copyFile(legacy, target);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /**
  * 序列化插件状态（引用式重构后插件本身不携带文本；历史条目可能带 text/content 冗余字段，
  * 恢复时多余字段无害，不 version bump）。
@@ -123,10 +89,7 @@ export async function writeProjectMapFile(filePath: string, data: unknown): Prom
  * 窗口内另一会话写入的条目不会丢失（丢失窗口 ≈ 一次读+写，代价 = 一次重新整理，不做锁）。
  * 项目地图是项目级共享资产，任何会话写都不得覆盖他人沉淀。
  */
-export async function writeProjectMapFileMerged(
-	filePath: string,
-	data: Record<string, MapEntry>,
-): Promise<void> {
+export async function writeProjectMapFileMerged(filePath: string, data: Record<string, MapEntry>): Promise<void> {
 	const disk = await readProjectMapFile(filePath);
 	const merged: Record<string, MapEntry> = {};
 	if (disk && typeof disk === "object" && !Array.isArray(disk)) {

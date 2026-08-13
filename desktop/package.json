@@ -1,9 +1,10 @@
 {
   "name": "piwpi-desktop",
   "version": "0.1.0",
+  "author": "acefun29",
   "private": true,
   "type": "module",
-  "description": "piwpi 桌面端：Electron 壳 + 本地 bridge（spawn pi --mode rpc + piwpi 扩展 debug 观测）",
+  "description": "piwpi desktop Agent harness",
   "license": "MIT",
   "main": "electron/main.cjs",
   "scripts": {
@@ -11,11 +12,51 @@
     "dev:web": "node server/bridge.mjs --dev",
     "smoke": "node scripts/smoke-rpc.mjs",
     "smoke:layout": "electron electron/layout-smoke.cjs",
-    "typecheck:web": "node --check web/app.js"
+    "typecheck:web": "node --check web/app.js",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "pack:win": "npm run prepare:runtime && node node_modules/electron-builder/cli.js --win nsis portable --x64",
+    "pack:win:dir": "npm run prepare:runtime && node node_modules/electron-builder/cli.js --win dir --x64"
   },
   "devDependencies": {
-    "@highlightjs/cdn-assets": "^11.11.1",
-    "electron": "^37.0.0",
-    "markdown-it": "^14.3.0"
+    "@highlightjs/cdn-assets": "11.11.1",
+    "electron": "37.10.3",
+    "electron-builder": "26.15.3",
+    "markdown-it": "14.3.0"
+  },
+  "build": {
+    "appId": "io.github.acefun29.piwpi",
+    "productName": "piwpi",
+    "asar": true,
+    "compression": "normal",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "web/**/*",
+      "package.json"
+    ],
+    "afterPack": "scripts/after-pack.cjs",
+    "win": {
+      "icon": "build/icon.ico",
+      "executableName": "piwpi",
+      "artifactName": "piwpi-${version}-windows-${arch}-${name}.${ext}",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "artifactName": "piwpi-${version}-windows-${arch}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "piwpi"
+    },
+    "portable": {
+      "artifactName": "piwpi-${version}-windows-${arch}-portable.${ext}"
+    }
   }
 }

@@ -3,7 +3,6 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 
-import { createHash } from "node:crypto";
 import {
 	type AssistantMessage,
 	type Context,
@@ -37,7 +36,14 @@ const TRACE_ENABLED = process.env.PIWPI_TRACE === "1" || process.env.PI_TIMING =
 /** P9：稳定前缀 hash（systemPrompt + 除最后一条外全部消息）——重复问题两次 → 前缀 hash 相同 */
 function stablePrefixHash(systemPrompt: string, llmMessages: Message[]): string {
 	const payload = systemPrompt + JSON.stringify(llmMessages.slice(0, -1));
-	return createHash("sha256").update(payload).digest("hex").slice(0, 16);
+	let high = 0x811c9dc5;
+	let low = 0x9e3779b9;
+	for (let i = 0; i < payload.length; i++) {
+		const code = payload.charCodeAt(i);
+		high = Math.imul(high ^ code, 0x01000193);
+		low = Math.imul(low ^ code, 0x85ebca6b);
+	}
+	return `${(high >>> 0).toString(16).padStart(8, "0")}${(low >>> 0).toString(16).padStart(8, "0")}`;
 }
 export function agentLoop(
 	prompts: AgentMessage[],

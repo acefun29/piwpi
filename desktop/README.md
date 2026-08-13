@@ -1,154 +1,52 @@
-# piwpi 桌面端（阶段一）
+# piwpi desktop
 
-基于 `prototype/` 视觉原型的桌面前端：Electron 壳 + 本地 bridge + pi RPC。
+The desktop application runs the built-in piwpi Agent harness through an authenticated loopback bridge:
 
-## 架构
-
-```
-Electron 主进程 (electron/main.mjs)
-  └─ startBridge()  (server/bridge.mjs，零依赖 Node 标准库)
-       ├─ HTTP 127.0.0.1:<随机端口>
-       │    ├─ 静态托管 web/
-       │    ├─ POST /api/rpc    → 命令写入 pi stdin（JSONL）
-       │    ├─ GET  /api/events → SSE 转发 pi stdout（事件 + 响应）
-       │    ├─ /api/providers   → 自定义供应商配置与真实模型发现
-       │    └─ GET  /debug/*    → 反代 piwpi 扩展 debug 服务 (127.0.0.1:8787)
-       └─ spawn pi --mode rpc -e <extension> --session-dir <项目>/.piwpi/sessions
-            env: PIWPI_DEBUG_PORT=8787, ELECTRON_RUN_AS_NODE=1（Electron 下必须）
-            cwd: 当前项目目录（默认 piwpi 仓库根，PIWPI_WORKSPACE 可覆盖；侧边栏项目行可切换）
+```text
+Electron renderer
+  ↕ HTTP/SSE (random 127.0.0.1 port, per-launch bearer token)
+bridge.mjs
+  ↕ strict JSONL
+CodingAgentHarness RPC process
 ```
 
-- 数据跟项目走：会话（`--session-dir`）与 Project Map（扩展 `dataDirFor`，默认 `<cwd>/.piwpi`）都落在所选项目目录下
-- 切换项目：原生目录选择对话框（`POST /api/project/picker`，Electron dialog；web 调试模式降级文本输入）→ 前端发 RPC `switch_project`（piwpi 魔改命令：pi **运行中切换 cwd，不重启进程**，参照 switch_session 的 runtime 重建流程）→ 会话与记忆自动切换
-- 会话列表/恢复（`GET /api/sessions`、`DELETE /api/sessions`）：基准 = 扩展 debug 快照的 cwd（切换后自动跟随）；读取 `<项目>/.piwpi/sessions/` 下的 JSONL 会话文件（首行 header + session_info 名称 + 消息计数），点击恢复走 RPC `switch_session`
+The RPC process owns the model execution state, queue, abort controller, session, context mounts, Project Map, and memory queue. There is no external extension or debug side server.
+
+## Run
+
+Build the monorepo runtime first, then start Electron:
+
+```bash
+npm run build
+npm --prefix desktop start
 ```
 
-- 对话数据走 pi RPC（协议见 `pi/packages/coding-agent/docs/rpc.md`）
-- Context 抽屉走扩展 debug API（见 `pi/extension/docs/debug-api.md`）
-- 前端为零构建纯 ES Module，浏览器也能直接打开调试
+The system Node used by `dev:web` must be Node 22.19 or newer. Electron supplies its own compatible Node runtime for the packaged app.
 
-> **单一版本原则（重要）**：`pi/extension` 对 `@earendil-works/pi-coding-agent` 的依赖是
-> `file:../packages/coding-agent`（workspace 链接），**不装 npm 发布版**——扩展的运行时 CLI、类型、
-> ModelRegistry API 全部来自 `pi/packages/coding-agent` 的本地构建产物，与魔改的 pi 源码永远同版本。
-> 记忆 Agent 的 LLM 通道在会话启动时会打印自检日志（`[piwpi] memory agent LLM channel: ...`），
-> 可据此判断走的是 `registry.complete`（本地包）还是 `runtime.complete`（兜底）。
+## Verify
 
-## 构建方式（什么时候要构建）
+```bash
+npm --prefix desktop run typecheck:web
+npm --prefix desktop run smoke
+```
 
-桌面版测试前不用找构建步骤，规则就三条：
+`smoke` uses the real built coding-agent RPC process but does not call a language model.
 
-| 改了什么 | 要做什么 | 原因 |
+## Package Windows x64
+
+```bash
+npm run build
+npm --prefix desktop run pack:win
+```
+
+This creates an unsigned NSIS installer and portable executable in `desktop/dist/`.
+
+## Environment
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `pi/extension/**`（扩展源码/测试/文档） | **什么都不用做**，直接重启桌面 | 扩展由 pi 的 jiti 运行时加载 TS 源码（`loader.ts`），改动即时生效 |
-| `pi/packages/coding-agent/**`（pi 源码） | `cd pi/packages/coding-agent && npm run build` | 桌面版 spawn 的是 `dist/cli.js`，dist 不自动跟随源码 |
-| `pi/desktop/**`（electron/server/web） | 什么都不用做，直接重启 | 前端为零构建纯 ES Module，Electron 壳直接跑 |
-
-执行：
-
-```bash
-# 只改过 extension 或 desktop：直接启动
-cd desktop && npm start
-
-# 改过 pi 源码：先构建再启动
-cd pi/packages/coding-agent && npm run build
-cd desktop && npm start
-```
-
-加载链路（可据此判断改动有没有生效）：
-
-```
-desktop/electron → server/bridge.mjs → spawn packages/coding-agent/dist/cli.js --mode rpc -e ../pi/extension
-                                        └─ dist/cli.js 内 jiti 加载 extension/index.ts（TS 源码，非构建产物）
-```
-
-改动生效判据：
-- extension 改动：重启桌面即可（jiti 每次新建 jiti 实例加载，`moduleCache: false`，无缓存问题）；
-- pi 源码改动：构建后看 `dist/cli.js` 时间戳更新，再重启桌面；
-- 会话启动日志出现 `[piwpi] memory agent LLM channel: ...` 即扩展已加载。
-
-## 运行
-
-```bash
-cd desktop
-npm install        # 首次（拉 electron 二进制，体积较大；网络受限可用镜像：ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ node node_modules/electron/install.js）
-npm start          # 启动 Electron 窗口
-```
-
-> **关于 Electron 内置模块加载**：本项目 Electron 主进程用 `.cjs`（CommonJS）+ `require("electron")`，绕开 Electron 37 在部分 Windows 环境下 ESM 入口解析不到内置模块的兼容问题。
-
-纯 Web 模式（调试用）：
-
-```bash
-npm run dev:web    # node server/bridge.mjs
-# 浏览器打开 http://127.0.0.1:8901
-```
-
-> **node 版本要求**：pi 要求 node >= 22.19，bridge 用 `process.execPath` spawn pi 子进程，所以 dev:web 必须用 node 22 运行（`npm start` 不受影响——Electron 自带 Node 22）。系统 node 为 20.x 时显式指定：
->
-> ```bash
-> C:\path\to\node22\node.exe server\bridge.mjs
-> ```
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `PORT` | 8901 | bridge 端口（0 = 随机，Electron 模式用随机） |
-| `PIWPI_DEBUG_PORT` | 8787 | piwpi 扩展 debug 端口（被占自动递增） |
-| `PIWPI_WORKSPACE` | piwpi 仓库根 | 初始项目目录（侧边栏可切换；上次选择存 localStorage） |
-| `PIWPI_DATA_DIR` | `<项目>/.piwpi` | 扩展数据目录覆盖（project map 落盘处） |
-| `PIWPI_PI_CLI` | extension/node_modules 内（symlink → packages/coding-agent） | pi-coding-agent dist/cli.js 路径 |
-| `PIWPI_EXT` | ../pi/extension | piwpi 扩展路径 |
-| `PIWPI_PI_ARGS` | `--offline --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document` | 额外 pi 参数；桌面端不硬编码默认模型，并关闭启动阶段的后台模型目录网络刷新 |
-
-## 模型供应商
-
-桌面端直接展示 pi `ModelRuntime` 的完整供应商和模型目录，不再单独维护内置供应商副本。支持交互式 API Key 登录的供应商可直接在页面保存凭据；其他供应商仍会展示，并标明需要由 pi 的环境凭据或 OAuth 流程配置。未选择模型时发送按钮不可用。
-
-其他服务通过四种接口类型接入：`openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`。自定义供应商支持从服务端模型接口真实发现模型，也支持手动填写模型 ID。
-
-- API Key 由 pi 的凭据运行时写入全局 `~/.pi/agent/auth.json`，不会写入 `models.json`、localStorage、日志或 HTTP 响应。
-- 自定义供应商写入全局 `~/.pi/agent/models.json`，ID 使用 `piwpi-custom-<uuid>`；读写时保留该文件中的其他供应商。
-- 当前只支持 API Key，不包含 OAuth、自定义请求头、无密钥本地服务、回退或重试配置。
-
-## 性能
-
-- 桌面端默认以 `--offline` 启动 pi，避免 RPC 就绪后立即触发后台模型目录网络刷新；正常模型请求不受影响。
-- pi 子进程启用 Node 编译缓存，降低重复启动时的大型模块解析开销。
-- 同一项目内切换会话会复用 pi 的模型运行时，扩展没有注册供应商时不再重复刷新完整供应商鉴权状态。
-- 会话列表摘要按文件修改时间和大小缓存，并且最多读取前 2000 行，不再为侧边栏反复读取完整 JSONL。
-- 历史消息首次显示后再分批执行代码高亮，并使用浏览器内容可见性跳过屏幕外消息布局。
-- Windows 使用隐藏系统标题栏和原生窗口控制叠层，页面提供 40px 可拖动应用标题栏。
-
-## 测试
-
-```bash
-npm run smoke            # RPC + debug 服务连通性（不调用 LLM）
-node scripts/e2e-chat.mjs   # 真实对话 E2E（会消耗 LLM 额度）
-```
-
-## 阶段一范围
-
-- [x] 流式对话（text / thinking 折叠块 / codex 风格工具卡 / 运行指示 / 中断 / followUp 排队）
-- [x] 思考强度选择器（get_available_thinking_levels / set_thinking_level）
-- [x] 实时 Context 抽屉（挂载文件 segments/hash/锚点/memory + 上下文消息 + SSE 事件流 + 徽标）
-- [x] 刷新后历史重建（get_messages）
-- [x] Project Map 页（目录树 + 详情卡；数据走 /debug/project-map + SSE 增量刷新）
-- [x] 项目目录选择与切换（原生目录选择对话框 + switch_project 运行中切换；数据持久化到 `<项目>/.piwpi/`）
-- [x] 侧边栏会话树（项目 → 会话层级；当前项目全部历史、当前会话高亮、点击恢复、行内删除）
-- [x] 模型供应商管理与模型切换（pi 完整目录 + 4 种自定义接口类型）
-
-## 测试
-
-```bash
-npm run smoke            # RPC + debug 服务连通性（不调用 LLM）
-node scripts/e2e-chat.mjs   # 真实对话 E2E（会消耗 LLM 额度；用 --model 走可达 provider）
-```
-
-Electron UI 冒烟（需 `ELECTRON_RUN_AS_NODE` 未被外部设置；沙箱/虚拟化环境追加 `--no-sandbox --disable-gpu`）：
-
-```bash
-node_modules/electron/dist/electron.exe --no-sandbox --disable-gpu electron/ui-smoke.cjs
-# 输出：desktop/screenshots/ui-smoke.png + state JSON
-```
-- [ ] extension_ui 弹窗交互（目前自动取消 + toast）
+| `PORT` | `8901` | Web bridge port; Electron passes `0` for a random port |
+| `PIWPI_WORKSPACE` | repository root in development | Initial project directory |
+| `PIWPI_PI_CLI` | built or packaged `rpc-entry.js` | Override the Agent RPC entry |
+| `PIWPI_PI_ARGS` | offline mode and desktop tools | Override arguments passed to the Agent runtime |
+| `PIWPI_DATA_DIR` | `<project>/.piwpi` | Override piwpi project data directory |

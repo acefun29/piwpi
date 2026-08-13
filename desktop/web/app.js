@@ -1,7 +1,7 @@
 /**
  * piwpi 桌面端前端逻辑
  * - 对话：POST /api/rpc 发命令，SSE /api/events 收 pi 事件流
- * - 上下文占用：通过 /debug/* 获取快照，随会话事件主动刷新
+ * - 上下文占用：通过内建 piwpi RPC 获取快照，随会话事件主动刷新
  */
 
 if (window.desktopShell) document.body.classList.add("desktop-shell");
@@ -132,7 +132,7 @@ const bridgeAuthReady = (async () => {
 /** P2-7：SSE 客户端身份（每页面加载一个新身份，重连复用；第二标签页被 bridge 拒 409） */
 const clientId = (window.crypto?.randomUUID?.() ?? `c${Math.random().toString(36).slice(2)}`);
 
-/** 带 token 的 fetch（/api/* 与 /debug/* 控制端点统一走这里） */
+/** 带 token 的 fetch（/api/* 控制端点统一走这里） */
 function authFetch(url, options = {}) {
 	const headers = new Headers(options.headers);
 	if (bridgeToken) headers.set("authorization", `Bearer ${bridgeToken}`);
@@ -1134,7 +1134,7 @@ function setupInput() {
 	});
 }
 
-/* ================= Context 抽屉（debug API） ================= */
+/* ================= Context 抽屉（piwpi RPC） ================= */
 const drawer = $("#drawer");
 
 function setupDrawer() {
@@ -1164,10 +1164,10 @@ function shortenPluginId(id) {
 
 async function refreshDebugState() {
 	try {
-		const res = await authFetch("/debug/state");
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const state = await res.json();
-		if (state.cwd) debugCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
+		const response = await rpc({ type: "get_piwpi_state" }, 30000);
+		if (!response.success) throw new Error(response.error);
+		const state = response.data;
+		if (state.cwd) projectCwd = state.cwd; // 会话内稳定，Project Map 相对路径基准
 		renderPlugins(state.plugins ?? []);
 		renderContext(state.context);
 	} catch {
@@ -1213,9 +1213,9 @@ function renderPlugins(plugins) {
 async function showPluginDetail(id) {
 	try {
 		// 实时读盘查看：live 端点返回挂载范围在磁盘上的当前内容（引用式，磁盘是事实源）
-		const res = await authFetch(`/debug/plugins/${encodeURIComponent(id)}/live`);
-		if (!res.ok) return;
-		const p = await res.json();
+		const response = await rpc({ type: "get_piwpi_plugin_live", pluginId: id }, 30000);
+		if (!response.success || !response.data) return;
+		const p = response.data;
 		const segs = (p.segments ?? []).map((s) => `--- L${s.start}-${s.end} ---\n${s.text}`).join("\n\n");
 		const text = segs || "（无内容）";
 		// 简单弹层展示已挂载文本
@@ -1919,7 +1919,7 @@ function setupProviders() {
 	});
 }
 
-/* ================= Project Map 页面（debug API） ================= */
+/* ================= Project Map 页面（piwpi RPC） ================= */
 const mapDetail = $("#mapDetail");
 const mapPicker = $("#mapPicker");
 const pickerHead = $("#pickerHead");
@@ -1928,7 +1928,7 @@ const pickerSearch = $("#pickerSearch");
 const pickerTree = $("#pickerTree");
 const pickerCurrent = $("#pickerCurrent");
 let mapVisible = false;
-let debugCwd = "";            // 会话内稳定，从 /debug/state 缓存
+let projectCwd = "";          // 会话内稳定，从内建 runtime 快照缓存
 let mapEntries = {};          // 最近一次 entries（重选文件时重渲染用）
 let mapFileList = [];         // [{ id, name, rel, entry }]，构建时收集、按 rel 排序
 let selectedMapId = null;
@@ -1983,7 +1983,7 @@ function buildMapTree(entries) {
 		if (!id.startsWith("source:file:")) continue; // 协议：仅 source:file 类别写入
 		const abs = id.slice("source:file:".length);
 		if (!abs) continue;
-		const rel = relPath(debugCwd, abs, win);
+		const rel = relPath(projectCwd, abs, win);
 		const parts = rel.split("/").filter(Boolean);
 		let node = root;
 		for (const part of parts.slice(0, -1)) {
@@ -2001,9 +2001,9 @@ function buildMapTree(entries) {
 
 function renderPickerTree(root, query) {
 	pickerTree.innerHTML = "";
-	const rootName = (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目";
+	const rootName = (projectCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目";
 	const rootRow = el("div", "tree-root", rootName);
-	rootRow.title = debugCwd || "";
+	rootRow.title = projectCwd || "";
 	pickerTree.appendChild(rootRow);
 
 	const term = (query ?? "").trim().toLowerCase();
@@ -2113,7 +2113,7 @@ function renderMapPage(entries) {
 	const root = buildMapTree(entries);
 	if (mapFileList.length === 0) {
 		pickerTree.innerHTML = "";
-		pickerTree.appendChild(el("div", "tree-root", (debugCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目"));
+		pickerTree.appendChild(el("div", "tree-root", (projectCwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "项目"));
 		pickerTree.appendChild(el("div", "tree-empty", "（暂无条目）对话中 agent 读取文件后，记忆 Agent 会累计整理生成项目地图。"));
 		mapDetail.innerHTML = "";
 		mapDetail.appendChild(el("div", "tree-empty", "从卡片中选择一个文件查看详情"));
@@ -2133,20 +2133,18 @@ function renderMapPage(entries) {
 async function refreshMap() {
 	if (!mapVisible) return;
 	try {
-		// 树构建依赖 cwd 做相对路径；页面加载时 debug 服务可能尚未就绪导致缓存为空，先补拉一次
-		if (!debugCwd) {
-			const r = await authFetch("/debug/state");
-			if (!r.ok) throw new Error(`HTTP ${r.status}`); // 502（服务未就绪）不静默落空 cwd
-			const s = await r.json();
-			debugCwd = s.cwd ?? "";
+		// 树构建依赖 cwd 做相对路径；页面加载时 runtime 可能尚未就绪导致缓存为空，先补拉一次
+		if (!projectCwd) {
+			const stateResponse = await rpc({ type: "get_piwpi_state" }, 30000);
+			if (!stateResponse.success) throw new Error(stateResponse.error);
+			projectCwd = stateResponse.data.cwd ?? "";
 		}
-		const res = await authFetch("/debug/project-map");
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = await res.json();
-		renderMapPage(data.entries ?? {});
+		const response = await rpc({ type: "get_project_map" }, 30000);
+		if (!response.success) throw new Error(response.error);
+		renderMapPage(response.data.entries ?? {});
 	} catch {
 		pickerTree.innerHTML = "";
-		pickerTree.appendChild(el("div", "tree-empty", "debug 服务未连接（扩展未启动？），正在重连…"));
+		pickerTree.appendChild(el("div", "tree-empty", "piwpi runtime 尚未连接，正在重连…"));
 		mapDetail.innerHTML = "";
 		updatePickerCurrent();
 	}
@@ -2189,26 +2187,26 @@ function normPath(p) {
 	return String(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
-/** 轮询扩展 debug 快照直到 cwd 变为目标项目（switch_project 后扩展重载完成） */
-async function waitDebugCwd(target, timeoutMs) {
+/** 轮询内建 runtime 快照直到 cwd 变为目标项目 */
+async function waitProjectCwd(target, timeoutMs) {
 	const start = Date.now();
 	for (;;) {
 		try {
-			const state = await (await authFetch("/debug/state")).json();
-			if (typeof state.cwd === "string" && normPath(state.cwd) === normPath(target)) return;
+			const response = await rpc({ type: "get_piwpi_state" }, 30000);
+			if (response.success && typeof response.data.cwd === "string" && normPath(response.data.cwd) === normPath(target)) return;
 		} catch { /* retry */ }
 		if (Date.now() - start > timeoutMs) throw new Error("项目切换确认超时");
 		await new Promise((r) => setTimeout(r, 250));
 	}
 }
 
-/** 刷新侧边栏项目名（事实源 = 扩展 debug 快照 cwd，switch_project 后自动跟随；fallback bridge status） */
+/** 刷新侧边栏项目名（事实源 = 内建 runtime cwd） */
 async function refreshProjectInfo() {
 	try {
 		let cwd = "";
 		try {
-			const state = await (await authFetch("/debug/state")).json();
-			if (typeof state.cwd === "string" && state.cwd) cwd = state.cwd;
+			const response = await rpc({ type: "get_piwpi_state" }, 30000);
+			if (response.success && typeof response.data.cwd === "string" && response.data.cwd) cwd = response.data.cwd;
 		} catch { /* fallthrough */ }
 		if (!cwd) {
 			const st = await (await authFetch("/api/bridge/status")).json();
@@ -2434,7 +2432,7 @@ async function switchProjectPath(path) {
 			return; // 已被更新的会话/切换取代
 		}
 		localStorage.setItem("piwpi.project", res.data?.cwd ?? path);
-		await waitDebugCwd(path, 15000);
+		await waitProjectCwd(path, 15000);
 		if (gen !== sessionGeneration) return;
 		await refreshProjectInfo();
 		if (gen !== sessionGeneration) return;

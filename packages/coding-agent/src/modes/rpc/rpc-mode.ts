@@ -812,6 +812,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "get_context_breakdown", session.getContextBreakdown() ?? null);
 			}
 
+			case "get_piwpi_state": {
+				return success(id, "get_piwpi_state", session.getPiwpiState());
+			}
+
+			case "get_piwpi_plugin_live": {
+				return success(id, "get_piwpi_plugin_live", await session.getPiwpiPluginLiveContent(command.pluginId));
+			}
+
+			case "get_project_map": {
+				const state = session.getPiwpiState();
+				return success(id, "get_project_map", {
+					entries: state.projectMap,
+					tree: session.getProjectMapTree(),
+				});
+			}
+
 			// =================================================================
 			// Commands (available for invocation via prompt)
 			// =================================================================

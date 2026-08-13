@@ -1,5 +1,5 @@
 import type { Context, Model } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamProxy } from "../src/proxy.ts";
 
 /**

@@ -100,6 +100,15 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import type { LiveContent } from "./piwpi/harness.ts";
+import {
+	createHarness,
+	type Harness as PiwpiHarness,
+	type PiwpiHostContext,
+	type PiwpiRuntimeRef,
+} from "./piwpi/harness.ts";
+import type { PiwpiState } from "./piwpi/state.ts";
+import { createPiwpiToolDefinitions } from "./piwpi/tools.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
@@ -108,11 +117,11 @@ import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import { TRACE_ENABLED } from "./timings.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
-import { TRACE_ENABLED } from "./timings.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -228,6 +237,8 @@ export interface AgentSessionConfig {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Mutable ref used by Agent to access the current ExtensionRunner */
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	/** Mutable ref used by Agent context transformation to access the built-in piwpi runtime. */
+	piwpiRuntimeRef?: PiwpiRuntimeRef;
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
 }
@@ -375,6 +386,8 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 
 	private _modelRuntime: ModelRuntime;
+	private readonly _piwpi: PiwpiHarness;
+	private readonly _piwpiRuntimeRef?: PiwpiRuntimeRef;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -396,9 +409,34 @@ export class AgentSession {
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
-		this._customTools = config.customTools ?? [];
+		this._customTools = [...(config.customTools ?? [])];
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
+		this._piwpiRuntimeRef = config.piwpiRuntimeRef;
+		this._piwpi = createHarness({
+			cwd: config.cwd,
+			customEntryWriter: (customType, data) => this.sessionManager.appendCustomEntry(customType, data),
+			entriesProvider: () => this.sessionManager.getEntries(),
+		});
+		if (this._piwpiRuntimeRef) {
+			this._piwpiRuntimeRef.harness = this._piwpi;
+			this._piwpiRuntimeRef.context = () => this._getPiwpiContext();
+		}
+		this._customTools.push(
+			...createPiwpiToolDefinitions({
+				harness: this._piwpi,
+				sessionManager: this.sessionManager,
+				getMode: () => this._collaborationMode,
+				select: async (title, options) => {
+					if (!this._extensionUIContext) throw new Error("User input UI is not available");
+					return await this._extensionUIContext.select(title, options);
+				},
+				input: async (title, placeholder) => {
+					if (!this._extensionUIContext) throw new Error("User input UI is not available");
+					return await this._extensionUIContext.input(title, placeholder);
+				},
+			}),
+		);
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -423,8 +461,33 @@ export class AgentSession {
 		});
 	}
 
+	private _getPiwpiContext(): PiwpiHostContext {
+		return {
+			cwd: this._cwd,
+			modelRegistry: new ModelRegistry(this._modelRuntime),
+			model: this.model,
+			sessionManager: this.sessionManager,
+		};
+	}
+
 	get modelRuntime(): ModelRuntime {
 		return this._modelRuntime;
+	}
+
+	getPiwpiState(): PiwpiState {
+		return this._piwpi.snapshot();
+	}
+
+	getPiwpiPluginLiveContent(id: string): Promise<LiveContent | null> {
+		return this._piwpi.liveContent(id);
+	}
+
+	getProjectMapTree(): string {
+		return this._piwpi.projectMapTree();
+	}
+
+	async shutdownPiwpi(): Promise<void> {
+		await this._piwpi.shutdown();
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -496,6 +559,15 @@ export class AgentSession {
 					reason: `Tool "${toolCall.name}" is unavailable in ${this._collaborationMode} mode`,
 				};
 			}
+			await this._piwpi.onToolCall(
+				{
+					type: "tool_call",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+				},
+				this._getPiwpiContext(),
+			);
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -517,6 +589,22 @@ export class AgentSession {
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const piwpiResult = await this._piwpi.onToolResult(
+				{
+					type: "tool_result",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+					content: result.content,
+					details: result.details,
+					isError,
+					usage: result.usage,
+				},
+				this._getPiwpiContext(),
+			);
+			const nativeContent = piwpiResult?.content ?? result.content;
+			const nativeDetails = piwpiResult?.details ?? result.details;
+			const nativeIsError = piwpiResult?.isError ?? isError;
 			const runner = this._extensionRunner;
 			const hookResult = runner.hasHandlers("tool_result")
 				? await runner.emitToolResult({
@@ -524,27 +612,27 @@ export class AgentSession {
 						toolName: toolCall.name,
 						toolCallId: toolCall.id,
 						input: args as Record<string, unknown>,
-						content: result.content,
-						details: result.details,
-						isError,
+						content: nativeContent,
+						details: nativeDetails,
+						isError: nativeIsError,
 						usage: result.usage,
 					})
 				: undefined;
 
-			const content = hookResult?.content ?? result.content ?? [];
+			const content = hookResult?.content ?? nativeContent ?? [];
 			// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 			const normalizedContent = await normalizeToolResultImages(content, {
 				autoResizeImages: this.settingsManager.getImageAutoResize(),
 			});
 
-			if (!hookResult && normalizedContent === content) {
+			if (!piwpiResult && !hookResult && normalizedContent === content) {
 				return undefined;
 			}
 
 			return {
 				content: normalizedContent,
-				details: hookResult?.details,
-				isError: hookResult?.isError ?? isError,
+				details: hookResult?.details ?? nativeDetails,
+				isError: hookResult?.isError ?? nativeIsError,
 				usage: hookResult?.usage,
 			};
 		};
@@ -614,6 +702,7 @@ export class AgentSession {
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
 		try {
+			this._piwpi.onAgentSettled();
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
@@ -928,9 +1017,7 @@ export class AgentSession {
 	 * 全量 active（含当前模式下不可执行的；agent.state.tools 可能已按模式过滤，_activeToolNames 未初始化时回退）。
 	 */
 	getActiveToolNames(): string[] {
-		return this._activeToolNames.length > 0
-			? this._activeToolNames
-			: this.agent.state.tools.map((t) => t.name);
+		return this._activeToolNames.length > 0 ? this._activeToolNames : this.agent.state.tools.map((t) => t.name);
 	}
 
 	/** P1-6：当前模式下可执行工具名（与执行期 _toolCanExecuteInCurrentMode 谓词完全一致）。 */
@@ -2345,6 +2432,7 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
+		await this._piwpi.onSessionStart(this._sessionStartEvent, this._getPiwpiContext());
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}

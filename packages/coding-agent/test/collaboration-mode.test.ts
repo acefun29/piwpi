@@ -73,16 +73,18 @@ describe("P1-6：按协作模式过滤工具集", () => {
 				(pi) => {
 					pi.registerTool({
 						name: "plan_only_tool",
+						label: "Plan only tool",
 						description: "只在 plan 模式可用",
 						parameters: Type.Object({}),
 						collaborationModes: ["plan"],
-						execute: async () => ({ content: [] }),
+						execute: async () => ({ content: [], details: undefined }),
 					});
 					pi.registerTool({
 						name: "default_only_tool",
+						label: "Default only tool",
 						description: "只在 default 模式可用（无 collaborationModes）",
 						parameters: Type.Object({}),
-						execute: async () => ({ content: [] }),
+						execute: async () => ({ content: [], details: undefined }),
 					});
 				},
 			],

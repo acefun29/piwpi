@@ -2,8 +2,8 @@ import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
-	AssistantMessageEventStream,
 	Context,
+	EventStream,
 	ImageContent,
 	Message,
 	Model,
@@ -13,6 +13,9 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai";
+
+export type { UserMessage } from "@earendil-works/pi-ai";
+
 import type { Static, TSchema } from "typebox";
 
 /**
@@ -29,7 +32,9 @@ export type StreamFn = (
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
-) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+) =>
+	| EventStream<AssistantMessageEvent, AssistantMessage>
+	| Promise<EventStream<AssistantMessageEvent, AssistantMessage>>;
 
 /**
  * Configuration for how tool calls from a single assistant message are executed.

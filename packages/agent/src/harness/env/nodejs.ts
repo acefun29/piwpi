@@ -14,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -81,7 +81,7 @@ function fileInfoFromStats(
 	const kind = fileKindFromStats(stats);
 	if (!kind) return err(new FileError("invalid", "Unsupported file type", path));
 	return ok({
-		name: path.replace(/\/+$/, "").split("/").pop() ?? path,
+		name: basename(path),
 		path,
 		kind,
 		size: stats.size,
@@ -171,8 +171,11 @@ async function findBashOnPath(): Promise<string | null> {
 			? await runCommand("where", ["bash.exe"], 5000)
 			: await runCommand("which", ["bash"], 5000);
 	if (result.status !== 0 || !result.stdout) return null;
-	const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-	return firstMatch && (await pathExists(firstMatch)) ? firstMatch : null;
+	const matches = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+	for (const match of matches) {
+		if (!isLegacyWslBashPath(match) && (await pathExists(match))) return match;
+	}
+	return null;
 }
 
 interface ShellConfig {

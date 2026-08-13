@@ -3,13 +3,15 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import type { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import { CodingAgentHarness } from "./coding-agent-harness.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
+import type { PiwpiRuntimeRef } from "./piwpi/harness.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -290,6 +292,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const piwpiRuntimeRef: PiwpiRuntimeRef = {};
 
 	agent = new Agent({
 		initialState: {
@@ -349,8 +352,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages) => {
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
+			const extensionMessages = runner ? await runner.emitContext(messages) : messages;
+			if (!piwpiRuntimeRef.harness || !piwpiRuntimeRef.context) return extensionMessages;
+			const result = await piwpiRuntimeRef.harness.onContext(
+				{ type: "context", messages: extensionMessages },
+				piwpiRuntimeRef.context(),
+			);
+			return result?.messages ?? extensionMessages;
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
@@ -373,7 +381,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
-	const session = new AgentSession({
+	const session = new CodingAgentHarness({
 		agent,
 		sessionManager,
 		settingsManager,
@@ -386,6 +394,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		allowedToolNames,
 		excludedToolNames,
 		extensionRunnerRef,
+		piwpiRuntimeRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 	const extensionsResult = resourceLoader.getExtensions();

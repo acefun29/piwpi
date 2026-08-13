@@ -7,7 +7,7 @@
 import { startBridge } from "../server/bridge.mjs";
 import { StringDecoder } from "node:string_decoder";
 
-const prompt = process.argv[2] ?? "读一下 pi/extension/src/hash.ts 的前 20 行，然后告诉我这个文件是做什么的。";
+const prompt = process.argv[2] ?? "读一下 packages/coding-agent/src/core/piwpi/hash.ts 的前 20 行，然后告诉我这个文件是做什么的。";
 
 const { server, port, killPi } = await startBridge({ port: 0, dev: true });
 
@@ -30,7 +30,10 @@ async function consumeEvents(onEvent, stopWhen) {
 				if (line.startsWith("data: ")) {
 					const evt = JSON.parse(line.slice(6));
 					onEvent(evt);
-					if (stopWhen(evt)) return;
+					if (stopWhen(evt)) {
+						await reader.cancel();
+						return;
+					}
 				}
 			}
 		}
@@ -81,15 +84,47 @@ await Promise.race([
 	new Promise((_, reject) => setTimeout(() => reject(new Error("e2e timeout 180s")), 180_000)),
 ]);
 
-// 拉 debug 快照验证挂载
+async function requestRpc(command) {
+	const eventResponse = await fetch(`http://127.0.0.1:${port}/api/events`);
+	const id = crypto.randomUUID();
+	await fetch(`http://127.0.0.1:${port}/api/rpc`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ id, ...command }),
+	});
+	const reader = eventResponse.body.getReader();
+	const decoder = new StringDecoder("utf8");
+	let buffer = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) throw new Error(`RPC event stream ended before ${command.type}`);
+		buffer += decoder.write(value);
+		const frames = buffer.split("\n\n");
+		buffer = frames.pop() ?? "";
+		for (const frame of frames) {
+			for (const line of frame.split("\n")) {
+				if (!line.startsWith("data: ")) continue;
+				const event = JSON.parse(line.slice(6));
+				if (event.id === id) {
+					await reader.cancel();
+					return event;
+				}
+			}
+		}
+	}
+}
+
+// 拉内建 runtime 快照验证挂载
 await new Promise((r) => setTimeout(r, 1200));
-const state = await (await fetch(`http://127.0.0.1:${port}/debug/state`)).json();
+const stateResponse = await requestRpc({ type: "get_piwpi_state" });
+if (!stateResponse.success) throw new Error(stateResponse.error);
+const state = stateResponse.data;
 
 console.log("---- 事件统计 ----");
 console.log(JSON.stringify(stats, null, 2));
 console.log(`text 累计 ${textLen} 字符 | thinking_delta ${stats.thinking} 次`);
 console.log("seen types:", [...seenTypes].join(", "));
-console.log("---- debug 快照 ----");
+console.log("---- piwpi 快照 ----");
 console.log(`plugins: ${state.plugins?.length ?? 0} 个`);
 for (const p of state.plugins ?? []) {
 	const meta = p.metadata ?? {};

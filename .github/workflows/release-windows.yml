@@ -1,0 +1,124 @@
+name: Release Windows Desktop
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.19.0"
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s $(which fdfind) /usr/local/bin/fd
+
+      - name: Install monorepo dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: ./test.sh
+
+  release:
+    needs: quality
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.19.0"
+          cache: npm
+
+      - name: Install monorepo dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install desktop dependencies
+        run: npm ci --prefix desktop
+
+      - name: Build runtime packages
+        run: npm run build
+
+      - name: Package Windows x64
+        run: npm --prefix desktop run pack:win
+
+      - name: Smoke packaged runtime
+        shell: pwsh
+        run: |
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          $env:PIWPI_PI_CLI = (Resolve-Path "desktop/dist/win-unpacked/resources/runtime/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js").Path
+          $process = Start-Process -FilePath ".\desktop\dist\win-unpacked\piwpi.exe" -ArgumentList ".\desktop\scripts\smoke-rpc.mjs" -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged runtime smoke failed: $($process.ExitCode)" }
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem desktop/dist/piwpi-*.exe | Sort-Object Name
+          if ($assets.Count -ne 2) { throw "Expected exactly two release executables" }
+          $lines = $assets | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          Set-Content -LiteralPath desktop/dist/SHA256SUMS.txt -Value $lines -Encoding ascii
+
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          piwpi v0.1.0-beta.1 is the first Windows desktop prerelease.
+
+          Included:
+          - independent piwpi desktop Agent harness
+          - built-in file context mounting and Project Map
+          - Default and Plan collaboration modes
+          - Windows x64 installer and portable executable
+
+          This build is unsigned. Windows SmartScreen may show an “unknown publisher” warning. Verify the SHA-256 values in SHA256SUMS.txt before running it.
+          NOTES
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --prerelease \
+            --title "piwpi v0.1.0-beta.1" \
+            --notes-file release-notes.md \
+            desktop/dist/piwpi-*.exe \
+            desktop/dist/SHA256SUMS.txt

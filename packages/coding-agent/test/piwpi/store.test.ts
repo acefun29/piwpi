@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { PluginStore } from "../src/store.ts";
-import type { ToolContextPlugin } from "../src/types.ts";
+import { PluginStore } from "../../src/core/piwpi/store.ts";
+import type { ToolContextPlugin } from "../../src/core/piwpi/types.ts";
 
 /** 构造一个最小 Source 插件（metadata 含 SourcePluginMeta 全字段） */
 function plugin(id: string, anchor: string, extra?: Partial<ToolContextPlugin>): ToolContextPlugin {

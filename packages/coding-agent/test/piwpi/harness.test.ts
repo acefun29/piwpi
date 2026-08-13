@@ -1,24 +1,18 @@
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-	ContextEvent,
-	ExtensionAPI,
-	ExtensionContext,
-	SessionEntry,
-	ToolCallEvent,
-	ToolResultEvent,
-	TruncationResult,
-} from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createHarness } from "../src/harness.ts";
-import { hashBuffer } from "../src/hash.ts";
-import { CUSTOM_ENTRY_TYPE, projectMapFilePath, serializePlugin } from "../src/memory/persist.ts";
-import { ProjectMap } from "../src/memory/project-map.ts";
-import { MemoryQueue } from "../src/memory/queue.ts";
-import { render } from "../src/render.ts";
-import { PluginStore } from "../src/store.ts";
-import type { Segment, SourcePluginMeta, ToolContextPlugin } from "../src/types.ts";
+import type { ContextEvent, ToolCallEvent, ToolResultEvent } from "../../src/core/extensions/types.ts";
+import { createHarness, type PiwpiHostContext } from "../../src/core/piwpi/harness.ts";
+import { hashBuffer } from "../../src/core/piwpi/hash.ts";
+import { CUSTOM_ENTRY_TYPE, projectMapFilePath, serializePlugin } from "../../src/core/piwpi/memory/persist.ts";
+import { ProjectMap } from "../../src/core/piwpi/memory/project-map.ts";
+import { MemoryQueue } from "../../src/core/piwpi/memory/queue.ts";
+import { render } from "../../src/core/piwpi/render.ts";
+import { PluginStore } from "../../src/core/piwpi/store.ts";
+import type { Segment, SourcePluginMeta, ToolContextPlugin } from "../../src/core/piwpi/types.ts";
+import type { SessionEntry } from "../../src/core/session-manager.ts";
+import type { TruncationResult } from "../../src/core/tools/truncate.ts";
 
 /**
  * Harness 集成测试（M3/M4/M5）：用真实 tmp 文件 + 伪造事件对象驱动 handler。
@@ -53,8 +47,8 @@ beforeAll(() => {
 });
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
 
-function ctx(): ExtensionContext {
-	return { cwd: tmp } as unknown as ExtensionContext;
+function ctx(): PiwpiHostContext {
+	return { cwd: tmp, modelRegistry: {}, sessionManager: { getEntries: () => [] } };
 }
 
 function readCall(toolCallId: string, input: Record<string, unknown>): ToolCallEvent {
@@ -692,67 +686,6 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("pending");
 	});
 
-	it("ModelRegistry 门面无顶层 complete → 回退 runtime.complete：批量整理仍成功（发布版 0.83.0 兼容）", async () => {
-		write80Lines();
-		const store = new PluginStore();
-		const events: string[] = [];
-		// 发布版 0.83.0 形状：registry 是同步兼容门面（无 complete），complete 在内部 runtime 上
-		// （TS private 不参与运行时，结构访问可触达）；memoryDeps 不注入，走 ctx.modelRegistry 提取通道。
-		// 关键：complete 是依赖 this 的类方法（真实实现内部调 this.stream）——裸提取调用会丢 this 崩溃
-		const stream = vi.fn(() => ({
-			result: async () => ({
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify({
-							entries: {
-								[fileId(absFile)]: { role: "auth", responsibilities: ["jwt"] },
-							},
-						}),
-					},
-				],
-			}),
-		}));
-		const runtime = {
-			stream,
-			complete() {
-				return this.stream().result(); // 真实实现同款：this 依赖
-			},
-		};
-		const fakeRegistry = {
-			runtime,
-			find: () => ({ provider: "faux", id: "faux-1" }), // 记忆模型解析通道（真实 ModelRegistry 同签名）
-		};
-		const prevEnv = process.env.PIWPI_MEMORY_MODEL;
-		process.env.PIWPI_MEMORY_MODEL = "faux/faux-1"; // P1-2：配置记忆模型 → 自动路径放行（经 env 通道）
-		try {
-			const h = createHarness({
-				store,
-				queue: new MemoryQueue(0),
-				memoryBatchFiles: 1,
-				onEvent: (e) => events.push(e.type),
-			});
-			await h.onSessionStart(
-				{ type: "session_start", reason: "startup" } as never,
-				{
-					cwd: tmp,
-					model: { provider: "faux", id: "faux-1" },
-					modelRegistry: fakeRegistry,
-					sessionManager: { getEntries: () => [] },
-				} as unknown as ExtensionContext,
-			);
-			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
-			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
-			await h.shutdown();
-		} finally {
-			if (prevEnv === undefined) delete process.env.PIWPI_MEMORY_MODEL;
-			else process.env.PIWPI_MEMORY_MODEL = prevEnv;
-		}
-		expect(stream).toHaveBeenCalledTimes(1);
-		expect(sourceMeta(store.get(fileId(absFile))!).memoryState).toBe("done");
-		expect(events).toContain("memory_updated");
-	});
-
 	it("P0-4 TOCTOU：LLM 返回前文件已变 → 提交被丢弃，store 与 project-map 不出现旧条目", async () => {
 		write80Lines();
 		const store = new PluginStore();
@@ -813,7 +746,9 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 	it("P1-1 shutdown 后不启动新模型调用（自动触发被门禁拦截）", async () => {
 		write80Lines();
 		const store = new PluginStore();
-		const complete = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
+		const complete = vi.fn(async (_model: unknown, _context: unknown, _options?: unknown) => ({
+			content: [{ type: "text", text: "{}" }],
+		}));
 		const h = createHarness({
 			store,
 			queue: new MemoryQueue(0),
@@ -862,7 +797,9 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 	it("P1-2 配置记忆模型：使用指定模型与 maxTokens=1024", async () => {
 		write80Lines();
 		const store = new PluginStore();
-		const complete = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
+		const complete = vi.fn(async (_model: unknown, _context: unknown, _options?: unknown) => ({
+			content: [{ type: "text", text: "{}" }],
+		}));
 		const found = { provider: "cheap", id: "cheap-1" };
 		const registry = {
 			complete,
@@ -883,7 +820,7 @@ describe("M5 新模型：记忆批量整理与持久化", () => {
 					model: { provider: "main", id: "main-1" },
 					modelRegistry: registry,
 					sessionManager: { getEntries: () => [] },
-				} as unknown as ExtensionContext,
+				} as unknown as PiwpiHostContext,
 			);
 			await h.onToolCall(readCall("t1", { path: FILE, offset: 20, limit: 21 }), ctx());
 			await h.onToolResult(readResult("t1", { path: FILE, offset: 20, limit: 21 }, { text: text20_40 }), ctx());
@@ -990,7 +927,10 @@ describe("M5 §6.4：session_start 恢复", () => {
 				id: "m2",
 				message: {
 					role: "assistant",
-					content: [{ type: "text", text: longText }, { type: "image", image: "x" }],
+					content: [
+						{ type: "text", text: longText },
+						{ type: "image", image: "x" },
+					],
 				},
 			},
 			{
@@ -1135,30 +1075,5 @@ describe("M3 §4.5：降级与兜底", () => {
 		expect(typeof h.shutdown).toBe("function");
 		expect(await h.onToolResult(readResult("x", {}), ctx())).toBeUndefined();
 		expect(await h.onContext({ type: "context", messages: [] } as unknown as ContextEvent, ctx())).toBeUndefined();
-	});
-
-	it("index 默认导出为工厂函数，且订阅 6 个事件 + 注册 read_project_map 工具", async () => {
-		const mod = await import("../index.ts");
-		expect(typeof mod.default).toBe("function");
-		const subscribed: string[] = [];
-		const registered: string[] = [];
-		const pi = {
-			on: (event: string) => {
-				subscribed.push(event);
-			},
-			registerTool: (tool: { name: string }) => {
-				registered.push(tool.name);
-			},
-		} as unknown as ExtensionAPI;
-		mod.default(pi);
-		expect(subscribed).toEqual([
-			"tool_call",
-			"tool_result",
-			"context",
-			"session_start",
-			"agent_settled",
-			"session_shutdown",
-		]);
-		expect(registered).toEqual(["read_project_map", "request_user_input", "update_plan_document"]);
 	});
 });

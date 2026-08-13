@@ -156,10 +156,14 @@ export async function summarize(
 		const completeOptions: Record<string, unknown> = {};
 		if (deps.maxTokens !== undefined) completeOptions.maxTokens = deps.maxTokens;
 		if (options?.signal) completeOptions.signal = options.signal;
-		const response = await deps.complete(deps.model, {
-			systemPrompt: MEMORY_SYSTEM_PROMPT,
-			messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
-		}, completeOptions);
+		const response = await deps.complete(
+			deps.model,
+			{
+				systemPrompt: MEMORY_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+			},
+			completeOptions,
+		);
 		const text = (response.content ?? [])
 			.filter((c) => c.type === "text")
 			.map((c) => c.text ?? "")

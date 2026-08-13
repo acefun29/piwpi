@@ -1,5 +1,5 @@
-import { readFile, stat } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
 import { hashBuffer } from "./hash.ts";
 
 /**

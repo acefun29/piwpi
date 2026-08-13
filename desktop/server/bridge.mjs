@@ -3,11 +3,10 @@
  *
  * 职责：
  * 1. 托管 web/ 静态文件
- * 2. spawn `pi --mode rpc -e extension`（自动注入 PIWPI_DEBUG_PORT）
+ * 2. spawn piwpi 内建 RPC runtime
  * 3. POST /api/rpc        → 写一条 JSONL 命令到 pi stdin
  * 4. GET  /api/events     → SSE 转发 pi stdout 的所有 JSON 行（事件 + 命令响应）
- * 5. GET  /debug/*        → 反向代理 piwpi 扩展 debug 服务（含 SSE）
- * 6. GET  /api/bridge/status → bridge 与 pi 进程状态
+ * 5. GET  /api/bridge/status → bridge 与 agent 进程状态
  *
  * 用法：
  *   - 直接运行：node server/bridge.mjs
@@ -15,15 +14,13 @@
  *
  * 配置（环境变量，startBridge 入参优先级更高）：
  *   PORT              监听端口（默认 8901；0 = 随机）
- *   PIWPI_DEBUG_PORT  扩展 debug 服务端口（默认 8787；0 = 随机，需扩展支持回读——扩展不支持，故做启动前 probe）
  *   PIWPI_WORKSPACE   pi 进程工作目录（默认 piwpi 仓库根）
- *   PIWPI_PI_CLI      pi-coding-agent cli.js 路径（默认 extension/node_modules 内）
- *   PIWPI_EXT         piwpi 扩展路径（默认 ../pi/extension）
+ *   PIWPI_PI_CLI      piwpi RPC 入口路径
  *   PIWPI_PI_ARGS     额外传给 pi 的参数（空格分隔）
  */
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { createServer, get as httpGet, request as httpRequest } from "node:http";
+import { createServer } from "node:http";
 import { mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -209,18 +206,9 @@ async function deleteCustomProvider(id) {
 	await writeModelsConfig(config);
 }
 
-/** 探测本地端口是否可用 */
-function isPortFree(port) {
-	return new Promise((resolveFree) => {
-		const probe = createServer();
-		probe.once("error", () => resolveFree(false));
-		probe.listen(port, "127.0.0.1", () => probe.close(() => resolveFree(true)));
-	});
-}
-
 /**
- * 启动 bridge：spawn pi RPC 子进程 + HTTP 服务。
- * @param {{port?: number, workspace?: string, piCli?: string, extPath?: string, debugPort?: number, onPiExit?: Function}} opts
+ * 启动 bridge：spawn piwpi RPC 子进程 + HTTP 服务。
+ * @param {{port?: number, workspace?: string, piCli?: string, onPiExit?: Function}} opts
  * @returns {Promise<{server: import("node:http").Server, port: number, workspace: string, killPi: Function}>}
  */
 export async function startBridge(opts = {}) {
@@ -228,12 +216,12 @@ export async function startBridge(opts = {}) {
 	// P0-3：控制端点鉴权 token（每次启动随机生成，只交给当前窗口；dev 模式放行）
 	const authToken = randomBytes(32).toString("hex");
 	const devMode = opts.dev ?? (process.argv.includes("--dev") || process.env.PIWPI_BRIDGE_DEV === "1");
-	let debugPort = opts.debugPort ?? Number.parseInt(process.env.PIWPI_DEBUG_PORT ?? "8787", 10);
 	// 当前项目目录（可变：POST /api/project 切换时更新并重启 pi）
 	let workspace = opts.workspace ?? process.env.PIWPI_WORKSPACE ?? REPO;
-	// desktop/ 位于 pi 仓库根下：REPO = pi 仓库根，piwpi 扩展即 REPO/extension
-	const piCli = opts.piCli ?? process.env.PIWPI_PI_CLI ?? join(REPO, "extension", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-	const extPath = opts.extPath ?? process.env.PIWPI_EXT ?? join(REPO, "extension");
+	const packagedRpcEntry = join(process.resourcesPath ?? "", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "rpc-entry.js");
+	const piCli = opts.piCli ?? process.env.PIWPI_PI_CLI ?? (existsSync(packagedRpcEntry)
+		? packagedRpcEntry
+		: join(REPO, "packages", "coding-agent", "dist", "rpc-entry.js"));
 	const extraArgs = (
 		process.env.PIWPI_PI_ARGS ??
 		"--offline --tools read,grep,find,ls,bash,edit,write,read_project_map,request_user_input,update_plan_document"
@@ -243,18 +231,6 @@ export async function startBridge(opts = {}) {
 	if (!existsSync(piCli)) {
 		throw new Error(`pi cli not found: ${piCli}（设置 PIWPI_PI_CLI 指定 pi-coding-agent dist/cli.js）`);
 	}
-	// debug 端口被占则递增重试（最多 +50），避免与别的进程冲突
-	if (!(await isPortFree(debugPort))) {
-		let found = debugPort;
-		for (let i = 1; i <= 50; i++) {
-			if (await isPortFree(debugPort + i)) { found = debugPort + i; break; }
-		}
-		if (found !== debugPort) {
-			console.warn(`[bridge] debug port ${debugPort} occupied, using ${found}`);
-			debugPort = found;
-		}
-	}
-
 	/* ================= pi RPC 子进程 ================= */
 	let pi = null;
 	let piAlive = false;
@@ -281,14 +257,13 @@ export async function startBridge(opts = {}) {
 		const isElectron = !!process.versions.electron;
 		// 会话持久化到项目内 .piwpi/sessions（数据跟项目走；pi 内部仍按 safeCwd 分目录）
 		const sessionDir = join(workspace, ".piwpi", "sessions");
-		const args = [piCli, "--mode", "rpc", "-e", extPath, "--session-dir", sessionDir, ...extraArgs];
+		const args = [piCli, "--session-dir", sessionDir, ...extraArgs];
 		console.log(`[bridge] spawn: ${isElectron ? "<electron as node>" : process.execPath} ${args.join(" ")}`);
-		console.log(`[bridge] workspace: ${workspace} | session dir: ${sessionDir} | debug port: ${debugPort}`);
+		console.log(`[bridge] workspace: ${workspace} | session dir: ${sessionDir}`);
 		const child = spawn(process.execPath, args, {
 			cwd: workspace,
 			env: {
 				...process.env,
-				PIWPI_DEBUG_PORT: String(debugPort),
 				NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE ?? join(homedir(), ".pi", "agent", "piwpi", "node-compile-cache"),
 				// Electron 主进程里 process.execPath 是 electron.exe；必须让它以 Node 模式跑 cli.js
 				...(isElectron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
@@ -330,6 +305,7 @@ export async function startBridge(opts = {}) {
 
 	function sendToPi(cmd) {
 		if (!piAlive || !pi) throw new Error("pi process not running");
+		if (cmd?.type === "switch_project" && typeof cmd.path === "string") workspace = resolve(cmd.path);
 		pi.stdin.write(JSON.stringify(cmd) + "\n");
 	}
 
@@ -513,23 +489,6 @@ export async function startBridge(opts = {}) {
 		}
 	}
 
-	/**
-	 * 当前项目目录的事实源 = 扩展 debug 快照的 cwd（切换项目后扩展自动跟随）；
-	 * debug 未就绪时降级为启动 workspace（信息性初始值）。
-	 */
-	async function currentProjectCwd() {
-		try {
-			const res = await fetch(`http://127.0.0.1:${debugPort}/api/state`);
-			if (res.ok) {
-				const state = await res.json();
-				if (typeof state.cwd === "string" && state.cwd) return state.cwd;
-			}
-		} catch {
-			/* fallthrough */
-		}
-		return workspace;
-	}
-
 	/** 原生目录选择对话框（仅 Electron 主进程可用；web 调试模式返回 ok:false 由前端降级） */
 	async function pickProjectDirectory() {
 		if (!process.versions.electron) return { ok: false, error: "仅桌面端支持（web 调试模式请手动输入路径）" };
@@ -573,32 +532,6 @@ export async function startBridge(opts = {}) {
 			res.end(data);
 		} catch {
 			res.writeHead(404).end("not found");
-		}
-	}
-
-	/* ================= debug 服务反代（含 SSE） ================= */
-	function proxyDebug(pathname, req, res) {
-		const target = `http://127.0.0.1:${debugPort}${pathname}`;
-		const proxyReq = httpRequest(target, { method: req.method ?? "GET" }, (proxyRes) => {
-			res.writeHead(proxyRes.statusCode ?? 502, {
-				"content-type": proxyRes.headers["content-type"] ?? "application/json; charset=utf-8",
-				"cache-control": proxyRes.headers["cache-control"] ?? "no-cache",
-			});
-			proxyRes.pipe(res);
-			// 客户端断开时中止上游，避免 SSE 泄漏
-			res.on("close", () => proxyRes.destroy());
-		});
-		proxyReq.on("error", () => {
-			if (!res.headersSent) {
-				res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
-			}
-			res.end(JSON.stringify({ error: "piwpi debug server unreachable", port: debugPort }));
-		});
-		if (req.method !== "GET") {
-			req.on("data", (c) => proxyReq.write(c));
-			req.on("end", () => proxyReq.end());
-		} else {
-			proxyReq.end();
 		}
 	}
 
@@ -647,8 +580,8 @@ export async function startBridge(opts = {}) {
 			return;
 		}
 
-		// P0-3：其余控制端点统一鉴权（/api/* 与 /debug/* 反代；静态文件与 / 开放）
-		if (path.startsWith("/api/") || path.startsWith("/debug/")) {
+		// P0-3：其余控制端点统一鉴权（静态文件与 / 开放）
+		if (path.startsWith("/api/")) {
 			if (!authorized(req, res)) return;
 		}
 
@@ -708,7 +641,7 @@ export async function startBridge(opts = {}) {
 
 		if (path === "/api/bridge/status" && req.method === "GET") {
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-			res.end(JSON.stringify({ ok: true, piAlive, debugPort, workspace, clients: sseClients.size }));
+			res.end(JSON.stringify({ ok: true, piAlive, workspace, clients: sseClients.size }));
 			return;
 		}
 
@@ -723,7 +656,7 @@ export async function startBridge(opts = {}) {
 
 		// 会话列表：全部注册项目的会话（对齐 Codex 桌面版"无 cwd 过滤 = 全部"；当前项目惰性注册）
 		if (path === "/api/sessions" && req.method === "GET") {
-			currentProjectCwd().then(async (cwd) => {
+			Promise.resolve(workspace).then(async (cwd) => {
 				await registerProject(cwd);
 				const projects = await readProjects();
 				const nested = await Promise.all(projects.map(async (p) => ({ p, sessions: await listSessions(p) })));
@@ -750,11 +683,6 @@ export async function startBridge(opts = {}) {
 			return;
 		}
 
-		if (path.startsWith("/debug/") && req.method === "GET") {
-			proxyDebug(path.replace(/^\/debug/, "/api"), req, res);
-			return;
-		}
-
 		if (req.method === "GET") {
 			serveStatic(path, res);
 			return;
@@ -772,7 +700,6 @@ export async function startBridge(opts = {}) {
 	});
 	const actualPort = server.address().port;
 	console.log(`[bridge] piwpi desktop ready: http://127.0.0.1:${actualPort}`);
-	console.log(`[bridge] debug proxy: /debug/* -> 127.0.0.1:${debugPort}/api/*`);
 
 	return { server, port: actualPort, workspace, killPi, authToken, get piAlive() { return piAlive; } };
 }
