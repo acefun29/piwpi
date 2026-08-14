@@ -218,7 +218,15 @@ export async function startBridge(opts = {}) {
 	const devMode = opts.dev ?? (process.argv.includes("--dev") || process.env.PIWPI_BRIDGE_DEV === "1");
 	// 当前项目目录（可变：POST /api/project 切换时更新并重启 pi）
 	let workspace = opts.workspace ?? process.env.PIWPI_WORKSPACE ?? REPO;
-	const packagedRpcEntry = join(process.resourcesPath ?? "", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "rpc-entry.js");
+	const packagedRpcEntry = join(
+		process.resourcesPath ?? "",
+		"runtime.asar",
+		"node_modules",
+		"@earendil-works",
+		"pi-coding-agent",
+		"dist",
+		"rpc-entry.js",
+	);
 	const piCli = opts.piCli ?? process.env.PIWPI_PI_CLI ?? (existsSync(packagedRpcEntry)
 		? packagedRpcEntry
 		: join(REPO, "packages", "coding-agent", "dist", "rpc-entry.js"));
@@ -511,7 +519,7 @@ export async function startBridge(opts = {}) {
 	async function serveStatic(pathname, res) {
 		if (pathname === "/logo.svg") {
 			try {
-				const data = await readFile(join(REPO, "logo.svg"));
+				const data = await readFile(join(WEB_DIR, "logo.svg")).catch(() => readFile(join(REPO, "logo.svg")));
 				res.writeHead(200, { "content-type": MIME[".svg"] });
 				res.end(data);
 			} catch {

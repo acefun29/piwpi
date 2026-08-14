@@ -1546,7 +1546,7 @@ let providerCatalog = new Map();
 let selectedProviderId = "openai";
 
 async function jsonRequest(url, options) {
-	const response = await fetch(url, options);
+	const response = await authFetch(url, options);
 	const data = await response.json();
 	if (!response.ok || data.ok === false) throw new Error(data.error ?? `HTTP ${response.status}`);
 	return data;

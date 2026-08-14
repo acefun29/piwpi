@@ -54,7 +54,7 @@ async function createWindow() {
 		autoHideMenuBar: true,
 		title: "piwpi",
 		backgroundColor: "#F5F4F1",
-		icon: path.join(__dirname, "..", "build", "icon.png"),
+		icon: path.join(__dirname, "..", "web", "assets", "icon.png"),
 		...(process.platform === "win32"
 			? {
 				titleBarStyle: "hidden",

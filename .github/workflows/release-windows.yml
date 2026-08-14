@@ -84,7 +84,7 @@ jobs:
         shell: pwsh
         run: |
           $env:ELECTRON_RUN_AS_NODE = "1"
-          $env:PIWPI_PI_CLI = (Resolve-Path "desktop/dist/win-unpacked/resources/runtime/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js").Path
+          $env:PIWPI_PI_CLI = (Resolve-Path "desktop/dist/win-unpacked/resources/runtime.asar").Path + "/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js"
           $process = Start-Process -FilePath ".\desktop\dist\win-unpacked\piwpi.exe" -ArgumentList ".\desktop\scripts\smoke-rpc.mjs" -NoNewWindow -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Packaged runtime smoke failed: $($process.ExitCode)" }
 
@@ -104,8 +104,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > release-notes.md <<'NOTES'
-          piwpi v0.1.0-beta.1 is the first Windows desktop prerelease.
+          cat > release-notes.md <<NOTES
+          piwpi $RELEASE_TAG is a Windows desktop prerelease.
 
           Included:
           - independent piwpi desktop Agent harness
@@ -118,7 +118,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --verify-tag \
             --prerelease \
-            --title "piwpi v0.1.0-beta.1" \
+            --title "piwpi $RELEASE_TAG" \
             --notes-file release-notes.md \
             desktop/dist/piwpi-*.exe \
             desktop/dist/SHA256SUMS.txt

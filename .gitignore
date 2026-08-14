@@ -38,6 +38,8 @@ pi-*.html
 out.html
 packages/coding-agent/binaries/
 desktop/build/runtime/
+desktop/build/runtime*.asar
+desktop/build/runtime*.asar.unpacked/
 desktop/runtime/
 desktop/dist/
 todo.md

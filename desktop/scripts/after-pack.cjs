@@ -1,8 +1,11 @@
-const { cpSync } = require("node:fs");
+const { cpSync, existsSync } = require("node:fs");
 const { join } = require("node:path");
 
 exports.default = function afterPack(context) {
-	cpSync(join(__dirname, "..", "build", "runtime"), join(context.appOutDir, "resources", "runtime"), {
-		recursive: true,
-	});
+	const build = join(__dirname, "..", "build");
+	const resources = join(context.appOutDir, "resources");
+	cpSync(join(build, "runtime.asar"), join(resources, "runtime.asar"));
+	if (existsSync(join(build, "runtime.asar.unpacked"))) {
+		cpSync(join(build, "runtime.asar.unpacked"), join(resources, "runtime.asar.unpacked"), { recursive: true });
+	}
 };
