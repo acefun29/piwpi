@@ -8,6 +8,7 @@ if (window.desktopShell) document.body.classList.add("desktop-shell");
 
 /* ================= 工具函数 ================= */
 const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
 const el = (tag, cls, text) => {
 	const node = document.createElement(tag);
 	if (cls) node.className = cls;
@@ -366,6 +367,12 @@ function updateActionBtn() {
 	btn.disabled = !on && !currentModel;
 	btn.title = on ? "中断" : currentModel ? "发送" : "请先配置并选择模型";
 	$("#modeSel").disabled = on;
+	$("#modePickerBtn").disabled = on;
+	const thinkingDisabled = on || availableThinkingLevels.length <= 1;
+	$("#thinkingSel").disabled = thinkingDisabled;
+	$("#thinkingPickerBtn").disabled = thinkingDisabled;
+	$("#thinkingPickerBtn").classList.toggle("disabled", thinkingDisabled);
+	if (on) closeAllPopMenus();
 	if (!on) hideRunning();
 }
 
@@ -822,29 +829,76 @@ function resetChatView() {
 	msgCol.appendChild(hint);
 }
 
+let currentThinkingLevel = "off";
+let availableThinkingLevels = [];
+
+function closeAllPopMenus() {
+	$("#modelMenu").hidden = true;
+	$("#modeMenu").hidden = true;
+	$("#thinkingMenu").hidden = true;
+	$("#modelPickerBtn")?.classList.remove("open");
+	$("#modePickerBtn")?.classList.remove("open");
+	$("#thinkingPickerBtn")?.classList.remove("open");
+}
+
 function thinkingLevelLabel(level) {
 	return ({ off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" })[level] ?? "自定义";
 }
 
+function renderThinkingMenu() {
+	const menu = $("#thinkingMenu");
+	menu.innerHTML = "";
+	const btn = $("#thinkingPickerBtn");
+	for (const lv of availableThinkingLevels) {
+		const item = el("button", `pop-menu-item${lv === currentThinkingLevel ? " selected" : ""}`);
+		item.type = "button";
+		item.dataset.value = lv;
+		item.innerHTML = `<span>${thinkingLevelLabel(lv)}</span><span class="pop-item-check">✓</span>`;
+		item.addEventListener("click", async (e) => {
+			e.stopPropagation();
+			closeAllPopMenus();
+			if (lv === currentThinkingLevel) return;
+			try {
+				const res = await rpc({ type: "set_thinking_level", level: lv });
+				if (res.success) {
+					currentThinkingLevel = lv;
+					$("#thinkingSel").value = lv;
+					$("#thinkingLabel").textContent = thinkingLevelLabel(lv);
+					btn.title = `思考强度：${thinkingLevelLabel(lv)}`;
+					renderThinkingMenu();
+					toast(`思考强度已切换为${thinkingLevelLabel(lv)}`);
+				} else {
+					toast(`切换失败：${res.error}`, "error");
+				}
+			} catch (err) {
+				toast(`切换失败：${err.message}`, "error");
+			}
+		});
+		menu.appendChild(item);
+	}
+}
+
 function setupThinkingPicker(levels, current) {
+	availableThinkingLevels = levels ?? [];
+	currentThinkingLevel = current && levels.includes(current) ? current : (levels[0] ?? "off");
 	const sel = $("#thinkingSel");
 	sel.innerHTML = "";
-	for (const lv of levels) {
+	for (const lv of availableThinkingLevels) {
 		const opt = el("option", null, thinkingLevelLabel(lv));
 		opt.value = lv;
 		sel.appendChild(opt);
 	}
-	if (current && levels.includes(current)) sel.value = current;
-	sel.disabled = levels.length <= 1;
-	sel.onchange = async () => {
-		try {
-			const res = await rpc({ type: "set_thinking_level", level: sel.value });
-			if (res.success) toast(`思考强度已切换为${thinkingLevelLabel(sel.value)}`);
-			else toast(`切换失败：${res.error}`, "error");
-		} catch (err) {
-			toast(`切换失败：${err.message}`, "error");
-		}
-	};
+	sel.value = currentThinkingLevel;
+
+	const btn = $("#thinkingPickerBtn");
+	const label = $("#thinkingLabel");
+	label.textContent = thinkingLevelLabel(currentThinkingLevel);
+	const disabled = streaming || availableThinkingLevels.length <= 1;
+	btn.disabled = disabled;
+	btn.classList.toggle("disabled", disabled);
+	btn.title = availableThinkingLevels.length <= 1 ? "当前模型不支持调整思考强度" : `思考强度：${thinkingLevelLabel(currentThinkingLevel)}`;
+
+	renderThinkingMenu();
 }
 
 async function refreshThinkingPicker() {
@@ -861,28 +915,87 @@ function setModePicker(mode) {
 	collaborationMode = mode === "plan" ? "plan" : "default";
 	const sel = $("#modeSel");
 	sel.value = collaborationMode;
-	sel.closest(".mode-picker")?.classList.toggle("plan", collaborationMode === "plan");
+	const btn = $("#modePickerBtn");
+	const label = $("#modeLabel");
+	label.textContent = collaborationMode === "plan" ? "计划" : "默认";
+	btn.classList.toggle("plan", collaborationMode === "plan");
+	btn.title = collaborationMode === "plan" ? "协作模式：计划模式（先确认计划）" : "协作模式：默认模式（直接执行）";
+
+	const items = $$("#modeMenu .pop-menu-item");
+	for (const item of items) {
+		item.classList.toggle("selected", item.dataset.value === collaborationMode);
+	}
 }
 
 function setupModePicker(current) {
-	const sel = $("#modeSel");
 	setModePicker(current);
-	sel.onchange = async () => {
-		const previous = collaborationMode;
-		const next = sel.value;
-		sel.disabled = true;
-		try {
-			const res = await rpc({ type: "set_collaboration_mode", mode: next });
-			if (!res.success) throw new Error(res.error ?? "未知原因");
-			setModePicker(next);
-			toast(next === "plan" ? "已进入计划模式" : "已切换为默认模式");
-		} catch (err) {
-			setModePicker(previous);
-			toast(`模式切换失败：${err.message}`, "error");
-		} finally {
-			sel.disabled = streaming;
+}
+
+function initInputPickerEvents() {
+	const modeBtn = $("#modePickerBtn");
+	const modeMenu = $("#modeMenu");
+	modeBtn.addEventListener("click", (e) => {
+		e.stopPropagation();
+		if (streaming) return;
+		const willShow = modeMenu.hidden;
+		closeAllPopMenus();
+		if (willShow) {
+			modeMenu.hidden = false;
+			modeBtn.classList.add("open");
+		}
+	});
+
+	const modeItems = $$("#modeMenu .pop-menu-item");
+	for (const item of modeItems) {
+		item.addEventListener("click", async (e) => {
+			e.stopPropagation();
+			const next = item.dataset.value;
+			closeAllPopMenus();
+			if (next === collaborationMode) return;
+			const previous = collaborationMode;
+			modeBtn.disabled = true;
+			try {
+				const res = await rpc({ type: "set_collaboration_mode", mode: next });
+				if (!res.success) throw new Error(res.error ?? "未知原因");
+				setModePicker(next);
+				toast(next === "plan" ? "已进入计划模式" : "已切换为默认模式");
+			} catch (err) {
+				setModePicker(previous);
+				toast(`模式切换失败：${err.message}`, "error");
+			} finally {
+				modeBtn.disabled = streaming;
+			}
+		});
+	}
+
+	const thinkingBtn = $("#thinkingPickerBtn");
+	const thinkingMenu = $("#thinkingMenu");
+	thinkingBtn.addEventListener("click", (e) => {
+		e.stopPropagation();
+		if (thinkingBtn.disabled || streaming) return;
+		const willShow = thinkingMenu.hidden;
+		closeAllPopMenus();
+		if (willShow) {
+			thinkingMenu.hidden = false;
+			thinkingBtn.classList.add("open");
+		}
+	});
+
+	const onOutside = (event) => {
+		if (!event.target.closest("#modelPickerBtn") && !event.target.closest("#modelMenu") &&
+		    !event.target.closest("#modePickerWrap") && !event.target.closest("#modeMenu") &&
+		    !event.target.closest("#thinkingPickerWrap") && !event.target.closest("#thinkingMenu")) {
+			closeAllPopMenus();
 		}
 	};
+	document.addEventListener("pointerdown", onOutside);
+	document.addEventListener("click", onOutside);
+
+	document.addEventListener("keydown", (event) => {
+		if (event.key === "Escape") {
+			closeAllPopMenus();
+		}
+	});
 }
 
 function splitProposedPlan(text) {
@@ -1132,6 +1245,7 @@ function setupInput() {
 			toast(`新建对话失败：${err.message}`, "error");
 		}
 	});
+	initInputPickerEvents();
 }
 
 /* ================= Context 抽屉（piwpi RPC） ================= */
@@ -1901,21 +2015,22 @@ function setupProviders() {
 		renderProviderList();
 		renderProviderDetail();
 	});
-	$("#modelPickerBtn").addEventListener("click", async () => {
+	$("#modelPickerBtn").addEventListener("click", async (e) => {
+		e.stopPropagation();
 		const menu = $("#modelMenu");
-		menu.hidden = !menu.hidden;
-		if (!menu.hidden) {
+		const willShow = menu.hidden;
+		closeAllPopMenus();
+		if (willShow) {
+			menu.hidden = false;
+			$("#modelPickerBtn").classList.add("open");
 			await refreshProviderState();
 			if (!menu.hidden) $("#modelSearch").focus();
 		}
 	});
 	$("#modelSearch").addEventListener("input", renderModelMenu);
 	$("#modelManage").addEventListener("click", () => {
-		$("#modelMenu").hidden = true;
+		closeAllPopMenus();
 		setView("providers");
-	});
-	document.addEventListener("pointerdown", (event) => {
-		if (!event.target.closest("#modelMenu") && !event.target.closest("#modelPickerBtn")) $("#modelMenu").hidden = true;
 	});
 }
 

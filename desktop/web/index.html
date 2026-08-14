@@ -65,16 +65,43 @@
         </div>
         <div class="input-tools">
           <button class="model-picker-btn" id="modelPickerBtn" type="button" title="选择模型">未选择模型</button>
-          <label class="mode-picker" title="协作模式">
-            <select id="modeSel" disabled>
+          
+          <div class="pop-picker-wrap" id="modePickerWrap">
+            <button class="tool-picker-btn mode-picker-btn" id="modePickerBtn" type="button" title="协作模式">
+              <span id="modeLabel">默认</span>
+              <svg class="picker-chev" width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 3.75L5 6.25L7.5 3.75" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <select id="modeSel" hidden disabled>
               <option value="default">默认</option>
               <option value="plan">计划</option>
             </select>
-          </label>
-          <label class="thinking-picker" title="思考强度">
-            <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M7 1a4 4 0 0 1 4 4c0 1.5-.8 2.4-1.5 3.2-.5.6-.5 1.3-.5 1.8H5c0-.5 0-1.2-.5-1.8C3.8 7.4 3 6.5 3 5a4 4 0 0 1 4-4Z" stroke="#74767C" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.5 12h3M6 13.5h2" stroke="#74767C" stroke-width="1.2" stroke-linecap="round"/></svg>
-            <select id="thinkingSel" disabled><option>…</option></select>
-          </label>
+            <div class="pop-menu mode-pop-menu" id="modeMenu" hidden>
+              <button class="pop-menu-item selected" data-value="default" type="button">
+                <div class="pop-item-head">
+                  <span class="pop-item-title">默认模式</span>
+                  <span class="pop-item-check">✓</span>
+                </div>
+                <span class="pop-item-desc">直接执行任务并调用工具</span>
+              </button>
+              <button class="pop-menu-item" data-value="plan" type="button">
+                <div class="pop-item-head">
+                  <span class="pop-item-title">计划模式</span>
+                  <span class="pop-item-check">✓</span>
+                </div>
+                <span class="pop-item-desc">先输出结构化计划，确认后执行</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="pop-picker-wrap" id="thinkingPickerWrap">
+            <button class="tool-picker-btn thinking-picker-btn" id="thinkingPickerBtn" type="button" title="思考强度">
+              <svg class="bulb-icon" width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M7 1a4 4 0 0 1 4 4c0 1.5-.8 2.4-1.5 3.2-.5.6-.5 1.3-.5 1.8H5c0-.5 0-1.2-.5-1.8C3.8 7.4 3 6.5 3 5a4 4 0 0 1 4-4Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.5 12h3M6 13.5h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+              <span id="thinkingLabel">关闭</span>
+              <svg class="picker-chev" width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2.5 3.75L5 6.25L7.5 3.75" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <select id="thinkingSel" hidden disabled><option>…</option></select>
+            <div class="pop-menu thinking-pop-menu" id="thinkingMenu" hidden></div>
+          </div>
           <button class="action-btn" id="btnAction" title="发送">
             <svg class="icon-send" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <svg class="icon-abort" width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="2" y="2" width="8" height="8" rx="1.5" fill="#FFFFFF"/></svg>
