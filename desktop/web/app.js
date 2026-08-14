@@ -2406,9 +2406,47 @@ function renderSessions(sessions) {
 		const base = cwd.split(/[\\/]/).filter(Boolean).at(-1) || cwd;
 		const name = el("span", "proj-name", base);
 		name.title = cwd;
+
+		const actions = el("div", "proj-actions");
+
+		// 快速在此项目新建对话
+		const addChatBtn = el("button", "proj-action-btn");
+		addChatBtn.type = "button";
+		addChatBtn.title = "在此项目新建对话";
+		addChatBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 2v6M2 5h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+		addChatBtn.addEventListener("click", async (e) => {
+			e.stopPropagation();
+			if (!isCurrentProj) await switchProjectPath(cwd);
+			$("#btnNewChat").click();
+		});
+
+		// 在资源管理器中打开
+		const openDirBtn = el("button", "proj-action-btn");
+		openDirBtn.type = "button";
+		openDirBtn.title = "在文件管理器中打开";
+		openDirBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 3.5h3l1 1.5h4v5H2v-6.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M8.5 2.5l2 2M10.5 2.5v2h-2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+		openDirBtn.addEventListener("click", async (e) => {
+			e.stopPropagation();
+			try {
+				await authFetch("/api/project/open", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ path: cwd }),
+				});
+			} catch (err) {
+				toast(`打开失败：${err.message}`, "error");
+			}
+		});
+
 		const chev = el("span", "proj-chev");
 		chev.innerHTML = SVG.chev;
-		head.append(folder, name, chev);
+
+		actions.append(addChatBtn, openDirBtn, chev);
+		head.append(folder, name);
+		if (isCurrentProj) {
+			head.appendChild(el("span", "proj-badge", "当前"));
+		}
+		head.append(actions);
 		head.title = isCurrentProj ? `${cwd}（当前项目）` : `${cwd} — 点击切换到此项目`;
 		const body = el("div", "proj-body");
 		for (const s of list) {
@@ -2614,8 +2652,267 @@ function openProjectPickerManual() {
 	input.select();
 }
 
+let projectModalData = [];
+const projectSelectedPaths = new Set();
+
+async function openProjectModal() {
+	const modal = $("#projectModal");
+	modal.hidden = false;
+	projectSelectedPaths.clear();
+	await refreshProjectModalList();
+}
+
+function closeProjectModal() {
+	$("#projectModal").hidden = true;
+	projectSelectedPaths.clear();
+}
+
+async function refreshProjectModalList() {
+	const listEl = $("#projectModalList");
+	listEl.innerHTML = '<div class="project-modal-empty">正在获取项目列表…</div>';
+	try {
+		const res = await authFetch("/api/projects");
+		const data = await res.json();
+		if (!data.ok) throw new Error(data.error ?? "获取失败");
+		projectModalData = data.projects ?? [];
+		renderProjectModalList();
+	} catch (err) {
+		listEl.innerHTML = `<div class="project-modal-empty">加载失败：${err.message}</div>`;
+	}
+}
+
+function updateProjectModalToolbar() {
+	const total = projectModalData.length;
+	const count = projectSelectedPaths.size;
+	$("#projectTotalCount").textContent = total;
+	$("#projectSelectedCount").textContent = count;
+	const selectAll = $("#projectSelectAll");
+	selectAll.checked = total > 0 && count === total;
+	selectAll.indeterminate = count > 0 && count < total;
+	$("#btnBatchUnregister").disabled = count === 0;
+	$("#btnBatchClearSessions").disabled = count === 0;
+}
+
+function renderProjectModalList() {
+	const listEl = $("#projectModalList");
+	listEl.innerHTML = "";
+	if (projectModalData.length === 0) {
+		listEl.innerHTML = '<div class="project-modal-empty">暂无注册项目</div>';
+		updateProjectModalToolbar();
+		return;
+	}
+	for (const p of projectModalData) {
+		const isClickable = !p.isCurrent && p.exists;
+		const row = el("div", `project-row${p.isCurrent ? " current" : ""}${isClickable ? " clickable" : ""}`);
+
+		const left = el("div", "project-row-left");
+		const chk = el("input", "project-row-checkbox");
+		chk.type = "checkbox";
+		chk.checked = projectSelectedPaths.has(p.path);
+		chk.addEventListener("change", () => {
+			if (chk.checked) projectSelectedPaths.add(p.path);
+			else projectSelectedPaths.delete(p.path);
+			updateProjectModalToolbar();
+		});
+
+		const folder = el("span", "project-row-folder");
+		folder.innerHTML = SVG.folder;
+
+		const info = el("div", "project-row-info");
+		if (isClickable) {
+			info.title = "点击切换到此项目";
+			folder.title = "点击切换到此项目";
+			info.addEventListener("click", () => {
+				closeProjectModal();
+				switchProjectPath(p.path);
+			});
+			folder.addEventListener("click", () => {
+				closeProjectModal();
+				switchProjectPath(p.path);
+			});
+		}
+
+		const nameLine = el("div", "project-row-name-line");
+		nameLine.appendChild(el("span", "project-row-name", p.name));
+		if (p.isCurrent) {
+			nameLine.appendChild(el("span", "project-row-badge", "当前项目"));
+		}
+		if (!p.exists) {
+			nameLine.appendChild(el("span", "project-row-badge missing", "目录已不存在"));
+		}
+		const pathEl = el("div", "project-row-path", p.path);
+		pathEl.title = p.path;
+
+		const meta = el("div", "project-row-meta");
+		meta.appendChild(el("span", null, `${p.sessionCount} 个会话`));
+		if (p.lastModified) {
+			meta.appendChild(el("span", null, `最近活跃：${new Date(p.lastModified).toLocaleString("zh-CN")}`));
+		}
+		info.append(nameLine, pathEl, meta);
+		left.append(chk, folder, info);
+
+		const right = el("div", "project-row-right");
+		const openBtn = el("button", "project-row-btn", "打开");
+		openBtn.type = "button";
+		openBtn.title = "在资源管理器中打开文件夹";
+		openBtn.addEventListener("click", async () => {
+			try {
+				await authFetch("/api/project/open", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ path: p.path }),
+				});
+			} catch (err) {
+				toast(`打开失败：${err.message}`, "error");
+			}
+		});
+		right.appendChild(openBtn);
+
+		const clearBtn = el("button", "project-row-btn", "清空会话");
+		clearBtn.type = "button";
+		clearBtn.disabled = p.sessionCount === 0;
+		clearBtn.addEventListener("click", async () => {
+			if (!confirm(`清空项目「${p.name}」的全部 ${p.sessionCount} 个会话？不可恢复。`)) return;
+			try {
+				const res = await authFetch("/api/projects/sessions", {
+					method: "DELETE",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ paths: [p.path] }),
+				});
+				const data = await res.json();
+				if (data.ok) {
+					toast(`已清空 ${data.deletedSessions ?? 0} 个会话`);
+					await refreshProjectModalList();
+					refreshSessions();
+				} else {
+					toast(data.error ?? "清空失败", "error");
+				}
+			} catch (err) {
+				toast(`清空失败：${err.message}`, "error");
+			}
+		});
+		right.appendChild(clearBtn);
+
+		const unregBtn = el("button", "project-row-btn danger", "移出");
+		unregBtn.type = "button";
+		unregBtn.title = "从项目列表中移出（不删除磁盘文件）";
+		unregBtn.addEventListener("click", async () => {
+			if (p.isCurrent) {
+				toast("当前正在使用此项目，不可直接移出（请先切换到其他项目）", "warn");
+				return;
+			}
+			if (!confirm(`从项目列表移出「${p.name}」？（不会删除磁盘代码和数据）`)) return;
+			try {
+				const res = await authFetch("/api/projects", {
+					method: "DELETE",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ paths: [p.path] }),
+				});
+				const data = await res.json();
+				if (data.ok) {
+					toast("已从项目列表移出");
+					projectSelectedPaths.delete(p.path);
+					await refreshProjectModalList();
+					refreshSessions();
+				} else {
+					toast(data.error ?? "移出失败", "error");
+				}
+			} catch (err) {
+				toast(`移出失败：${err.message}`, "error");
+			}
+		});
+		right.appendChild(unregBtn);
+
+		row.append(left, right);
+		listEl.appendChild(row);
+	}
+	updateProjectModalToolbar();
+}
+
+function setupProjectModalEvents() {
+	$("#btnManageProjects")?.addEventListener("click", openProjectModal);
+	$("#btnAddProject")?.addEventListener("click", openProjectPicker);
+	$("#btnAddNewProjectModal")?.addEventListener("click", () => {
+		openProjectPicker();
+		closeProjectModal();
+	});
+	$("#projectModalClose")?.addEventListener("click", closeProjectModal);
+	$("#projectModal")?.addEventListener("click", (e) => {
+		if (e.target === $("#projectModal")) closeProjectModal();
+	});
+
+	$("#projectSelectAll")?.addEventListener("change", (e) => {
+		const checked = e.target.checked;
+		projectSelectedPaths.clear();
+		if (checked) {
+			for (const p of projectModalData) projectSelectedPaths.add(p.path);
+		}
+		const checkboxes = $$("#projectModalList .project-row-checkbox");
+		for (const cb of checkboxes) cb.checked = checked;
+		updateProjectModalToolbar();
+	});
+
+	// 批量移出
+	$("#btnBatchUnregister")?.addEventListener("click", async () => {
+		const selected = [...projectSelectedPaths];
+		if (selected.length === 0) return;
+		const containsCurrent = selected.some((p) => normPath(p) === normPath(currentWorkspace));
+		const toDelete = containsCurrent ? selected.filter((p) => normPath(p) !== normPath(currentWorkspace)) : selected;
+		if (containsCurrent) {
+			toast("已自动跳过当前正在使用的项目", "warn");
+		}
+		if (toDelete.length === 0) {
+			toast("没有可移出的非当前项目", "warn");
+			return;
+		}
+		if (!confirm(`确认将选中的 ${toDelete.length} 个项目移出列表？（不会删除磁盘代码和数据）`)) return;
+		try {
+			const res = await authFetch("/api/projects", {
+				method: "DELETE",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ paths: toDelete }),
+			});
+			const data = await res.json();
+			if (data.ok) {
+				toast(`已移出 ${data.count ?? toDelete.length} 个项目`);
+				for (const p of toDelete) projectSelectedPaths.delete(p);
+				await refreshProjectModalList();
+				refreshSessions();
+			} else {
+				toast(data.error ?? "批量移出失败", "error");
+			}
+		} catch (err) {
+			toast(`批量移出失败：${err.message}`, "error");
+		}
+	});
+
+	// 批量清空会话
+	$("#btnBatchClearSessions")?.addEventListener("click", async () => {
+		const selected = [...projectSelectedPaths];
+		if (selected.length === 0) return;
+		if (!confirm(`确认清空选中的 ${selected.length} 个项目的全部历史会话？文件将从磁盘移除，不可恢复。`)) return;
+		try {
+			const res = await authFetch("/api/projects/sessions", {
+				method: "DELETE",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ paths: selected }),
+			});
+			const data = await res.json();
+			if (data.ok) {
+				toast(`已清空 ${data.deletedSessions ?? 0} 个历史会话`);
+				await refreshProjectModalList();
+				refreshSessions();
+			} else {
+				toast(data.error ?? "批量清空失败", "error");
+			}
+		} catch (err) {
+			toast(`批量清空失败：${err.message}`, "error");
+		}
+	});
+}
+
 function setupProject() {
-	$("#navProject").addEventListener("click", openProjectPicker);
+	setupProjectModalEvents();
 }
 
 /* ================= Markdown 链接 ================= */

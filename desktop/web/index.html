@@ -28,7 +28,12 @@
     </button>
     <div class="projects-head">
       <span>项目</span>
-      <button id="navProject" class="project-switch" title="切换项目目录">切换</button>
+      <div class="projects-actions">
+        <button id="btnAddProject" class="project-head-btn" title="添加/打开新项目目录" type="button">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+        <button id="btnManageProjects" class="project-head-btn" title="批量管理项目与会话" type="button">管理</button>
+      </div>
     </div>
     <div class="session-tree" id="sessionTree"></div>
     <div class="side-status">
@@ -237,6 +242,37 @@
 
 <div class="banner" id="banner" hidden></div>
 <div class="toast-stack" id="toasts"></div>
+
+<!-- ===== 项目批量管理弹窗 ===== -->
+<div class="project-modal-backdrop" id="projectModal" hidden>
+  <div class="project-modal">
+    <div class="project-modal-head">
+      <div class="project-modal-titles">
+        <h3 class="project-modal-title">项目与会话管理</h3>
+        <p class="project-modal-sub">查看所有已注册的项目目录，支持批量移出列表或清空会话数据</p>
+      </div>
+      <button class="icon-btn" id="projectModalClose" type="button" title="关闭" aria-label="关闭">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="project-modal-toolbar">
+      <div class="project-modal-select-all">
+        <input type="checkbox" id="projectSelectAll">
+        <label for="projectSelectAll">全选 (<span id="projectSelectedCount">0</span>/<span id="projectTotalCount">0</span>)</label>
+      </div>
+      <div class="project-modal-batch-btns">
+        <button id="btnBatchUnregister" class="btn-subtle danger" type="button" disabled>移出列表</button>
+        <button id="btnBatchClearSessions" class="btn-subtle warn" type="button" disabled>清空会话</button>
+        <button id="btnAddNewProjectModal" class="btn-subtle primary" type="button">+ 添加新目录</button>
+      </div>
+    </div>
+    <div class="project-modal-body">
+      <div class="project-modal-list" id="projectModalList">
+        <!-- 动态渲染项目条目 -->
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="./vendor/markdown-it.min.js"></script>
 <script src="./vendor/hljs.min.js"></script>

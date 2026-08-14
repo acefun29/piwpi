@@ -38,49 +38,76 @@ app.whenReady().then(async () => {
 		const svgContent = fs.readFileSync(path.join(repoRoot, "logo.svg"), "utf8");
 
 		const win = new BrowserWindow({
-			width: 1024,
-			height: 1024,
+			width: 600,
+			height: 600,
 			show: false,
 			webPreferences: {
 				offscreen: true,
 			},
 		});
 
-		const html = `
+		const pageHtml = `
 <!DOCTYPE html>
 <html>
 <head>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: transparent; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; overflow: hidden; }
-#container { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
-svg { width: 88%; height: 88%; object-fit: contain; }
-</style>
+<meta charset="utf-8">
 </head>
-<body>
-<div id="container">
-${svgContent}
-</div>
+<body style="margin:0;padding:0;background:transparent;">
+<canvas id="c"></canvas>
+<script>
+window.renderIcon = function(svgStr, size) {
+	return new Promise((resolve, reject) => {
+		const canvas = document.getElementById('c');
+		canvas.width = size;
+		canvas.height = size;
+		const ctx = canvas.getContext('2d');
+		ctx.clearRect(0, 0, size, size);
+
+		const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+		const url = URL.createObjectURL(blob);
+		const img = new Image();
+		img.onload = () => {
+			// Center 900x500 logo inside square with subtle margins (e.g. 92% of box)
+			const maxDim = size * 0.94;
+			const scale = Math.min(maxDim / 900, maxDim / 500);
+			const w = 900 * scale;
+			const h = 500 * scale;
+			const x = (size - w) / 2;
+			const y = (size - h) / 2;
+			ctx.drawImage(img, x, y, w, h);
+			URL.revokeObjectURL(url);
+			const dataUrl = canvas.toDataURL('image/png');
+			resolve(dataUrl);
+		};
+		img.onerror = (e) => {
+			URL.revokeObjectURL(url);
+			reject(new Error('Failed to load SVG into image'));
+		};
+		img.src = url;
+	});
+};
+</script>
 </body>
 </html>
 `;
 
-		await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-		await new Promise((r) => setTimeout(r, 500));
+		await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(pageHtml)}`);
+		await new Promise((r) => setTimeout(r, 200));
 
 		const sizes = [16, 24, 32, 48, 64, 128, 256, 512];
 		const rendered = [];
 
 		for (const size of sizes) {
-			win.setContentSize(size, size);
-			await new Promise((r) => setTimeout(r, 100));
-			const image = await win.webContents.capturePage({ x: 0, y: 0, width: size, height: size });
-			const pngBuffer = image.toPNG();
+			const dataUrl = await win.webContents.executeJavaScript(
+				`window.renderIcon(${JSON.stringify(svgContent)}, ${size})`
+			);
+			const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+			const pngBuffer = Buffer.from(base64, "base64");
 			rendered.push({ size, buffer: pngBuffer });
-			console.log(`Rendered ${size}x${size}: ${pngBuffer.length} bytes`);
+			console.log(`Rendered transparent ${size}x${size}: ${pngBuffer.length} bytes`);
 		}
 
-		// Save 512x512 icon.png
+		// Save 512x512 transparent icon.png
 		const png512 = rendered.find((r) => r.size === 512).buffer;
 		const buildDir = path.join(repoRoot, "desktop", "build");
 		const webAssetsDir = path.join(repoRoot, "desktop", "web", "assets");
@@ -93,17 +120,17 @@ ${svgContent}
 		fs.writeFileSync(path.join(webAssetsDir, "icon.png"), png512);
 		fs.writeFileSync(path.join(webAssetsDir, "pwp-logo.png"), png512);
 
-		// Also copy logo.svg to desktop/web/logo.svg and desktop/web/assets/logo.svg
+		// Also copy logo.svg
 		fs.writeFileSync(path.join(webDir, "logo.svg"), svgContent);
 		fs.writeFileSync(path.join(webAssetsDir, "logo.svg"), svgContent);
 
-		// Build ICO with sizes up to 256
+		// Build ICO with sizes 16, 24, 32, 48, 64, 128, 256
 		const icoSizes = rendered.filter((r) => r.size <= 256);
 		const icoBuffer = buildIco(icoSizes);
 		fs.writeFileSync(path.join(buildDir, "icon.ico"), icoBuffer);
-		console.log(`Generated icon.ico: ${icoBuffer.length} bytes`);
+		console.log(`Generated transparent icon.ico: ${icoBuffer.length} bytes`);
 
-		console.log("Icon generation completed successfully!");
+		console.log("Transparent icon generation completed successfully!");
 		win.close();
 		app.quit();
 	} catch (err) {

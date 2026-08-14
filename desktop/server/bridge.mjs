@@ -350,6 +350,51 @@ export async function startBridge(opts = {}) {
 			await writeFile(projectsFilePath(), JSON.stringify(projects, null, 2), "utf8");
 		} catch { /* 注册失败不影响主流程 */ }
 	}
+	/** 批量移出注册项目（路径存在即可移出） */
+	async function unregisterProjects(paths) {
+		const targets = paths.map((p) => resolve(p));
+		const projects = await readProjects();
+		const filtered = projects.filter((p) => !targets.some((t) => normPathEquals(p, t)));
+		try {
+			await mkdir(dirname(projectsFilePath()), { recursive: true });
+			await writeFile(projectsFilePath(), JSON.stringify(filtered, null, 2), "utf8");
+			return { ok: true, count: projects.length - filtered.length };
+		} catch (err) {
+			return { ok: false, error: String(err?.message ?? err) };
+		}
+	}
+
+	/** 批量清空项目全部会话（删除 <cwd>/.piwpi/sessions/*.jsonl） */
+	async function clearProjectSessions(cwd) {
+		const root = resolve(join(cwd, ".piwpi", "sessions"));
+		if (!existsSync(root)) return { ok: true, count: 0 };
+		try {
+			const sessions = await listSessions(cwd);
+			let deleted = 0;
+			for (const s of sessions) {
+				if (deleteSession(s.sessionFile, cwd)) deleted++;
+			}
+			return { ok: true, count: deleted };
+		} catch (err) {
+			return { ok: false, error: String(err?.message ?? err) };
+		}
+	}
+
+	/** 在系统资源管理器中打开项目目录 */
+	async function openDirectoryInExplorer(dir) {
+		const resolved = resolve(dir);
+		if (!existsSync(resolved)) return { ok: false, error: "目录不存在" };
+		try {
+			if (process.versions.electron) {
+				const { shell } = await import("electron");
+				const err = await shell.openPath(resolved);
+				return err ? { ok: false, error: err } : { ok: true };
+			}
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: String(err?.message ?? err) };
+		}
+	}
 
 	/** 路径比较（win32 大小写不敏感） */
 	function normPathEquals(a, b) {
@@ -659,6 +704,104 @@ export async function startBridge(opts = {}) {
 				res.writeHead(result.ok ? 200 : 400, { "content-type": "application/json; charset=utf-8" });
 				res.end(JSON.stringify(result));
 			});
+			return;
+		}
+
+		// 项目列表与统计信息
+		if (path === "/api/projects" && req.method === "GET") {
+			Promise.resolve(workspace).then(async (cwd) => {
+				await registerProject(cwd);
+				const projects = await readProjects();
+				const items = await Promise.all(projects.map(async (p) => {
+					const exists = existsSync(p);
+					const sessions = exists ? await listSessions(p) : [];
+					const lastModified = sessions.length > 0 ? Math.max(...sessions.map((s) => s.modified || 0)) : 0;
+					const base = p.split(/[\\/]/).filter(Boolean).at(-1) || p;
+					return {
+						path: p,
+						name: base,
+						exists,
+						sessionCount: sessions.length,
+						lastModified,
+						isCurrent: normPathEquals(p, cwd),
+					};
+				}));
+				items.sort((a, b) => (b.isCurrent ? 1 : 0) - (a.isCurrent ? 1 : 0) || b.lastModified - a.lastModified);
+				sendJson(res, 200, { ok: true, currentWorkspace: cwd, projects: items });
+			}).catch((err) => sendJson(res, 500, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		// 注册新项目
+		if (path === "/api/projects" && req.method === "POST") {
+			readJsonBody(req).then(async (body) => {
+				const target = body?.path;
+				if (typeof target !== "string" || !target.trim()) {
+					sendJson(res, 400, { ok: false, error: "缺少有效项目路径" });
+					return;
+				}
+				const resolved = resolve(target.trim());
+				if (!existsSync(resolved)) {
+					sendJson(res, 400, { ok: false, error: "指定的目录不存在" });
+					return;
+				}
+				await registerProject(resolved);
+				sendJson(res, 200, { ok: true, path: resolved });
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		// 批量移出注册项目列表（不删磁盘文件）
+		if (path === "/api/projects" && req.method === "DELETE") {
+			readJsonBody(req).then(async (body) => {
+				const paths = Array.isArray(body?.paths)
+					? body.paths
+					: typeof body?.path === "string"
+						? [body.path]
+						: url.searchParams.get("path")
+							? [url.searchParams.get("path")]
+							: [];
+				if (paths.length === 0) {
+					sendJson(res, 400, { ok: false, error: "未指定要移出的项目路径" });
+					return;
+				}
+				const result = await unregisterProjects(paths);
+				sendJson(res, result.ok ? 200 : 400, result);
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		// 批量清空项目会话
+		if (path === "/api/projects/sessions" && req.method === "DELETE") {
+			readJsonBody(req).then(async (body) => {
+				const paths = Array.isArray(body?.paths)
+					? body.paths
+					: typeof body?.path === "string"
+						? [body.path]
+						: url.searchParams.get("path")
+							? [url.searchParams.get("path")]
+							: [];
+				if (paths.length === 0) {
+					sendJson(res, 400, { ok: false, error: "未指定要清空会话的项目路径" });
+					return;
+				}
+				let totalDeleted = 0;
+				for (const p of paths) {
+					const resClear = await clearProjectSessions(p);
+					totalDeleted += resClear.count || 0;
+				}
+				sendJson(res, 200, { ok: true, deletedSessions: totalDeleted });
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
+			return;
+		}
+
+		// 在系统资源管理器中打开项目
+		if (path === "/api/project/open" && req.method === "POST") {
+			readJsonBody(req).then(async (body) => {
+				const target = body?.path ?? workspace;
+				const result = await openDirectoryInExplorer(target);
+				sendJson(res, result.ok ? 200 : 400, result);
+			}).catch((err) => sendJson(res, 400, { ok: false, error: String(err?.message ?? err) }));
 			return;
 		}
 
